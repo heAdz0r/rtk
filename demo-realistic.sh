@@ -264,11 +264,11 @@ echo -e "${GRAY}... (truncated)${RESET}"
 sleep 1.5
 
 echo ""
-echo -e "${GREEN}✓ rtk kubectl pods${RESET}"
+echo -e "${GREEN}✓ rtk kubectl pods -A${RESET}"
 think
-type_cmd "rtk kubectl pods"
-rtk kubectl pods 2>&1 | head -10
-show_gain 1200 180
+type_cmd "rtk kubectl pods -A"
+rtk kubectl pods -A 2>&1 | head -12
+show_gain 1200 280
 
 #######################################
 # SUMMARY

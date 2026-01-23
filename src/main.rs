@@ -231,11 +231,17 @@ enum KubectlCommands {
     Pods {
         #[arg(short, long)]
         namespace: Option<String>,
+        /// All namespaces
+        #[arg(short = 'A', long)]
+        all: bool,
     },
     /// List services
     Services {
         #[arg(short, long)]
         namespace: Option<String>,
+        /// All namespaces
+        #[arg(short = 'A', long)]
+        all: bool,
     },
     /// Show pod logs (deduplicated)
     Logs {
@@ -340,12 +346,24 @@ fn main() -> Result<()> {
         },
 
         Commands::Kubectl { command } => match command {
-            KubectlCommands::Pods { namespace } => {
-                let args: Vec<String> = namespace.map(|n| vec!["-n".to_string(), n]).unwrap_or_default();
+            KubectlCommands::Pods { namespace, all } => {
+                let mut args: Vec<String> = Vec::new();
+                if all {
+                    args.push("-A".to_string());
+                } else if let Some(n) = namespace {
+                    args.push("-n".to_string());
+                    args.push(n);
+                }
                 container::run(container::ContainerCmd::KubectlPods, &args, cli.verbose)?;
             }
-            KubectlCommands::Services { namespace } => {
-                let args: Vec<String> = namespace.map(|n| vec!["-n".to_string(), n]).unwrap_or_default();
+            KubectlCommands::Services { namespace, all } => {
+                let mut args: Vec<String> = Vec::new();
+                if all {
+                    args.push("-A".to_string());
+                } else if let Some(n) = namespace {
+                    args.push("-n".to_string());
+                    args.push(n);
+                }
                 container::run(container::ContainerCmd::KubectlServices, &args, cli.verbose)?;
             }
             KubectlCommands::Logs { pod, container: c } => {
