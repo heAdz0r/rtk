@@ -13,6 +13,7 @@ mod json_cmd;
 mod local_llm;
 mod log_cmd;
 mod ls;
+mod pnpm_cmd;
 mod read;
 mod runner;
 mod summary;
@@ -88,6 +89,12 @@ enum Commands {
     Git {
         #[command(subcommand)]
         command: GitCommands,
+    },
+
+    /// pnpm commands with ultra-compact output
+    Pnpm {
+        #[command(subcommand)]
+        command: PnpmCommands,
     },
 
     /// Run command and show only errors/warnings
@@ -273,6 +280,33 @@ enum GitCommands {
 }
 
 #[derive(Subcommand)]
+enum PnpmCommands {
+    /// List installed packages (ultra-dense)
+    List {
+        /// Depth level (default: 0)
+        #[arg(short, long, default_value = "0")]
+        depth: usize,
+        /// Additional pnpm arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show outdated packages (condensed: "pkg: old → new")
+    Outdated {
+        /// Additional pnpm arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Install packages (filter progress bars)
+    Install {
+        /// Packages to install
+        packages: Vec<String>,
+        /// Additional pnpm arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DockerCommands {
     /// List running containers
     Ps,
@@ -347,6 +381,18 @@ fn main() -> Result<()> {
             }
             GitCommands::Pull => {
                 git::run(git::GitCommand::Pull, &[], None, cli.verbose)?;
+            }
+        },
+
+        Commands::Pnpm { command } => match command {
+            PnpmCommands::List { depth, args } => {
+                pnpm_cmd::run(pnpm_cmd::PnpmCommand::List { depth }, &args, cli.verbose)?;
+            }
+            PnpmCommands::Outdated { args } => {
+                pnpm_cmd::run(pnpm_cmd::PnpmCommand::Outdated, &args, cli.verbose)?;
+            }
+            PnpmCommands::Install { packages, args } => {
+                pnpm_cmd::run(pnpm_cmd::PnpmCommand::Install { packages }, &args, cli.verbose)?;
             }
         },
 
