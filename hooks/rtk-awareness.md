@@ -27,13 +27,13 @@ All other commands are automatically rewritten by the Claude Code hook.
 Example: `git status` → `rtk git status` (transparent, 0 tokens overhead)
 Example: `grepai search "auth token refresh"` → `rtk rgai "auth token refresh"`
 
-## Search Priority Policy
+## Search Priority Policy (MANDATORY)
 
-**Search priority (mandatory): rgai > rg > grep.**
+Search priority (mandatory): rgai > rg > grep.
 
-- Use `rtk rgai` first for semantic/intention-based discovery.
-- Use `rtk grep` for exact/regex matching.
-- `rtk grep` internally uses `rg -> grep` backend fallback.
+- `rtk rgai` — semantic/intention-based discovery (first choice)
+- `rtk grep` — exact/regex matching (second choice, internal rg -> grep fallback)
+- Native Grep tool — only if rtk commands are unavailable or broken
 
 ## Semantic Search
 

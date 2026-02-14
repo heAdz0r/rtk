@@ -110,7 +110,7 @@ rtk npx <cmd>           # Compact npx command output
 rtk prisma              # Prisma without ASCII art (88%)
 ```
 
-### Files & Search (60-75% savings)
+### Files & Search (60-85% savings)
 ```bash
 rtk ls <path>           # Tree format, compact (65%)
 rtk read <file>         # Code reading with filtering (60%)
@@ -1090,9 +1090,9 @@ pub fn show_config() -> Result<()> {
         println!("⚪ settings.json: not found");
     }
 
-    println!("\nUsage:");
-    println!("  Search priority (mandatory): rgai > rg > grep.");
-    println!("  Use rtk rgai first; use rtk grep for exact/regex (internal rg -> grep fallback).");
+    println!("\nSearch priority (mandatory): rgai > rg > grep.");
+    println!("  Use rtk rgai first; use rtk grep for exact/regex (internal rg -> grep fallback).\n");
+    println!("Usage:");
     println!("  rtk init              # Full injection into local CLAUDE.md");
     println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
     println!("  rtk init -g --auto-patch    # Same as above but no prompt");

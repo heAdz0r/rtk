@@ -165,9 +165,9 @@ Then add to `~/.claude/settings.json` (replace `~` with full path):
 
 **Note**: Use absolute path in `settings.json`, not `~/.claude/...`
 
-### Search Priority Policy
+### Search Priority
 
-**Search priority (mandatory): rgai > rg > grep.**
+**Search priority: rgai > rg > grep.**
 
 - Use `rtk rgai` first for semantic/intention-based discovery.
 - Use `rtk grep` for exact/regex matching.

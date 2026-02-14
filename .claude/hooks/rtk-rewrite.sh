@@ -85,8 +85,6 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+check([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo check/rtk cargo check/')"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+install([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo install/rtk cargo install/')"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+nextest([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo nextest/rtk cargo nextest/')"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')"
 
@@ -95,12 +93,12 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
 # Tier 1: semantic intent search (grepai/rgai) -> rtk rgai
 # Tier 2: exact search via ripgrep -> rtk grep (rtk grep runs rg -> grep fallback internally)
 # Tier 3: exact search via grep    -> rtk grep
-elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
 elif echo "$MATCH_CMD" | grep -qE '^(grepai|rgai)[[:space:]]+search([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(grepai|rgai)[[:space:]]+search[[:space:]]+/rtk rgai /')"
 elif echo "$MATCH_CMD" | grep -qE '^rgai[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^rgai[[:space:]]+/rtk rgai /')"
+elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
 elif echo "$MATCH_CMD" | grep -qE '^rg[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^rg /rtk grep /')"
 elif echo "$MATCH_CMD" | grep -qE '^grep[[:space:]]+'; then

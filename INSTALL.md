@@ -69,9 +69,9 @@ rtk gain  # MUST show token savings, not "command not found"
 
 ## Project Initialization
 
-### Search Priority Policy
+### Search Priority
 
-**Search priority (mandatory): rgai > rg > grep.**
+**Search priority: rgai > rg > grep.**
 
 - Use `rtk rgai` first for semantic/intention-based discovery.
 - Use `rtk grep` for exact/regex matching.
@@ -238,7 +238,7 @@ cp ~/.claude/settings.json.bak ~/.claude/settings.json
 ```bash
 rtk ls .              # Compact tree view
 rtk read file.rs      # Optimized reading
-rtk rgai "query"      # Semantic code search (grepai-style)
+rtk rgai "query"      # Semantic code search
 rtk grep "pattern" .  # Exact/regex search (internal rg -> grep fallback)
 ```
 
@@ -342,7 +342,7 @@ Before each session:
 - [ ] Verify RTK is installed: `rtk --version`
 - [ ] If not installed → follow "Install from fork"
 - [ ] If project not initialized → `rtk init`
-- [ ] Search policy: `rgai > rg > grep` (use `rtk rgai` first)
+- [ ] Search: use `rtk rgai` first, then `rtk grep` for exact/regex
 - [ ] Use `rtk` for ALL git/pnpm/test/vitest commands
 - [ ] Check savings: `rtk gain`
 
