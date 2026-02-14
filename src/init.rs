@@ -102,11 +102,12 @@ rtk npx <cmd>           # Compact npx command output
 rtk prisma              # Prisma without ASCII art (88%)
 ```
 
-### Files & Search (60-75% savings)
+### Files & Search (60-85% savings)
 ```bash
 rtk ls <path>           # Tree format, compact (65%)
 rtk read <file>         # Code reading with filtering (60%)
-rtk grep <pattern>      # Search grouped by file (75%)
+rtk rgai <query>        # Semantic search ranked by relevance (85%)
+rtk grep <pattern>      # Exact/regex search (internal rg -> grep fallback)
 rtk find <pattern>      # Find grouped by directory (70%)
 ```
 
@@ -155,7 +156,7 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 | Git | status, log, diff, add, commit | 59-80% |
 | GitHub | gh pr, gh run, gh issue | 26-87% |
 | Package Managers | pnpm, npm, npx | 70-90% |
-| Files | ls, read, grep, find | 60-75% |
+| Files | ls, read, grep, rgai, find | 60-85% |
 | Infrastructure | docker, kubectl | 85% |
 | Network | curl, wget | 65-70% |
 
@@ -1081,7 +1082,9 @@ pub fn show_config() -> Result<()> {
         println!("⚪ settings.json: not found");
     }
 
-    println!("\nUsage:");
+    println!("\nSearch priority: rgai > rg > grep.");
+    println!("  Use rtk rgai first; use rtk grep for exact/regex.\n");
+    println!("Usage:");
     println!("  rtk init              # Full injection into local CLAUDE.md");
     println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
     println!("  rtk init -g --auto-patch    # Same as above but no prompt");
@@ -1116,6 +1119,7 @@ mod tests {
             "rtk git",
             "rtk docker",
             "rtk kubectl",
+            "rtk rgai",
         ] {
             assert!(
                 RTK_INSTRUCTIONS.contains(cmd),
@@ -1195,6 +1199,7 @@ More content"#;
         // Just verify RTK_INSTRUCTIONS constant has the right content
         assert!(RTK_INSTRUCTIONS.contains("<!-- rtk-instructions"));
         assert!(RTK_INSTRUCTIONS.contains("rtk cargo test"));
+        assert!(RTK_INSTRUCTIONS.contains("rtk rgai"));
         assert!(RTK_INSTRUCTIONS.contains("<!-- /rtk-instructions -->"));
         assert!(RTK_INSTRUCTIONS.len() > 4000);
     }
