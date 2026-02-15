@@ -44,6 +44,14 @@ git add . && git commit -m "msg" && git push
 rtk git add . && rtk git commit -m "msg" && rtk git push
 ```
 
+## Search Priority Policy
+
+**Search priority (mandatory): rgai > rg > grep.**
+
+- Use `rtk rgai` first for semantic/intention-based discovery.
+- Use `rtk grep` for exact/regex matching.
+- `rtk grep` internally follows `rg -> grep` backend fallback automatically.
+
 ## RTK Commands by Workflow
 
 ### Build & Compile (80-90% savings)
@@ -106,7 +114,8 @@ rtk prisma              # Prisma without ASCII art (88%)
 ```bash
 rtk ls <path>           # Tree format, compact (65%)
 rtk read <file>         # Code reading with filtering (60%)
-rtk grep <pattern>      # Search grouped by file (75%)
+rtk rgai <query>        # Semantic search ranked by relevance (85%)
+rtk grep <pattern>      # Exact/regex search (internal rg -> grep fallback)
 rtk find <pattern>      # Find grouped by directory (70%)
 ```
 
@@ -155,7 +164,7 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 | Git | status, log, diff, add, commit | 59-80% |
 | GitHub | gh pr, gh run, gh issue | 26-87% |
 | Package Managers | pnpm, npm, npx | 70-90% |
-| Files | ls, read, grep, find | 60-75% |
+| Files | ls, read, grep, rgai, find | 60-85% |
 | Infrastructure | docker, kubectl | 85% |
 | Network | curl, wget | 65-70% |
 
@@ -1082,6 +1091,8 @@ pub fn show_config() -> Result<()> {
     }
 
     println!("\nUsage:");
+    println!("  Search priority (mandatory): rgai > rg > grep.");
+    println!("  Use rtk rgai first; use rtk grep for exact/regex (internal rg -> grep fallback).");
     println!("  rtk init              # Full injection into local CLAUDE.md");
     println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
     println!("  rtk init -g --auto-patch    # Same as above but no prompt");
@@ -1116,6 +1127,7 @@ mod tests {
             "rtk git",
             "rtk docker",
             "rtk kubectl",
+            "rtk rgai",
         ] {
             assert!(
                 RTK_INSTRUCTIONS.contains(cmd),
@@ -1195,6 +1207,7 @@ More content"#;
         // Just verify RTK_INSTRUCTIONS constant has the right content
         assert!(RTK_INSTRUCTIONS.contains("<!-- rtk-instructions"));
         assert!(RTK_INSTRUCTIONS.contains("rtk cargo test"));
+        assert!(RTK_INSTRUCTIONS.contains("rtk rgai"));
         assert!(RTK_INSTRUCTIONS.contains("<!-- /rtk-instructions -->"));
         assert!(RTK_INSTRUCTIONS.len() > 4000);
     }
@@ -1246,6 +1259,33 @@ More notes
         let (content, action) = upsert_rtk_block(input, RTK_INSTRUCTIONS);
         assert_eq!(action, RtkBlockUpsert::Malformed);
         assert_eq!(content, input);
+    }
+
+    #[test]
+    fn test_search_priority_policy_in_init_and_slim_templates() {
+        let policy = "Search priority (mandatory): rgai > rg > grep.";
+        assert!(
+            RTK_INSTRUCTIONS.contains(policy),
+            "RTK_INSTRUCTIONS must include strict search priority policy"
+        );
+        assert!(
+            RTK_SLIM.contains(policy),
+            "RTK_SLIM must include strict search priority policy"
+        );
+    }
+
+    #[test]
+    fn test_files_search_examples_prioritize_rgai_before_grep() {
+        let rgai_pos = RTK_INSTRUCTIONS
+            .find("rtk rgai <query>")
+            .expect("rtk rgai example missing");
+        let grep_pos = RTK_INSTRUCTIONS
+            .find("rtk grep <pattern>")
+            .expect("rtk grep example missing");
+        assert!(
+            rgai_pos < grep_pos,
+            "Files/Search examples must prioritize rtk rgai before rtk grep"
+        );
     }
 
     #[test]
