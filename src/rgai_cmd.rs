@@ -336,9 +336,14 @@ fn analyze_file(
     context_lines: usize,
     snippets_per_file: usize,
 ) -> Option<SearchHit> {
+    // FIX: extract extension for extension-aware comment detection
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     let mut candidates = Vec::new();
     for (idx, line) in content.lines().enumerate() {
-        if let Some(candidate) = score_line(idx, line, query) {
+        if let Some(candidate) = score_line(idx, line, query, ext) {
             candidates.push(candidate);
         }
     }
@@ -444,7 +449,7 @@ fn build_raw_output(hits: &[SearchHit]) -> String {
     raw
 }
 
-fn score_line(line_idx: usize, line: &str, query: &QueryModel) -> Option<LineCandidate> {
+fn score_line(line_idx: usize, line: &str, query: &QueryModel, ext: &str) -> Option<LineCandidate> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -478,7 +483,8 @@ fn score_line(line_idx: usize, line: &str, query: &QueryModel) -> Option<LineCan
         score += 2.5;
     }
 
-    if is_comment_line(trimmed) {
+    if is_comment_line(trimmed, ext) {
+        // FIX: pass ext for extension-aware comment detection
         score *= 0.7;
     }
 
@@ -562,7 +568,11 @@ fn stem_token(token: &str) -> String {
         return token.to_string();
     }
 
-    let suffixes = ["ingly", "edly", "ing", "ed", "es", "s"];
+    // FIX: removed "es" suffix — it broke stems for -ce/-ge/-ve words common in code
+    // (caches→cach, services→servic, changes→chang). Stripping just "s" handles
+    // these correctly (caches→cache, services→service). The trade-off (classes→classe)
+    // is acceptable since original unstemmed tokens are also kept in the query model.
+    let suffixes = ["ingly", "edly", "ing", "ed", "s"];
     for suffix in suffixes {
         if token.len() > suffix.len() + 2 && token.ends_with(suffix) {
             return token[..token.len() - suffix.len()].to_string();
@@ -592,13 +602,39 @@ fn is_symbol_definition(line: &str) -> bool {
     SYMBOL_DEF_RE.is_match(line)
 }
 
-fn is_comment_line(line: &str) -> bool {
+// FIX: accept file extension to avoid penalizing Markdown headers and YAML keys.
+// '#' is only treated as a comment prefix for scripting languages (py, sh, rb, etc.).
+fn is_comment_line(line: &str, ext: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.starts_with("//")
-        || trimmed.starts_with('#')
+    if trimmed.starts_with("//")
         || trimmed.starts_with('*')
         || trimmed.starts_with("/*")
         || trimmed.starts_with("--")
+    {
+        return true;
+    }
+    // Only treat '#' as comment for languages that actually use it
+    if trimmed.starts_with('#') {
+        return matches!(
+            ext,
+            "py" | "sh"
+                | "bash"
+                | "zsh"
+                | "rb"
+                | "pl"
+                | "pm"
+                | "r"
+                | "jl"
+                | "makefile"
+                | "mk"
+                | "dockerfile"
+                | "tf"
+                | "cfg"
+                | "conf"
+                | "ini"
+        );
+    }
+    false
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {
@@ -733,7 +769,7 @@ mod tests {
     fn score_line_prefers_symbol_definitions() {
         let query = build_query_model("refresh token");
         let line = "pub fn refresh_token(session: &Session) -> Result<String> {";
-        let cand = score_line(10, line, &query).expect("line should match");
+        let cand = score_line(10, line, &query, "rs").expect("line should match");
         assert!(cand.score > 3.0);
         assert!(cand.matched_terms.contains(&"refresh".to_string()));
         assert!(cand.matched_terms.contains(&"token".to_string()));
@@ -785,5 +821,48 @@ pub fn log_info(msg: &str) {
         let s = "Привет это длинная строка для теста";
         let truncated = truncate_chars(s, 10);
         assert!(truncated.chars().count() <= 10);
+    }
+
+    // FIX: stem_token must preserve trailing 'e' for common code identifiers
+    #[test]
+    fn stem_token_preserves_trailing_e() {
+        assert_eq!(stem_token("caches"), "cache");
+        assert_eq!(stem_token("services"), "service");
+        assert_eq!(stem_token("changes"), "change");
+        assert_eq!(stem_token("images"), "image");
+        assert_eq!(stem_token("packages"), "package");
+        assert_eq!(stem_token("interfaces"), "interface");
+        assert_eq!(stem_token("sources"), "source");
+    }
+
+    #[test]
+    fn stem_token_handles_regular_suffixes() {
+        assert_eq!(stem_token("tokens"), "token");
+        assert_eq!(stem_token("running"), "runn");
+        assert_eq!(stem_token("created"), "creat");
+    }
+
+    // FIX: is_comment_line respects file extension — no false positives on .md/.yaml
+    #[test]
+    fn is_comment_line_ignores_hash_in_non_script_files() {
+        assert!(!is_comment_line("# Installation", "md"));
+        assert!(!is_comment_line("## API Reference", "md"));
+        assert!(!is_comment_line("# yaml comment", "yaml"));
+        assert!(!is_comment_line("#[derive(Debug)]", "rs"));
+        assert!(!is_comment_line("# toml section", "toml"));
+    }
+
+    #[test]
+    fn is_comment_line_detects_hash_in_script_files() {
+        assert!(is_comment_line("# python comment", "py"));
+        assert!(is_comment_line("# shell comment", "sh"));
+        assert!(is_comment_line("# ruby comment", "rb"));
+    }
+
+    #[test]
+    fn is_comment_line_detects_universal_comment_markers() {
+        assert!(is_comment_line("// rust comment", "rs"));
+        assert!(is_comment_line("/* block comment */", "js"));
+        assert!(is_comment_line("-- sql comment", "sql"));
     }
 }
