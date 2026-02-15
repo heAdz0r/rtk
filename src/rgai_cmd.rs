@@ -1,3 +1,5 @@
+use crate::config; // grepai config
+use crate::grepai; // grepai delegation
 use crate::tracking;
 use anyhow::{bail, Result};
 use ignore::WalkBuilder;
@@ -70,6 +72,7 @@ pub fn run(
     max_file_kb: usize,
     json_output: bool,
     compact: bool,
+    builtin: bool, // --builtin flag: skip grepai delegation
     verbose: u8,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
@@ -82,6 +85,23 @@ pub fn run(
     let root = Path::new(path);
     if !root.exists() {
         bail!("path does not exist: {}", path);
+    }
+
+    // Try grepai delegation first (unless --builtin flag is set)
+    if !builtin {
+        if let Some(output) =
+            try_grepai_delegation(query, root, max_results, json_output, compact, verbose)?
+        {
+            print!("{}", output);
+            timer.track(
+                &format!("grepai search '{}' {}", query, path),
+                "rtk rgai (grepai)",
+                &output,
+                &output,
+            );
+            return Ok(());
+        }
+        // Fall through to built-in search
     }
 
     let query_model = build_query_model(query);
@@ -239,6 +259,126 @@ pub fn run(
     );
 
     Ok(())
+}
+
+/// Try to delegate search to external grepai binary
+/// Returns Some(output) if grepai handled the search, None to fall back to built-in
+fn try_grepai_delegation(
+    query: &str,
+    project_path: &Path,
+    max: usize,
+    json: bool,
+    compact: bool,
+    verbose: u8,
+) -> Result<Option<String>> {
+    let project_dir = resolve_grepai_project_dir(project_path);
+
+    // Check config: is grepai delegation enabled?
+    let cfg = config::Config::load().unwrap_or_default();
+    if !cfg.grepai.enabled {
+        if verbose > 0 {
+            eprintln!("rgai: grepai delegation disabled in config");
+        }
+        return Ok(None);
+    }
+
+    // Use custom binary path from config, or auto-detect
+    let state = if let Some(ref custom_path) = cfg.grepai.binary_path {
+        if custom_path.exists() {
+            let config_file = project_dir.join(".grepai").join("config.yaml");
+            if config_file.exists() {
+                grepai::GrepaiState::Ready(custom_path.clone())
+            } else {
+                grepai::GrepaiState::NotInitialized(custom_path.clone())
+            }
+        } else {
+            if verbose > 0 {
+                eprintln!(
+                    "rgai: configured binary not found: {}",
+                    custom_path.display()
+                );
+            }
+            return Ok(None);
+        }
+    } else {
+        grepai::detect_grepai(project_dir)
+    };
+
+    match state {
+        grepai::GrepaiState::Ready(binary) => {
+            if verbose > 0 {
+                eprintln!("rgai: delegating to grepai ({})", binary.display());
+            }
+            match grepai::execute_search(&binary, project_dir, query, max, json, compact) {
+                Ok(output) => Ok(output),
+                Err(e) => {
+                    if verbose > 0 {
+                        eprintln!(
+                            "rgai: grepai search failed: {}, falling back to built-in",
+                            e
+                        );
+                    }
+                    Ok(None)
+                }
+            }
+        }
+        grepai::GrepaiState::NotInitialized(binary) => {
+            if cfg.grepai.auto_init {
+                if verbose > 0 {
+                    eprintln!("rgai: auto-initializing grepai in project...");
+                }
+                match grepai::init_project(&binary, project_dir, verbose) {
+                    Ok(()) => {
+                        match grepai::execute_search(
+                            &binary,
+                            project_dir,
+                            query,
+                            max,
+                            json,
+                            compact,
+                        ) {
+                            Ok(output) => Ok(output),
+                            Err(e) => {
+                                if verbose > 0 {
+                                    eprintln!(
+                                        "rgai: grepai search failed after init: {}, falling back",
+                                        e
+                                    );
+                                }
+                                Ok(None)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if verbose > 0 {
+                            eprintln!(
+                                "rgai: grepai auto-init failed: {}, falling back to built-in",
+                                e
+                            );
+                        }
+                        Ok(None)
+                    }
+                }
+            } else {
+                if verbose > 0 {
+                    eprintln!("rgai: grepai not initialized, auto_init disabled, using built-in");
+                }
+                Ok(None)
+            }
+        }
+        grepai::GrepaiState::NotInstalled => {
+            // Silent: no nagging — install happens via `rtk init`
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_grepai_project_dir(project_path: &Path) -> &Path {
+    if project_path.is_dir() {
+        project_path
+    } else {
+        project_path.parent().unwrap_or(project_path)
+    }
 }
 
 fn search_project(
@@ -864,5 +1004,19 @@ pub fn log_info(msg: &str) {
         assert!(is_comment_line("// rust comment", "rs"));
         assert!(is_comment_line("/* block comment */", "js"));
         assert!(is_comment_line("-- sql comment", "sql"));
+    }
+
+    #[test]
+    fn resolve_grepai_project_dir_for_directory_path() {
+        let dir = tempdir().unwrap();
+        assert_eq!(resolve_grepai_project_dir(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn resolve_grepai_project_dir_for_file_path_uses_parent() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("mod.rs");
+        fs::write(&file, "pub fn x() {}").unwrap();
+        assert_eq!(resolve_grepai_project_dir(&file), dir.path());
     }
 }

@@ -10,6 +10,8 @@ pub struct Config {
     pub display: DisplayConfig,
     #[serde(default)]
     pub filters: FilterConfig,
+    #[serde(default)]
+    pub grepai: GrepaiConfig, // grepai integration settings
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +71,28 @@ impl Default for FilterConfig {
     }
 }
 
+/// grepai external semantic search integration
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrepaiConfig {
+    /// Enable grepai delegation in `rtk rgai` (default: true)
+    pub enabled: bool,
+    /// Auto-init projects on first `rtk rgai` if grepai is installed (default: true)
+    pub auto_init: bool,
+    /// Custom binary path override (default: auto-detect via PATH)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<PathBuf>,
+}
+
+impl Default for GrepaiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_init: true,
+            binary_path: None,
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = get_config_path()?;
@@ -122,4 +146,17 @@ pub fn show_config() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grepai_config_defaults_are_enabled_with_auto_init() {
+        let cfg = Config::default();
+        assert!(cfg.grepai.enabled);
+        assert!(cfg.grepai.auto_init);
+        assert_eq!(cfg.grepai.binary_path, None);
+    }
 }

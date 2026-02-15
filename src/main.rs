@@ -18,6 +18,7 @@ mod git;
 mod go_cmd;
 mod golangci_cmd;
 mod grep_cmd;
+mod grepai; // grepai external semantic search integration
 mod init;
 mod json_cmd;
 mod learn;
@@ -280,6 +281,9 @@ enum Commands {
         /// Compact output (fewer lines per hit)
         #[arg(long)]
         compact: bool,
+        /// Force built-in keyword search (skip grepai delegation)
+        #[arg(long)]
+        builtin: bool,
     },
 
     /// Initialize rtk instructions in CLAUDE.md
@@ -1087,6 +1091,7 @@ fn main() -> Result<()> {
             max_file_kb,
             json,
             compact,
+            builtin, // --builtin flag: skip grepai delegation
         } => {
             // Backward-compat: rtk rgai "query words" ./src -> path="./src"
             let (query, path) = normalize_rgai_args(query, path);
@@ -1099,6 +1104,7 @@ fn main() -> Result<()> {
                 max_file_kb,
                 json,
                 compact,
+                builtin, // pass --builtin flag
                 cli.verbose,
             )?;
         }

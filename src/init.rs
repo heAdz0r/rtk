@@ -1,3 +1,4 @@
+use crate::grepai; // grepai integration
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
@@ -705,9 +706,94 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         }
     }
 
+    // 6. Offer grepai installation
+    setup_grepai(patch_mode, verbose)?;
+
     println!(); // Final newline
 
     Ok(())
+}
+
+/// Offer grepai installation during `rtk init --global`
+fn setup_grepai(patch_mode: PatchMode, verbose: u8) -> Result<()> {
+    // Check if grepai is already installed
+    if let Some(path) = grepai::find_grepai_binary() {
+        println!("\n  grepai: already installed at {}", path.display());
+        return Ok(());
+    }
+
+    // Not installed — decide based on patch_mode
+    match patch_mode {
+        PatchMode::Auto => {
+            // Install without prompting
+            println!("\n  Installing grepai...");
+            match grepai::install_grepai(verbose) {
+                Ok(path) => {
+                    println!("  grepai installed: {}", path.display());
+                    println!(
+                        "  Run `grepai init` in any project, then `grepai watch --background`."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  grepai install failed: {}", e);
+                    eprintln!("  Install manually: https://github.com/yoanbernabeu/grepai");
+                }
+            }
+        }
+        PatchMode::Skip => {
+            // Print manual instructions only
+            println!("\n  grepai: not installed (skipped)");
+            println!("  Install manually: https://github.com/yoanbernabeu/grepai");
+        }
+        PatchMode::Ask => {
+            // Prompt with Y as default (capital Y, unlike settings.json which defaults to N)
+            if prompt_grepai_consent()? {
+                println!("  Installing grepai...");
+                match grepai::install_grepai(verbose) {
+                    Ok(path) => {
+                        println!("  grepai installed: {}", path.display());
+                        println!(
+                            "  Run `grepai init` in any project, then `grepai watch --background`."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  grepai install failed: {}", e);
+                        eprintln!("  Install manually: https://github.com/yoanbernabeu/grepai");
+                    }
+                }
+            } else {
+                println!("  grepai: skipped");
+                println!("  Install later: https://github.com/yoanbernabeu/grepai");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Prompt user for consent to install grepai
+/// Default is Yes (capital Y) — unlike settings.json patch which defaults to No
+fn prompt_grepai_consent() -> Result<bool> {
+    use std::io::{self, BufRead, IsTerminal};
+
+    eprintln!("\nInstall grepai for semantic code search? [Y/n] ");
+
+    // If stdin is not a terminal (piped), default to Yes
+    if !io::stdin().is_terminal() {
+        eprintln!("(non-interactive mode, defaulting to Y)");
+        return Ok(true);
+    }
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("Failed to read user input")?;
+
+    let response = line.trim().to_lowercase();
+    // Default is Yes: empty input or explicit y/yes
+    Ok(response.is_empty() || response == "y" || response == "yes")
 }
 
 /// Hook-only mode: just the hook, no RTK.md
@@ -1091,7 +1177,9 @@ pub fn show_config() -> Result<()> {
     }
 
     println!("\nSearch priority (mandatory): rgai > rg > grep.");
-    println!("  Use rtk rgai first; use rtk grep for exact/regex (internal rg -> grep fallback).\n");
+    println!(
+        "  Use rtk rgai first; use rtk grep for exact/regex (internal rg -> grep fallback).\n"
+    );
     println!("Usage:");
     println!("  rtk init              # Full injection into local CLAUDE.md");
     println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
