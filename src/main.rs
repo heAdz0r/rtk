@@ -1458,11 +1458,14 @@ fn normalize_rgai_args(mut query_parts: Vec<String>, mut path: String) -> (Strin
 }
 
 fn looks_like_path_token(token: &str) -> bool {
+    // FIX: removed bare contains('/') — too greedy, treats "client/server" as a path.
+    // Now only matches tokens that look like actual filesystem paths.
     token == "."
         || token == ".."
         || token.starts_with("./")
+        || token.starts_with("../")
         || token.starts_with('/')
-        || token.contains('/')
+        || token.starts_with("~/")
 }
 
 #[cfg(test)]
@@ -1497,5 +1500,33 @@ mod rgai_arg_tests {
         );
         assert_eq!(query, "domain model");
         assert_eq!(path, ".");
+    }
+
+    // FIX: slash-containing words like "client/server" must NOT be treated as paths
+    #[test]
+    fn normalize_rgai_does_not_treat_slash_word_as_path() {
+        let (query, path) = normalize_rgai_args(
+            vec!["client/server".to_string(), "architecture".to_string()],
+            ".".to_string(),
+        );
+        assert_eq!(query, "client/server architecture");
+        assert_eq!(path, ".");
+    }
+
+    #[test]
+    fn looks_like_path_recognizes_real_paths() {
+        assert!(looks_like_path_token("./src"));
+        assert!(looks_like_path_token("../lib"));
+        assert!(looks_like_path_token("/usr/local"));
+        assert!(looks_like_path_token("~/projects"));
+        assert!(looks_like_path_token("."));
+        assert!(looks_like_path_token(".."));
+    }
+
+    #[test]
+    fn looks_like_path_rejects_non_paths() {
+        assert!(!looks_like_path_token("client/server"));
+        assert!(!looks_like_path_token("input/output"));
+        assert!(!looks_like_path_token("read/write"));
     }
 }
