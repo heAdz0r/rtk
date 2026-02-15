@@ -31,7 +31,7 @@ pub fn run(
                 monthly,
                 all,
                 project_scope.as_deref(), // added: pass project scope
-            )
+            );
         }
         "csv" => {
             return export_csv(
@@ -41,7 +41,7 @@ pub fn run(
                 monthly,
                 all,
                 project_scope.as_deref(), // added: pass project scope
-            )
+            );
         }
         _ => {} // Continue with text format
     }
@@ -251,19 +251,22 @@ fn print_ascii_graph(data: &[(String, usize)]) {
     }
 }
 
-fn print_daily_full(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> { // changed: add project scope
+fn print_daily_full(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    // changed: add project scope
     let days = tracker.get_all_days_filtered(project_scope)?; // changed: use filtered variant
     print_period_table(&days);
     Ok(())
 }
 
-fn print_weekly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> { // changed: add project scope
+fn print_weekly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    // changed: add project scope
     let weeks = tracker.get_by_week_filtered(project_scope)?; // changed: use filtered variant
     print_period_table(&weeks);
     Ok(())
 }
 
-fn print_monthly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> { // changed: add project scope
+fn print_monthly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    // changed: add project scope
     let months = tracker.get_by_month_filtered(project_scope)?; // changed: use filtered variant
     print_period_table(&months);
     Ok(())
