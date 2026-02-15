@@ -295,6 +295,9 @@ enum Commands {
 
     /// Show token savings summary and history
     Gain {
+        /// Filter statistics to current project (current working directory) // added
+        #[arg(short, long)]
+        project: bool,
         /// Show ASCII graph of daily savings
         #[arg(short, long)]
         graph: bool,
@@ -1070,6 +1073,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Gain {
+            project, // added
             graph,
             history,
             quota,
@@ -1081,6 +1085,7 @@ fn main() -> Result<()> {
             format,
         } => {
             gain::run(
+                project, // added: pass project flag
                 graph,
                 history,
                 quota,
