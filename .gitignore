@@ -36,3 +36,9 @@ benchmark-report.md
 *.sqlite3
 rtk_tracking.db
 claudedocs
+
+# grepai local index (project-specific, not portable)
+.grepai/
+
+# Claude Code local settings (user-specific)
+.claude/settings.local.json
