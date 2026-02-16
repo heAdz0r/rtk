@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 const MAX_SNIPPETS_PER_FILE: usize = 2;
 const MAX_SNIPPET_LINE_LEN: usize = 140;
 const MIN_FILE_SCORE: f64 = 2.4;
+// ADDED: compact mode limits for token savings
+const COMPACT_MAX_FILES: usize = 5;
+const RELATIVE_SCORE_CUTOFF: f64 = 0.35;
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "code", "file", "find", "for", "from", "how",
@@ -184,44 +187,19 @@ pub fn run(
         return Ok(());
     }
 
-    rendered.push_str(&format!(
-        "🧠 {}F for '{}' (scan {}F)\n",
-        outcome.hits.len(),
+    // CHANGED: use extracted render_text_hits with compact-aware limits
+    let effective_max = if compact {
+        max_results.min(COMPACT_MAX_FILES)
+    } else {
+        max_results
+    };
+    rendered = render_text_hits(
+        &outcome.hits,
+        effective_max,
+        compact,
         query,
-        outcome.scanned_files
-    ));
-    rendered.push('\n');
-
-    for hit in outcome.hits.iter().take(max_results) {
-        rendered.push_str(&format!(
-            "📄 {} [{:.1}]\n",
-            compact_path(&hit.path),
-            hit.score
-        ));
-
-        for snippet in &hit.snippets {
-            for (line_no, line) in &snippet.lines {
-                rendered.push_str(&format!("  {:>4}: {}\n", line_no, line));
-            }
-
-            if !compact && !snippet.matched_terms.is_empty() {
-                rendered.push_str(&format!("       ~ {}\n", snippet.matched_terms.join(", ")));
-            }
-            rendered.push('\n');
-        }
-
-        let shown_lines = hit.snippets.len();
-        if hit.matched_lines > shown_lines {
-            rendered.push_str(&format!(
-                "  +{} more lines\n\n",
-                hit.matched_lines - shown_lines
-            ));
-        }
-    }
-
-    if outcome.hits.len() > max_results {
-        rendered.push_str(&format!("... +{}F\n", outcome.hits.len() - max_results));
-    }
+        outcome.scanned_files,
+    );
 
     if verbose > 0 {
         rendered.push_str(&format!(
@@ -324,6 +302,9 @@ fn search_project(
             .total_cmp(&a.score)
             .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
     });
+
+    // ADDED: prune low-relevance hits before building raw output
+    prune_by_relevance(&mut outcome.hits);
 
     outcome.raw_output = build_raw_output(&outcome.hits);
     Ok(outcome)
@@ -447,6 +428,77 @@ fn build_raw_output(hits: &[SearchHit]) -> String {
         }
     }
     raw
+}
+
+// ADDED: dynamic relevance cutoff — prune hits below 35% of top score
+fn prune_by_relevance(hits: &mut Vec<SearchHit>) {
+    if let Some(top) = hits.first() {
+        let cutoff = (top.score * RELATIVE_SCORE_CUTOFF).max(MIN_FILE_SCORE);
+        hits.retain(|h| h.score >= cutoff);
+    }
+}
+
+// ADDED: extract text rendering for testability and compact mode support
+fn render_text_hits(
+    hits: &[SearchHit],
+    max_results: usize,
+    compact: bool,
+    query: &str,
+    scanned_files: usize,
+) -> String {
+    let mut rendered = String::new();
+
+    // CHANGED: compact header is shorter (no "scan NF")
+    if compact {
+        rendered.push_str(&format!("🧠 {} for '{}'\n", hits.len(), query));
+    } else {
+        rendered.push_str(&format!(
+            "🧠 {}F for '{}' (scan {}F)\n",
+            hits.len(),
+            query,
+            scanned_files
+        ));
+        rendered.push('\n');
+    }
+
+    for hit in hits.iter().take(max_results) {
+        rendered.push_str(&format!(
+            "📄 {} [{:.1}]\n",
+            compact_path(&hit.path),
+            hit.score
+        ));
+
+        for snippet in &hit.snippets {
+            for (line_no, line) in &snippet.lines {
+                rendered.push_str(&format!("  {:>4}: {}\n", line_no, line));
+            }
+
+            // CHANGED: suppress matched_terms in compact mode (already suppressed)
+            if !compact && !snippet.matched_terms.is_empty() {
+                rendered.push_str(&format!("       ~ {}\n", snippet.matched_terms.join(", ")));
+            }
+            // CHANGED: no blank line between snippets in compact mode
+            if !compact {
+                rendered.push('\n');
+            }
+        }
+
+        // CHANGED: suppress "+N more lines" in compact mode
+        let shown_lines = hit.snippets.len();
+        if !compact && hit.matched_lines > shown_lines {
+            rendered.push_str(&format!(
+                "  +{} more lines\n\n",
+                hit.matched_lines - shown_lines
+            ));
+        }
+    }
+
+    // CHANGED: suppress "+NF" footer in compact mode
+    if !compact && hits.len() > max_results {
+        rendered.push_str(&format!("... +{}F\n", hits.len() - max_results));
+    }
+
+    rendered
 }
 
 fn score_line(line_idx: usize, line: &str, query: &QueryModel, ext: &str) -> Option<LineCandidate> {
@@ -864,5 +916,175 @@ pub fn log_info(msg: &str) {
         assert!(is_comment_line("// rust comment", "rs"));
         assert!(is_comment_line("/* block comment */", "js"));
         assert!(is_comment_line("-- sql comment", "sql"));
+    }
+
+    // --- compact output optimization tests ---
+
+    #[test]
+    fn prune_by_relevance_removes_low_scores() {
+        // Arrange: hits with scores [20.0, 18.0, 15.0, 5.0, 3.0]
+        let mut hits = vec![
+            SearchHit {
+                path: "a.rs".into(),
+                score: 20.0,
+                matched_lines: 5,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "b.rs".into(),
+                score: 18.0,
+                matched_lines: 3,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "c.rs".into(),
+                score: 15.0,
+                matched_lines: 2,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "d.rs".into(),
+                score: 5.0,
+                matched_lines: 1,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "e.rs".into(),
+                score: 3.0,
+                matched_lines: 1,
+                snippets: vec![],
+            },
+        ];
+        // Act: cutoff = 20.0 * 0.35 = 7.0
+        prune_by_relevance(&mut hits);
+        // Assert: only scores >= 7.0 remain
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].path, "a.rs");
+        assert_eq!(hits[2].path, "c.rs");
+    }
+
+    #[test]
+    fn prune_by_relevance_keeps_all_when_scores_close() {
+        // Arrange: all scores within 35% of top
+        let mut hits = vec![
+            SearchHit {
+                path: "a.rs".into(),
+                score: 10.0,
+                matched_lines: 3,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "b.rs".into(),
+                score: 8.0,
+                matched_lines: 2,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "c.rs".into(),
+                score: 6.0,
+                matched_lines: 1,
+                snippets: vec![],
+            },
+        ];
+        // Act: cutoff = 10.0 * 0.35 = 3.5 — all pass
+        prune_by_relevance(&mut hits);
+        // Assert: nothing pruned
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn prune_by_relevance_respects_min_file_score() {
+        // Arrange: low top score where 35% cutoff < MIN_FILE_SCORE
+        let mut hits = vec![
+            SearchHit {
+                path: "a.rs".into(),
+                score: 4.0,
+                matched_lines: 2,
+                snippets: vec![],
+            },
+            SearchHit {
+                path: "b.rs".into(),
+                score: 2.5,
+                matched_lines: 1,
+                snippets: vec![],
+            },
+        ];
+        // Act: 4.0 * 0.35 = 1.4, but MIN_FILE_SCORE = 2.4 is used instead
+        prune_by_relevance(&mut hits);
+        // Assert: both survive (both >= 2.4)
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn prune_by_relevance_empty_hits() {
+        let mut hits: Vec<SearchHit> = vec![];
+        prune_by_relevance(&mut hits);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn render_compact_omits_more_lines() {
+        // Arrange
+        let hits = vec![SearchHit {
+            path: "src/auth.rs".into(),
+            score: 15.0,
+            matched_lines: 20, // many matched lines
+            snippets: vec![Snippet {
+                lines: vec![(10, "pub fn login() {".into())],
+                matched_terms: vec!["login".into()],
+            }],
+        }];
+        // Act
+        let output = render_text_hits(&hits, 5, true, "login", 100);
+        // Assert: no "+N more lines" noise in compact
+        assert!(!output.contains("more lines"));
+        // but the snippet IS present
+        assert!(output.contains("pub fn login()"));
+    }
+
+    #[test]
+    fn render_compact_omits_remaining_files_footer() {
+        // Arrange: 10 hits but max=3
+        let hits: Vec<SearchHit> = (0..10)
+            .map(|i| SearchHit {
+                path: format!("f{}.rs", i),
+                score: 20.0 - i as f64,
+                matched_lines: 1,
+                snippets: vec![Snippet {
+                    lines: vec![(1, format!("line {}", i))],
+                    matched_terms: vec!["term".into()],
+                }],
+            })
+            .collect();
+        // Act
+        let output = render_text_hits(&hits, 3, true, "term", 50);
+        // Assert: no "+NF" footer in compact
+        assert!(!output.contains("+7F"));
+        assert!(!output.contains("..."));
+        // only 3 files shown
+        assert!(output.contains("f0.rs"));
+        assert!(output.contains("f2.rs"));
+        assert!(!output.contains("f3.rs"));
+    }
+
+    #[test]
+    fn render_normal_keeps_more_lines_and_footer() {
+        // Arrange
+        let hits: Vec<SearchHit> = (0..10)
+            .map(|i| SearchHit {
+                path: format!("f{}.rs", i),
+                score: 20.0 - i as f64,
+                matched_lines: 15,
+                snippets: vec![Snippet {
+                    lines: vec![(1, format!("line {}", i))],
+                    matched_terms: vec!["term".into()],
+                }],
+            })
+            .collect();
+        // Act: compact=false
+        let output = render_text_hits(&hits, 5, false, "term", 50);
+        // Assert: normal mode KEEPS the noise
+        assert!(output.contains("more lines"));
+        assert!(output.contains("+5F"));
     }
 }
