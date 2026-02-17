@@ -3,7 +3,8 @@ set -euo pipefail
 
 echo "Validating RTK documentation consistency..."
 
-main_modules="$(grep -c '^mod ' src/main.rs || true)"
+# Count only top-level module declarations (`mod name;`), not inline test modules.
+main_modules="$(grep -Ec '^mod [a-zA-Z0-9_]+;' src/main.rs || true)"
 echo "main.rs modules: ${main_modules}"
 
 if [[ -f "ARCHITECTURE.md" ]]; then
