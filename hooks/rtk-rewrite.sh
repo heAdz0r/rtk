@@ -71,7 +71,7 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   GIT_VERB=$(echo "$GIT_SUBCMD" | awk '{print $1}')
   case "$GIT_VERB" in
     status|diff|log|show) CMD_CLASS="read_only" ;;
-    add|commit|push|pull|fetch) CMD_CLASS="mutating" ;;
+    add|commit|push|pull|fetch|checkout|cherry-pick) CMD_CLASS="mutating" ;;
     branch)
       BRANCH_ARGS="${GIT_SUBCMD#branch}"
       if echo "$BRANCH_ARGS" | grep -qE '(^|[[:space:]])-(d|D|m|M|c|C)([[:space:]]|$)'; then
@@ -102,7 +102,7 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   esac
 
   case "$GIT_SUBCMD" in
-    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *)
+    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|checkout|checkout\ *|cherry-pick|cherry-pick\ *)
       REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
       ;;
   esac
@@ -122,7 +122,7 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]'; then
   CMD_CLASS="read_only"
   CARGO_SUBCMD=$(echo "$MATCH_CMD" | sed -E 's/^cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?//')
   case "$CARGO_SUBCMD" in
-    test|test\ *|build|build\ *|clippy|clippy\ *|check|check\ *|install|install\ *|nextest|nextest\ *|fmt|fmt\ *)
+    test|test\ *|build|build\ *|clippy|clippy\ *|check|check\ *|install|install\ *|nextest|nextest\ *|fmt|fmt\ *|run|run\ *)
       REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
       ;;
   esac

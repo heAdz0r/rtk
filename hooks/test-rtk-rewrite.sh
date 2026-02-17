@@ -98,6 +98,14 @@ test_rewrite "git push (mutating guarded default)" \
   "git push" \
   ""
 
+test_rewrite "git checkout (mutating guarded default)" \
+  "git checkout feat/gain-project-scope" \
+  ""
+
+test_rewrite "git cherry-pick (mutating guarded default)" \
+  "git cherry-pick 3d08e6c" \
+  ""
+
 test_rewrite "gh pr list" \
   "gh pr list" \
   "rtk gh pr list"
@@ -134,6 +142,10 @@ test_rewrite "cargo test" \
   "cargo test" \
   "rtk cargo test"
 
+test_rewrite "cargo run passthrough" \
+  "cargo run -- rgai --builtin \"token trace\"" \
+  "rtk cargo run -- rgai --builtin \"token trace\""
+
 test_rewrite "npx prisma migrate" \
   "npx prisma migrate" \
   "rtk prisma migrate"
@@ -158,6 +170,16 @@ test_rewrite_with_env "git add . with mutating enabled" \
 test_rewrite_with_env "git commit with mutating enabled" \
   "git commit -m 'msg'" \
   "rtk git commit -m 'msg'" \
+  "RTK_REWRITE_MUTATING=1"
+
+test_rewrite_with_env "git checkout with mutating enabled" \
+  "git checkout feat/gain-project-scope" \
+  "rtk git checkout feat/gain-project-scope" \
+  "RTK_REWRITE_MUTATING=1"
+
+test_rewrite_with_env "git cherry-pick with mutating enabled" \
+  "git cherry-pick 3d08e6c" \
+  "rtk git cherry-pick 3d08e6c" \
   "RTK_REWRITE_MUTATING=1"
 
 echo ""
