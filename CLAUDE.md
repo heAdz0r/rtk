@@ -24,8 +24,9 @@ If `rtk gain` fails, you have the wrong package installed.
 
 ## Development Commands
 
-> **Note**: If rtk is installed, prefer `rtk <cmd>` over raw commands for token-optimized output.
-> All commands work with passthrough support even for subcommands rtk doesn't specifically handle.
+> **Policy**: Always use `rtk <cmd>` instead of raw commands during agent work.
+> Native `Read`/`Grep`/`Edit`/`Write` may still execute, but hooks are configured to nudge back to RTK commands.
+> Use raw commands only for explicit low-level debugging.
 
 ### Build & Run
 ```bash
@@ -284,8 +285,12 @@ All code follows Red-Green-Refactor. See `.claude/skills/rtk-tdd/` for the full 
 
 ### Pre-commit gate
 ```bash
-cargo fmt --all --check && rtk cargo clippy --all-targets && rtk cargo test
+cargo fmt --all --check && rtk cargo clippy --all-targets && rtk cargo test && bash scripts/sync-architecture-modules.sh && bash scripts/validate-docs.sh
 ```
+
+### CI lessons
+- If `src/main.rs` top-level `mod` entries change, run `bash scripts/sync-architecture-modules.sh`.
+- Before push, always run `bash scripts/validate-docs.sh` and include any resulting `ARCHITECTURE.md` update in the commit.
 
 ### Test commands
 ```bash

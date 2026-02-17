@@ -43,7 +43,7 @@ Search priority (mandatory): rgai > rg > grep.
 
 - `rtk rgai` — semantic/intention-based discovery (first choice)
 - `rtk grep` — exact/regex matching (second choice, internal rg -> grep fallback)
-- Native Grep/Read tools may be blocked by hook; use `rtk grep` / `rtk read` via Bash
+- Native Grep/Read tools are allowed by default but hook-notified; always use `rtk grep` / `rtk read` via Bash
 
 ## Semantic Search
 
@@ -62,7 +62,7 @@ rtk read src/main.rs --level none --from 200 --to 320
 ## Safe File Writes
 
 Use `rtk write` for deterministic, atomic edits (idempotent + durable by default).
-Native Edit/Write tools are blocked by hook — always use `rtk write` via Bash.
+Native Edit/Write tools are allowed by default but hook-notified; always use `rtk write` via Bash.
 
 ### Single operations
 
