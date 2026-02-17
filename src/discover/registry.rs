@@ -64,7 +64,7 @@ const PATTERNS: &[&str] = &[
     r"^ls(\s|$)",
     r"^tree(\s|$)",
     r"^find\s+",
-    r"^((npx|bunx)\s+)?vue-tsc(\s|$)",
+    r"^(((npx|bunx)\s+)?vue-tsc|vue\s+tsc)(\s|$)",
     r"^(npx\s+|pnpm\s+)?tsc(\s|$)",
     r"^(npx\s+|pnpm\s+)?(eslint|biome|lint)(\s|$)",
     r"^(npx\s+|pnpm\s+)?prettier",
@@ -234,7 +234,7 @@ const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
-        rtk_cmd: "rtk tsc",
+        rtk_cmd: "rtk npx vue-tsc",
         category: "Build",
         savings_pct: 83.0,
         subcmd_savings: &[],
@@ -872,7 +872,20 @@ mod tests {
         assert_eq!(
             classify_command("bunx vue-tsc --noEmit"),
             Classification::Supported {
-                rtk_equivalent: "rtk tsc",
+                rtk_equivalent: "rtk npx vue-tsc",
+                category: "Build",
+                estimated_savings_pct: 83.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_vue_tsc_shorthand() {
+        assert_eq!(
+            classify_command("vue tsc --noEmit"),
+            Classification::Supported {
+                rtk_equivalent: "rtk npx vue-tsc",
                 category: "Build",
                 estimated_savings_pct: 83.0,
                 status: RtkStatus::Existing,

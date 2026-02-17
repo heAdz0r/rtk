@@ -233,7 +233,10 @@ elif echo "$MATCH_CMD" | grep -qE '^bun[[:space:]]+'; then
   esac
 elif echo "$MATCH_CMD" | grep -qE '^((npx|bunx)[[:space:]]+)?vue-tsc([[:space:]]|$)'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx |bunx )?vue-tsc/rtk tsc/')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx |bunx )?vue-tsc/rtk npx vue-tsc/')"
+elif echo "$MATCH_CMD" | grep -qE '^vue[[:space:]]+tsc([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^vue tsc/rtk npx vue-tsc/')"
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+tsc([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm tsc/rtk tsc/')"

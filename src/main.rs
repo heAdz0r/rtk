@@ -1023,6 +1023,37 @@ enum GoCommands {
     Other(Vec<OsString>),
 }
 
+fn run_npx_passthrough(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("npx requires a command argument");
+    }
+
+    let timer = tracking::TimedExecution::start();
+    let mut cmd = std::process::Command::new("npx");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    if skip_env {
+        cmd.env("SKIP_ENV_VALIDATION", "1");
+    }
+    if verbose > 0 {
+        eprintln!("Running: npx {}", args.join(" "));
+    }
+
+    let status = cmd.status().context("Failed to run npx command")?;
+    let args_str = args.join(" ");
+    timer.track_passthrough(
+        &format!("npx {args_str}"),
+        &format!("rtk npx {args_str} (passthrough)"),
+    );
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1697,6 +1728,9 @@ fn main() -> Result<()> {
                 "tsc" | "typescript" => {
                     tsc_cmd::run(&args[1..], cli.verbose)?;
                 }
+                "vue-tsc" => {
+                    tsc_cmd::run_vue_tsc(&args[1..], cli.verbose, cli.skip_env)?;
+                }
                 "eslint" => {
                     lint_cmd::run(&args[1..], cli.verbose)?;
                 }
@@ -1720,33 +1754,11 @@ fn main() -> Result<()> {
                                 )?;
                             }
                             _ => {
-                                // Passthrough other prisma subcommands
-                                let timer = tracking::TimedExecution::start();
-                                let mut cmd = std::process::Command::new("npx");
-                                for arg in &args {
-                                    cmd.arg(arg);
-                                }
-                                let status = cmd.status().context("Failed to run npx prisma")?;
-                                let args_str = args.join(" ");
-                                timer.track_passthrough(
-                                    &format!("npx {}", args_str),
-                                    &format!("rtk npx {} (passthrough)", args_str),
-                                );
-                                if !status.success() {
-                                    std::process::exit(status.code().unwrap_or(1));
-                                }
+                                run_npx_passthrough(&args, cli.verbose, cli.skip_env)?;
                             }
                         }
                     } else {
-                        let timer = tracking::TimedExecution::start();
-                        let status = std::process::Command::new("npx")
-                            .arg("prisma")
-                            .status()
-                            .context("Failed to run npx prisma")?;
-                        timer.track_passthrough("npx prisma", "rtk npx prisma (passthrough)");
-                        if !status.success() {
-                            std::process::exit(status.code().unwrap_or(1));
-                        }
+                        run_npx_passthrough(&args, cli.verbose, cli.skip_env)?;
                     }
                 }
                 "next" => {
@@ -1759,8 +1771,8 @@ fn main() -> Result<()> {
                     playwright_cmd::run(&args[1..], cli.verbose)?;
                 }
                 _ => {
-                    // Generic passthrough with npm boilerplate filter
-                    npm_cmd::run(&args, cli.verbose, cli.skip_env)?;
+                    // Generic npx passthrough (keep tool semantics; no npm run fallback).
+                    run_npx_passthrough(&args, cli.verbose, cli.skip_env)?;
                 }
             }
         }

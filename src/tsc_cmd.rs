@@ -6,8 +6,6 @@ use std::collections::HashMap;
 use std::process::Command;
 
 pub fn run(args: &[String], verbose: u8) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
-
     // Try tsc directly first, fallback to npx if not found
     let tsc_exists = Command::new("which")
         .arg("tsc")
@@ -15,26 +13,70 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    let mut cmd = if tsc_exists {
-        Command::new("tsc")
-    } else {
-        let mut c = Command::new("npx");
-        c.arg("tsc");
-        c
-    };
+    let mut cmd = command_for_tsc(tsc_exists);
 
     for arg in args {
         cmd.arg(arg);
     }
 
+    let tool = if tsc_exists { "tsc" } else { "npx tsc" };
+    run_tsc_like(
+        cmd,
+        tool,
+        args,
+        verbose,
+        "Failed to run tsc (try: npm install -g typescript)",
+        &format!("{tool} {}", args.join(" ")),
+        &format!("rtk tsc {}", args.join(" ")),
+    )
+}
+
+pub fn run_vue_tsc(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
+    let mut cmd = Command::new("npx");
+    cmd.arg("vue-tsc");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    if skip_env {
+        cmd.env("SKIP_ENV_VALIDATION", "1");
+    }
+    run_tsc_like(
+        cmd,
+        "npx vue-tsc",
+        args,
+        verbose,
+        "Failed to run npx vue-tsc (try: npm install -D vue-tsc)",
+        &format!("npx vue-tsc {}", args.join(" ")),
+        &format!("rtk npx vue-tsc {}", args.join(" ")),
+    )
+}
+
+fn command_for_tsc(tsc_exists: bool) -> Command {
+    if tsc_exists {
+        Command::new("tsc")
+    } else {
+        let mut c = Command::new("npx");
+        c.arg("tsc");
+        c
+    }
+}
+
+fn run_tsc_like(
+    mut cmd: Command,
+    tool_name: &str,
+    args: &[String],
+    verbose: u8,
+    error_context: &str,
+    track_input_cmd: &str,
+    track_rtk_cmd: &str,
+) -> Result<()> {
+    let timer = tracking::TimedExecution::start();
+
     if verbose > 0 {
-        let tool = if tsc_exists { "tsc" } else { "npx tsc" };
-        eprintln!("Running: {} {}", tool, args.join(" "));
+        eprintln!("Running: {} {}", tool_name, args.join(" "));
     }
 
-    let output = cmd
-        .output()
-        .context("Failed to run tsc (try: npm install -g typescript)")?;
+    let output = cmd.output().with_context(|| error_context.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
@@ -49,12 +91,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         println!("{}", filtered);
     }
 
-    timer.track(
-        &format!("tsc {}", args.join(" ")),
-        &format!("rtk tsc {}", args.join(" ")),
-        &raw,
-        &filtered,
-    );
+    timer.track(track_input_cmd, track_rtk_cmd, &raw, &filtered);
 
     // Preserve tsc exit code for CI/CD compatibility
     std::process::exit(exit_code); // upstream sync: use exit_code
@@ -256,5 +293,22 @@ src/app.tsx(20,5): error TS2345: Argument of type 'number' is not assignable to 
         let output = "Found 0 errors. Watching for file changes.";
         let result = filter_tsc_output(output);
         assert!(result.contains("No errors found"));
+    }
+
+    #[test]
+    fn test_filter_vue_tsc_output() {
+        let output = r#"
+src/components/LetterBalloonsVisualizer.vue(43,26): error TS2367: This comparison appears to be unintentional because the types '"pairs" | "basic" | "similar"' and '"words"' have no overlap.
+src/components/LetterBalloonsVisualizer.vue(43,52): error TS2367: This comparison appears to be unintentional because the types '"pairs" | "basic" | "similar"' and '"words-sh"' have no overlap.
+src/components/LetterCountVisualizer.vue(239,26): error TS7053: Element implicitly has an 'any' type because expression of type 'number' can't be used to index type 'Map<number, Set<number>>'.
+
+Found 3 errors in 2 files.
+"#;
+        let result = filter_tsc_output(output);
+        assert!(result.contains("TypeScript: 3 errors in 2 files"));
+        assert!(result.contains("LetterBalloonsVisualizer.vue (2 errors)"));
+        assert!(result.contains("LetterCountVisualizer.vue (1 errors)"));
+        assert!(result.contains("TS2367"));
+        assert!(result.contains("TS7053"));
     }
 }

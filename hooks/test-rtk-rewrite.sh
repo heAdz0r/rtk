@@ -319,11 +319,15 @@ test_rewrite "bun --version" \
 
 test_rewrite "vue-tsc -b" \
   "vue-tsc -b" \
-  "rtk tsc -b"
+  "rtk npx vue-tsc -b"
 
 test_rewrite "npx vue-tsc --noEmit" \
   "npx vue-tsc --noEmit" \
-  "rtk tsc --noEmit"
+  "rtk npx vue-tsc --noEmit"
+
+test_rewrite "vue tsc shorthand" \
+  "vue tsc --noEmit" \
+  "rtk npx vue-tsc --noEmit"
 
 test_rewrite "docker compose up -d" \
   "docker compose up -d" \
