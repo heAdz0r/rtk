@@ -26,6 +26,16 @@ which rtk             # Verify correct binary
 All other commands are automatically rewritten by the Claude Code hook.
 Example: `git status` → `rtk git status` (transparent, 0 tokens overhead)
 Example: `grepai search "auth token refresh"` → `rtk rgai "auth token refresh"`
+Example: `bun run build` → `rtk bun run build`
+
+## JS/TS Defaults (compact first)
+
+```bash
+rtk bun run <script>      # concise default (tests/warnings/errors in a few lines)
+rtk bun run <script> -v   # verbose details when needed
+rtk npm run <script>      # concise script output
+rtk npx <tool> ...        # routes to specialized filters when available
+```
 
 ## Search Priority Policy (MANDATORY)
 

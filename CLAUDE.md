@@ -217,6 +217,7 @@ rtk gain --history | grep proxy
 | gh_cmd.rs | GitHub CLI | Compact PR/issue/run views (26-87% reduction) |
 | vitest_cmd.rs | Vitest test runner | Failures only with ANSI stripping (99.5% reduction) |
 | pnpm_cmd.rs | pnpm package manager | Compact dependency trees (70-90% reduction) |
+| bun_cmd.rs | Bun package manager/scripts | Compact default summaries, verbose details on `-v` |
 | ruff_cmd.rs | Ruff linter/formatter | JSON for check, text for format (80%+ reduction) |
 | pytest_cmd.rs | Pytest test runner | State machine text parser (90%+ reduction) |
 | pip_cmd.rs | pip/uv package manager | JSON parsing, auto-detect uv (70-85% reduction) |
@@ -252,6 +253,11 @@ rtk gain --history | grep proxy
 - **Shared Infrastructure**: utils.rs module for package manager auto-detection
 - **Features**: Exit code preservation, error grouping, consistent formatting
 - **Testing**: Validated on production T3 Stack project (methode-aristote/app)
+
+### PR #17: Bun Wrapper + Compact-By-Default Summaries (2026-02-17)
+- **New Command**: `rtk bun` for `bun run/test/build` flows
+- **Default UX**: concise multi-line summaries for noisy outputs (test/build logs)
+- **Verbose Path**: use `-v` to keep detailed test/failure sections
 
 ### Python & Go Support (2026-02-12)
 - **Python Commands**: 3 commands for Python development workflows

@@ -137,6 +137,7 @@ rtk gh api              # Compact API responses (26%)
 rtk pnpm list           # Compact dependency tree (70%)
 rtk pnpm outdated       # Compact outdated packages (80%)
 rtk pnpm install        # Compact install output (90%)
+rtk bun run <script>    # Compact bun script output (default summary)
 rtk npm run <script>    # Compact npm script output
 rtk npx <cmd>           # Compact npx command output
 rtk prisma              # Prisma without ASCII art (88%)
@@ -1648,6 +1649,7 @@ mod tests {
             "rtk playwright",
             "rtk prisma",
             "rtk pnpm",
+            "rtk bun",
             "rtk npm",
             "rtk ssh",
             "rtk curl",
