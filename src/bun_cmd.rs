@@ -35,7 +35,7 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
         .status
         .code()
         .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let rendered = render_bun_output(args, &raw);
+    let rendered = render_bun_output(args, &raw, verbose);
 
     if let Some(hint) = crate::tee::tee_and_hint(&raw, "bun", exit_code) {
         println!("{}\n{}", rendered, hint);
@@ -57,24 +57,15 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_bun_output(args: &[String], output: &str) -> String {
+fn render_bun_output(args: &[String], output: &str, verbose: u8) -> String {
     // Version/short commands should stay as-is.
     if matches!(args.first().map(|s| s.as_str()), Some("--version" | "-v")) {
         return filter_bun_output(output);
     }
-
-    let filtered = filter_bun_output(output);
-    let is_noisy = filtered.lines().count() > 80
-        || output.contains("Test Files")
-        || output.contains("vite v")
-        || output.contains("modules transformed")
-        || output.contains("vite-plugin-compression");
-
-    if is_noisy {
-        summarize_bun_output(args, output)
-    } else {
-        filtered
+    if verbose > 0 {
+        return filter_bun_output(output);
     }
+    summarize_bun_output(args, output)
 }
 
 fn filter_bun_output(output: &str) -> String {

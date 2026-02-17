@@ -84,7 +84,13 @@ fn run_build(args: &[String], verbose: u8) -> Result<()> {
 }
 
 fn run_test(args: &[String], verbose: u8) -> Result<()> {
-    run_cargo_filtered("test", args, verbose, filter_cargo_test)
+    run_cargo_filtered("test", args, verbose, |raw| {
+        if verbose > 0 {
+            filter_cargo_test_verbose(raw)
+        } else {
+            filter_cargo_test(raw)
+        }
+    })
 }
 
 fn run_clippy(args: &[String], verbose: u8) -> Result<()> {
@@ -636,13 +642,6 @@ impl AggregatedTestResult {
         });
 
         let caps = re.captures(line)?;
-        let status = caps.get(1)?.as_str();
-
-        // Only aggregate if status is "ok" (all tests passed)
-        if status != "ok" {
-            return None;
-        }
-
         let passed = caps.get(2)?.as_str().parse().ok()?;
         let failed = caps.get(3)?.as_str().parse().ok()?;
         let ignored = caps.get(4)?.as_str().parse().ok()?;
@@ -683,6 +682,9 @@ impl AggregatedTestResult {
     fn format_compact(&self) -> String {
         let mut parts = vec![format!("{} passed", self.passed)];
 
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
         if self.ignored > 0 {
             parts.push(format!("{} ignored", self.ignored));
         }
@@ -698,32 +700,73 @@ impl AggregatedTestResult {
             format!("{} suites", self.suites)
         };
 
+        let mark = if self.failed > 0 { "✗" } else { "✓" };
         if self.has_duration {
             format!(
-                "✓ cargo test: {} ({}, {:.2}s)",
+                "{mark} cargo test: {} ({}, {:.2}s)",
                 counts, suite_text, self.duration_secs
             )
         } else {
-            format!("✓ cargo test: {} ({})", counts, suite_text)
+            format!("{mark} cargo test: {} ({})", counts, suite_text)
         }
     }
 }
 
-/// Filter cargo test output - show failures + summary only
+/// Filter cargo test output - compact 3-line summary (default mode)
 fn filter_cargo_test(output: &str) -> String {
     let diag = crate::diag_summary::analyze_output(output);
 
     fn with_diag(base: String, diag: &crate::diag_summary::DiagnosticSummary) -> String {
         format!("{}\n{}\n{}", base, diag.warnings_line(), diag.errors_line())
     }
+    let summary_lines: Vec<&str> = output
+        .lines()
+        .filter(|l| l.trim_start().starts_with("test result:"))
+        .collect();
 
+    let mut aggregated: Option<AggregatedTestResult> = None;
+    let mut parsed_any = false;
+    let mut parsed_all = true;
+
+    for line in &summary_lines {
+        if let Some(parsed) = AggregatedTestResult::parse_line(line.trim()) {
+            if let Some(ref mut agg) = aggregated {
+                agg.merge(&parsed);
+            } else {
+                aggregated = Some(parsed);
+            }
+            parsed_any = true;
+        } else {
+            parsed_all = false;
+        }
+    }
+
+    if parsed_any && parsed_all {
+        if let Some(agg) = aggregated {
+            if agg.suites > 0 {
+                return with_diag(agg.format_compact(), &diag);
+            }
+        }
+    }
+
+    if !summary_lines.is_empty() {
+        return with_diag(
+            format!("cargo test: {}", summary_lines.last().unwrap().trim()),
+            &diag,
+        );
+    }
+
+    with_diag("cargo test: completed".to_string(), &diag)
+}
+
+/// Verbose cargo test filter with failure details (for `-v`).
+fn filter_cargo_test_verbose(output: &str) -> String {
     let mut failures: Vec<String> = Vec::new();
     let mut summary_lines: Vec<String> = Vec::new();
     let mut in_failure_section = false;
     let mut current_failure = Vec::new();
 
     for line in output.lines() {
-        // Skip compilation lines
         if line.trim_start().starts_with("Compiling")
             || line.trim_start().starts_with("Downloading")
             || line.trim_start().starts_with("Downloaded")
@@ -732,12 +775,10 @@ fn filter_cargo_test(output: &str) -> String {
             continue;
         }
 
-        // Skip "running N tests" and individual "test ... ok" lines
         if line.starts_with("running ") || (line.starts_with("test ") && line.ends_with("... ok")) {
             continue;
         }
 
-        // Detect failures section
         if line == "failures:" {
             in_failure_section = true;
             continue;
@@ -757,7 +798,6 @@ fn filter_cargo_test(output: &str) -> String {
             }
         }
 
-        // Capture test result summary
         if !in_failure_section && line.starts_with("test result:") {
             summary_lines.push(line.to_string());
         }
@@ -768,41 +808,6 @@ fn filter_cargo_test(output: &str) -> String {
     }
 
     let mut result = String::new();
-
-    if failures.is_empty() && !summary_lines.is_empty() {
-        // All passed - try to aggregate
-        let mut aggregated: Option<AggregatedTestResult> = None;
-        let mut all_parsed = true;
-
-        for line in &summary_lines {
-            if let Some(parsed) = AggregatedTestResult::parse_line(line) {
-                if let Some(ref mut agg) = aggregated {
-                    agg.merge(&parsed);
-                } else {
-                    aggregated = Some(parsed);
-                }
-            } else {
-                all_parsed = false;
-                break;
-            }
-        }
-
-        // If all lines parsed successfully and we have at least one suite, return compact format
-        if all_parsed {
-            if let Some(agg) = aggregated {
-                if agg.suites > 0 {
-                    return with_diag(agg.format_compact(), &diag);
-                }
-            }
-        }
-
-        // Fallback: use original behavior if regex failed
-        for line in &summary_lines {
-            result.push_str(&format!("✓ {}\n", line));
-        }
-        return with_diag(result.trim().to_string(), &diag);
-    }
-
     if !failures.is_empty() {
         result.push_str(&format!("FAILURES ({}):\n", failures.len()));
         result.push_str("═══════════════════════════════════════\n");
@@ -814,13 +819,10 @@ fn filter_cargo_test(output: &str) -> String {
         }
         result.push('\n');
     }
-
     for line in &summary_lines {
         result.push_str(&format!("{}\n", line));
     }
-
     if result.trim().is_empty() {
-        // Fallback: show last meaningful lines
         let meaningful: Vec<&str> = output
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("Compiling"))
@@ -829,8 +831,7 @@ fn filter_cargo_test(output: &str) -> String {
             result.push_str(&format!("{}\n", line));
         }
     }
-
-    with_diag(result.trim().to_string(), &diag)
+    result.trim().to_string()
 }
 
 /// Filter cargo clippy output - group warnings by lint rule
@@ -1047,12 +1048,13 @@ thread 'foo::test_b' panicked at 'assert_eq!(1, 2)'
 failures:
     foo::test_b
 
-test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+        test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 "#;
         let result = filter_cargo_test(output);
-        assert!(result.contains("FAILURES"));
-        assert!(result.contains("test_b"));
-        assert!(result.contains("test result:"));
+        assert!(result.contains("✗ cargo test: 4 passed, 1 failed (1 suite)"));
+        assert!(result.contains("warnings: 0"));
+        assert!(result.contains("errors: 0"));
+        assert!(!result.contains("test_b"));
     }
 
     #[test]
@@ -1110,17 +1112,17 @@ test result: FAILED. 14 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out;
      Running tests/integration.rs
 
 running 10 tests
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+        test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 "#;
         let result = filter_cargo_test(output);
-        // Should NOT aggregate when there are failures
-        assert!(result.contains("FAILURES"), "got: {}", result);
-        assert!(result.contains("test_bad"), "got: {}", result);
-        assert!(result.contains("test result:"), "got: {}", result);
-        // Should show individual summaries
-        assert!(result.contains("20 passed"), "got: {}", result);
-        assert!(result.contains("14 passed"), "got: {}", result);
-        assert!(result.contains("10 passed"), "got: {}", result);
+        assert!(
+            result.contains("✗ cargo test: 44 passed, 1 failed (3 suites, 0.17s)"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("warnings: 0"), "got: {}", result);
+        assert!(result.contains("errors: 0"), "got: {}", result);
+        assert!(!result.contains("test_bad"), "got: {}", result);
     }
 
     #[test]
@@ -1194,12 +1196,29 @@ running 15 tests
 test result: MALFORMED LINE WITHOUT PROPER FORMAT
 "#;
         let result = filter_cargo_test(output);
-        // Should fallback to original behavior (show line with checkmark)
         assert!(
-            result.contains("✓ test result: MALFORMED"),
+            result.contains("cargo test: test result: MALFORMED LINE WITHOUT PROPER FORMAT"),
             "Expected fallback format, got: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_filter_cargo_test_verbose_keeps_failure_details() {
+        let output = r#"running 3 tests
+test foo::a ... ok
+test foo::b ... FAILED
+
+failures:
+---- foo::b stdout ----
+thread 'foo::b' panicked
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+"#;
+        let result = filter_cargo_test_verbose(output);
+        assert!(result.contains("FAILURES"));
+        assert!(result.contains("foo::b"));
+        assert!(result.contains("test result: FAILED"));
     }
 
     #[test]
