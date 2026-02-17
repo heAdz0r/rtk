@@ -1126,7 +1126,7 @@ enum MemoryCommands {
         /// Project root to watch
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Poll interval in seconds
+        /// Debounce window in seconds (E3.1: event-driven via notify)
         #[arg(long, default_value = "2")]
         interval: u64,
         /// Response detail level
