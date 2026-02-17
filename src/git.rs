@@ -1159,10 +1159,16 @@ fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8) -> Result<(
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{}{}", stdout, stderr);
 
-            let msg = if output.status.success() {
+            // P1-3: track + exit in each branch to avoid unreachable code after -> !
+            if output.status.success() {
                 let msg = format!("ok stash {}", sub);
                 println!("{}", msg);
-                msg
+                timer.track(
+                    &format!("git stash {}", sub),
+                    &format!("rtk git stash {}", sub),
+                    &combined,
+                    &msg,
+                );
             } else {
                 timer.track(
                     &format!("git stash {}", sub),
@@ -1176,14 +1182,7 @@ fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8) -> Result<(
                     &stderr,
                     output.status,
                 );
-            };
-
-            timer.track(
-                &format!("git stash {}", sub),
-                &format!("rtk git stash {}", sub),
-                &combined,
-                &msg,
-            );
+            }
         }
         _ => {
             // Default: git stash (push)
@@ -1197,22 +1196,19 @@ fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8) -> Result<(
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{}{}", stdout, stderr);
 
-            let msg = if output.status.success() {
-                if stdout.contains("No local changes") {
-                    let msg = "ok (nothing to stash)";
-                    println!("{}", msg);
-                    msg.to_string()
+            // P1-3: track + exit in each branch to avoid unreachable code after -> !
+            if output.status.success() {
+                let msg = if stdout.contains("No local changes") {
+                    "ok (nothing to stash)"
                 } else {
-                    let msg = "ok stashed";
-                    println!("{}", msg);
-                    msg.to_string()
-                }
+                    "ok stashed"
+                };
+                println!("{}", msg);
+                timer.track("git stash", "rtk git stash", &combined, msg);
             } else {
                 timer.track("git stash", "rtk git stash", &combined, "FAILED");
                 exit_with_git_failure("git stash", &stdout, &stderr, output.status);
-            };
-
-            timer.track("git stash", "rtk git stash", &combined, &msg);
+            }
         }
     }
 

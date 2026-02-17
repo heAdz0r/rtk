@@ -271,3 +271,93 @@ Target:
 2. Затем PR-W2 (atomic core).
 3. После этого PR-W5 (bench gates).
 4. И только после прохождения gate — обсуждать расширение `rtk write` и/или mutating auto-rewrite.
+
+---
+
+## PR-W6: Write path hardening (post-audit, 2026-02-17)
+
+Выявлено по результатам аудита LLM-понятности, fuzziness-анализа, clippy (88 warnings), Context7 cross-ref.
+
+### Iteration 1: Quick wins (P0 + P1 cleanup)
+
+#### P0-1: Убрать двойной idempotent-check в write_cmd
+**Проблема**: `run_replace`/`run_patch`/`run_set` уже вычисляют `updated` и знают, что контент менялся, но `AtomicWriter` повторно читает файл в `is_unchanged()`.
+**Замер**: worst-case 8MB fast: ~2009us → ~1000us при assume_changed (≈2x).
+**Решение**: передавать `WriteOptions { idempotent_skip: false, .. }` из `write_cmd` когда diff уже известен. Добавить CAS CLI-флаги (`--if-match-mtime`, `--if-match-len`, `--if-match-hash`) и прокидывать `WriteOptions.cas` из write_cmd.
+**Файлы**: `src/write_cmd.rs:95,132,248`, `src/write_core.rs:137`.
+
+#### P0-2: Single-pass replace/patch без двойного скана
+**Проблема**: `matches().count()` + `replace()`/`replacen()` = 2 прохода + полная копия.
+**Решение**:
+- `--all`: считать count и строить результат за один проход.
+- Без `--all`: `find()` + `replacen(..., 1)`, без предварительного `count`.
+**Файлы**: `src/write_cmd.rs:49,54-58,132,137-141`.
+
+#### P1-1: Убрать I/O метрики из LLM-facing output
+**Проблема**: `fsync=N, rename=N, skipped=bool` в stdout — noise для LLM-агента.
+**Решение**: перенести в `--verbose 2`, оставить в default только `ok replace: N occurrence(s)`.
+**Файлы**: `src/write_cmd.rs:97-99,180-182,249-251`.
+
+#### P1-2: Убрать WriteSemantics debug format из output
+**Проблема**: `(Replace/Text)` в no-op и dry-run сообщениях — декоративный тип, LLM его не использует.
+**Решение**: удалить `{:?}` formatting из println!. `write_semantics.rs` оставить для документации контракта, но не выводить в user-facing output.
+**Файлы**: `src/write_cmd.rs:62-65,80-84,144-148,163-167,232-237`.
+
+#### P1-3: Исправить dead code в `run_stash`
+**Проблема**: `timer.track()` на строках 1181-1186 и 1215 недостижим при failure (после `exit_with_git_failure -> !`).
+**Решение**: вынести `timer.track` из `let msg = if ... { } else { exit }` pattern — tracking для success-path должен быть внутри success-ветки.
+**Файлы**: `src/git.rs:1162-1186,1200-1216`.
+
+#### P1-4: Исправить persist error handling — сохранить error chain
+**Проблема**: `map_err(|e| anyhow!(..., e.error))` теряет error chain и temp file handle.
+**Решение**: `map_err(|e| anyhow::Error::new(e.error).context(format!(...)))`.
+**Файлы**: `src/write_core.rs:183-189`.
+
+#### P1-5: Очистить dead code (clippy warnings)
+**Проблема**: `FileSnapshot`, `snapshot_file`, `CasOptions::from_snapshot` — 0 callers в production.
+**Решение**: После P0-1 (CAS CLI-флаги) эти станут used. До тех пор — `#[allow(dead_code)]` с `// Used by CAS CLI flags (PR-W6 P0-1)` comment.
+**Файлы**: `src/write_core.rs:17,31,208`.
+
+### Iteration 2: Core improvements (P1 features + P2)
+
+#### P1-6: `--json`/`--quiet` output mode для write
+**Проблема**: 14-21 токен статуса на операцию. Для LLM-цепочек нужен машинный ответ.
+**Решение**: `--json` → `{"ok":true,"applied":1,"file":"..."}`, `--quiet` → пустой stdout при success.
+**Файлы**: `src/write_cmd.rs`, `src/main.rs` (CLI flags).
+
+#### P1-7: Batch-режим `rtk write batch --plan <json>`
+**Проблема**: startup процесса ~34-35ms. При серии правок от LLM — overhead доминирует.
+**Решение**: принимать JSON-план с массивом операций, группировать fsync/rename по parent dirs.
+**Файлы**: `src/write_cmd.rs` (new `run_batch`), `src/main.rs`.
+
+#### P1-8: Symlink/TOCTOU защита
+**Проблема**: `path.exists()` + metadata read → TOCTOU race. Symlink-target может отличаться от ожидаемого.
+**Решение**: `--allow-symlink` flag (default: reject symlinks). File-lock (advisory) для multi-agent сценариев.
+**Файлы**: `src/write_core.rs:127,183`.
+
+#### P2-1: JSON `--key ""` — запретить перезапись root
+**Проблема**: `set_json_path` при пустом key делает `*root = value` — перезаписывает весь файл.
+**Решение**: `bail!("--key must be non-empty")` аналогично TOML-ветке.
+**Файлы**: `src/write_cmd.rs:372-377`.
+
+#### P2-2: Strict mode для `--value-type auto`
+**Проблема**: невалидный JSON молча превращается в строку (fallback `Ok(JsonValue::String(raw))`).
+**Решение**: `--strict` flag — при auto-detection failure возвращать ошибку вместо string fallback.
+**Файлы**: `src/write_cmd.rs:292-297`.
+
+#### P2-3: Fast/durable policy по типу файла
+**Проблема**: для temp/generated файлов `--fast` даёт 2-3x speedup, но нужно явно указывать.
+**Решение**: policy config в `~/.config/rtk/config.toml`: `[write] default_durability = "fast"` + per-glob overrides.
+**Файлы**: `src/write_cmd.rs`, `src/config.rs`.
+
+#### P2-4: Объединить replace/patch или чётко документировать разницу
+**Проблема**: ~170 строк дупликации, функционально идентичные операции с разными flag names.
+**Решение**: общий internal `run_text_replace(mode: ReplaceMode)` + aliases.
+**Файлы**: `src/write_cmd.rs:31-195`.
+
+### Gate criteria (PR-W6)
+1. clippy clean на write-модулях (0 warnings в write_core/write_cmd/write_semantics).
+2. Benchmark: single-pass replace не медленнее текущего на 128 KiB.
+3. LLM-facing output: <= 8 токенов на success operation (default mode).
+4. Все тесты `cargo test write` green.
+5. `--json` output parseable `jq` без ошибок.

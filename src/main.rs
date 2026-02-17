@@ -167,6 +167,9 @@ enum Commands {
 
     /// Safe file writes (atomic + idempotent) with dry-run support
     Write {
+        /// Output mode: quiet (silent on success), concise (default), json (machine-readable)
+        #[arg(long, value_enum, default_value = "concise")]
+        output: write_cmd::OutputMode,
         #[command(subcommand)]
         command: WriteCommands,
     },
@@ -764,6 +767,18 @@ enum WriteCommands {
         #[arg(long)]
         fast: bool,
     },
+    /// Execute a batch of write operations from a JSON plan (single process, grouped I/O)
+    Batch {
+        /// JSON plan: array of ops [{op:"replace",file:"...",from:"...",to:"..."}, ...]
+        #[arg(long)]
+        plan: String,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Use fast durability mode (skip fsync)
+        #[arg(long)]
+        fast: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1149,7 +1164,7 @@ fn main() -> Result<()> {
             }
         },
 
-        Commands::Write { command } => match command {
+        Commands::Write { output, command } => match command {
             WriteCommands::Replace {
                 file,
                 from,
@@ -1158,7 +1173,7 @@ fn main() -> Result<()> {
                 dry_run,
                 fast,
             } => {
-                write_cmd::run_replace(&file, &from, &to, all, dry_run, fast, cli.verbose)?;
+                write_cmd::run_replace(&file, &from, &to, all, dry_run, fast, cli.verbose, output)?;
             }
             WriteCommands::Patch {
                 file,
@@ -1168,7 +1183,7 @@ fn main() -> Result<()> {
                 dry_run,
                 fast,
             } => {
-                write_cmd::run_patch(&file, &old, &new_text, all, dry_run, fast, cli.verbose)?;
+                write_cmd::run_patch(&file, &old, &new_text, all, dry_run, fast, cli.verbose, output)?;
             }
             WriteCommands::Set {
                 file,
@@ -1188,7 +1203,15 @@ fn main() -> Result<()> {
                     dry_run,
                     fast,
                     cli.verbose,
+                    output,
                 )?;
+            }
+            WriteCommands::Batch {
+                plan,
+                dry_run,
+                fast,
+            } => {
+                write_cmd::run_batch(&plan, dry_run, fast, cli.verbose, output)?;
             }
         },
 

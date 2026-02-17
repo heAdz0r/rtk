@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File, Metadata};
 use std::hash::Hasher;
@@ -13,7 +13,9 @@ pub enum DurabilityMode {
     Fast,
 }
 
+// P1-5: CAS infrastructure — will be used by CAS CLI flags (PR-W6 P0-1)
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct FileSnapshot {
     pub len: Option<u64>,
     pub modified: Option<SystemTime>,
@@ -28,6 +30,7 @@ pub struct CasOptions {
 }
 
 impl CasOptions {
+    #[allow(dead_code)] // P1-5: will be used by CAS CLI flags
     pub fn from_snapshot(snapshot: &FileSnapshot) -> Self {
         Self {
             expected_len: snapshot.len,
@@ -180,12 +183,10 @@ impl AtomicWriter {
             fsync_count += 1;
         }
 
+        // P1-4: preserve error chain via .context() instead of formatting into anyhow!
         temp_file.persist(path).map_err(|e| {
-            anyhow!(
-                "Failed to atomically replace {}: {}",
-                path.display(),
-                e.error
-            )
+            anyhow::Error::new(e.error)
+                .context(format!("Failed to atomically replace {}", path.display()))
         })?;
 
         if self.options.durability == DurabilityMode::Durable {
@@ -205,6 +206,7 @@ impl AtomicWriter {
     }
 }
 
+#[allow(dead_code)] // P1-5: will be used by CAS CLI flags
 pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnapshot>> {
     if !path.exists() {
         return Ok(None);
