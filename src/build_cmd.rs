@@ -17,6 +17,7 @@ pub struct BuildShOptions {
     pub symlink_usr_local: bool,
     pub use_sudo: bool,
     pub set_version: Option<String>,
+    pub sync_global_init: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +102,39 @@ pub fn run_sh(opts: BuildShOptions, verbose: u8) -> Result<()> {
         verify_binary(&paths.usr_local_bin)?;
     }
 
+    if opts.sync_global_init {
+        sync_global_init(&paths, opts.install_user)?;
+    }
+
     log("done");
+    Ok(())
+}
+
+fn sync_global_init(paths: &BuildPaths, prefer_user_bin: bool) -> Result<()> {
+    let sync_bin = if prefer_user_bin && paths.user_bin.exists() {
+        &paths.user_bin
+    } else {
+        &paths.release_bin
+    };
+
+    log(&format!(
+        "sync global Claude hooks/settings via `{}`",
+        sync_bin.display()
+    ));
+
+    let status = Command::new(sync_bin)
+        .arg("init")
+        .arg("-g")
+        .arg("--auto-patch")
+        // Build should be deterministic and fast; skip optional grepai install.
+        .env("RTK_SKIP_GREPAI", "1")
+        .status()
+        .with_context(|| format!("Failed to run `{}` init sync", sync_bin.display()))?;
+
+    if !status.success() {
+        warn("Global init sync failed (build succeeded). Run `rtk init -g --auto-patch` manually.");
+    }
+
     Ok(())
 }
 

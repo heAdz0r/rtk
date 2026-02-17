@@ -355,9 +355,19 @@ fn write_tracking_enabled() -> bool {
     })
 }
 
-/// Best-effort unescape for shell-escaped punctuation (e.g. "\!" -> "!").
-/// Used only as a fallback when exact matching fails.
-fn maybe_unescape_shell_escapes(input: &str) -> Option<String> {
+/// Characters that are commonly shell-escaped by agents/wrappers and can break
+/// exact text matching when passed through multiple layers.
+fn is_shell_escaped_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        '!' | '$' | '&' | '(' | ')' | '*' | ';' | '<' | '>' | '?' | '[' | ']' | '{' | '}' | '|'
+            | '#'
+    )
+}
+
+/// Single-pass best-effort unescape for shell-escaped punctuation
+/// (e.g. "\!" -> "!"). Used only as a fallback when exact matching fails.
+fn maybe_unescape_shell_escapes_once(input: &str) -> Option<String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut changed = false;
@@ -365,7 +375,7 @@ fn maybe_unescape_shell_escapes(input: &str) -> Option<String> {
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             if let Some(&next) = chars.peek() {
-                if next.is_ascii_punctuation() && next != '\\' {
+                if is_shell_escaped_punct(next) {
                     out.push(next);
                     chars.next();
                     changed = true;
@@ -379,12 +389,53 @@ fn maybe_unescape_shell_escapes(input: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Generate progressively unescaped variants (up to `max_steps`).
+/// This handles cases where strings are escaped multiple times (e.g. "\\\\!" -> "\\!" -> "!").
+fn shell_unescape_candidates(input: &str, max_steps: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut current = input.to_string();
+
+    for step in 1..=max_steps {
+        let Some(next) = maybe_unescape_shell_escapes_once(current.as_str()) else {
+            break;
+        };
+        if out.iter().any(|(_, seen)| seen == &next) {
+            break;
+        }
+        out.push((step, next.clone()));
+        current = next;
+    }
+
+    out
+}
+
+fn apply_shell_unescape_steps<'a>(input: &'a str, steps: usize) -> Cow<'a, str> {
+    let mut current: Cow<'a, str> = Cow::Borrowed(input);
+    for _ in 0..steps {
+        let Some(next) = maybe_unescape_shell_escapes_once(current.as_ref()) else {
+            break;
+        };
+        current = Cow::Owned(next);
+    }
+    current
+}
+
+fn has_shell_escape_like_pattern(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek().copied().is_some_and(is_shell_escaped_punct) {
+            return true;
+        }
+    }
+    false
+}
+
 fn smart_no_match_hint(base: &str, flag: &str, pattern: &str) -> String {
     let mut hints: Vec<String> = Vec::new();
 
-    if maybe_unescape_shell_escapes(pattern).is_some() {
+    if has_shell_escape_like_pattern(pattern) {
         hints.push(format!(
-            "pattern for {} looks shell-escaped (for example, '\\\\!'); pass literal text or single-quote the argument",
+            "pattern for {} contains shell-style escapes (for example, '\\\\!'); pass literal text or single-quote the argument",
             flag
         ));
     }
@@ -413,15 +464,14 @@ fn resolve_match_pair<'a>(
         return Some((Cow::Borrowed(pattern), Cow::Borrowed(replacement)));
     }
 
-    let unescaped_pattern = maybe_unescape_shell_escapes(pattern)?;
-    if !content.contains(unescaped_pattern.as_str()) {
-        return None;
+    for (steps, candidate) in shell_unescape_candidates(pattern, 4) {
+        if content.contains(candidate.as_str()) {
+            let replacement_candidate = apply_shell_unescape_steps(replacement, steps);
+            return Some((Cow::Owned(candidate), replacement_candidate));
+        }
     }
 
-    let unescaped_replacement = maybe_unescape_shell_escapes(replacement)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed(replacement));
-    Some((Cow::Owned(unescaped_pattern), unescaped_replacement))
+    None
 }
 
 pub fn run_replace(
@@ -1253,7 +1303,29 @@ mod tests {
         let err = run_replace(&file, "\\!=", "==", false, tp(OutputMode::Quiet)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("NO_MATCH"));
-        assert!(msg.contains("shell-escaped"));
+        assert!(msg.contains("shell-style escapes"));
+    }
+
+    #[test]
+    fn no_shell_escape_hint_for_common_code_backslashes() {
+        let hint = smart_no_match_hint("hunk not found", "--old", "replace('\\\\', \"/\")");
+        assert!(
+            !hint.contains("shell-style escapes"),
+            "code backslashes should not trigger shell-escape hint"
+        );
+    }
+
+    #[test]
+    fn replace_unescapes_double_escaped_shell_punctuation() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("double_escaped_bang_replace.txt");
+        fs::write(&file, "if a != b { return; }\n").unwrap();
+
+        run_replace(&file, "\\\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "if a == b { return; }\n"
+        );
     }
 
     #[test]

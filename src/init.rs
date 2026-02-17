@@ -992,6 +992,13 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
 
 /// Offer grepai installation during `rtk init --global`
 fn setup_grepai(patch_mode: PatchMode, verbose: u8) -> Result<()> {
+    if std::env::var("RTK_SKIP_GREPAI").ok().as_deref() == Some("1") {
+        if verbose > 0 {
+            eprintln!("grepai setup skipped (RTK_SKIP_GREPAI=1)");
+        }
+        return Ok(());
+    }
+
     // Check if grepai is already installed
     if let Some(path) = grepai::find_grepai_binary() {
         println!("\n  grepai: already installed at {}", path.display());

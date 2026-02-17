@@ -860,6 +860,9 @@ enum BuildCommands {
         /// Never invoke sudo
         #[arg(long)]
         no_sudo: bool,
+        /// Skip automatic global `rtk init -g --auto-patch` sync after build/install
+        #[arg(long)]
+        no_init_sync: bool,
     },
 }
 
@@ -1163,6 +1166,13 @@ enum MemoryCommands {
         /// Show current hook status without changing anything
         #[arg(long)]
         status: bool,
+    },
+
+    /// Show token savings: raw source bytes vs compact context (E6.3)
+    Gain {
+        /// Project root to measure (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
     },
 }
 
@@ -1476,6 +1486,7 @@ fn main() -> Result<()> {
                 set_version,
                 no_verify,
                 no_sudo,
+                no_init_sync,
             } => {
                 let use_sudo =
                     !no_sudo && std::env::var("RTK_BUILD_NO_SUDO").ok().as_deref() != Some("1");
@@ -1490,6 +1501,7 @@ fn main() -> Result<()> {
                         symlink_usr_local,
                         use_sudo,
                         set_version,
+                        sync_global_init: !no_init_sync,
                     },
                     cli.verbose,
                 )?;
@@ -1929,6 +1941,9 @@ fn main() -> Result<()> {
             }
             MemoryCommands::InstallHook { uninstall, status } => {
                 memory_layer::run_install_hook(uninstall, status, cli.verbose)?;
+            }
+            MemoryCommands::Gain { project } => { // E6.3
+                memory_layer::run_gain(&project, cli.verbose)?;
             }
         },
 
