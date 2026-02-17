@@ -9,7 +9,7 @@ cat <<'EOF'
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Native Edit/Write tools are disabled. Use `rtk write` via Bash instead:\n  rtk write replace <file> --from 'old' --to 'new' [--all]\n  rtk write patch <file> --old 'old block' --new 'new block' [--all]\n  rtk write set <file.json> --key a.b --value true\n  rtk write batch --plan '[{\"op\":\"replace\",\"file\":\"...\",\"from\":\"...\",\"to\":\"...\"}]'\nAll writes are atomic (tempfile+rename), idempotent, and support --dry-run."
+    "permissionDecisionReason": "Native Edit/Write tools are disabled. Use `rtk write` via Bash instead:\n  rtk write replace <file> --from 'old' --to 'new' [--all] [--cas] [--retry N]\n  rtk write patch <file> --old 'old block' --new 'new block' [--all] [--cas] [--retry N]\n  rtk write set <file.json> --key a.b --value true [--cas] [--retry N]\n  rtk write batch --plan '[{\"op\":\"replace\",\"file\":\"...\",\"from\":\"...\",\"to\":\"...\"}]'\nAll writes are atomic (tempfile+rename), idempotent, and support --dry-run, --cas (compare-and-swap), and --retry N (auto-retry on conflict)."
   }
 }
 EOF

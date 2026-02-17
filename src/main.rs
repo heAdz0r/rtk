@@ -59,6 +59,7 @@ mod vitest_cmd;
 mod wget_cmd;
 mod write_cmd;
 mod write_core;
+mod write_lock; // changed: flock abstraction for concurrent write safety
 mod write_semantics;
 
 use anyhow::{Context, Result};
@@ -69,7 +70,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "rtk",
-    version = "0.20.1-fork.4",
+    version = "0.20.1-fork.5",
     about = "Rust Token Killer - Minimize LLM token consumption",
     long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
@@ -723,6 +724,12 @@ enum WriteCommands {
         /// Use fast durability mode (skip fsync)
         #[arg(long)]
         fast: bool,
+        /// Enable explicit CAS (compare-and-swap) check // changed: concurrency flag
+        #[arg(long)]
+        cas: bool,
+        /// Retry on conflict (auto-enables CAS when > 0) // changed: concurrency flag
+        #[arg(long, default_value = "0")]
+        retry: u32,
     },
     /// Apply exact old->new hunk replacement
     Patch {
@@ -743,6 +750,12 @@ enum WriteCommands {
         /// Use fast durability mode (skip fsync)
         #[arg(long)]
         fast: bool,
+        /// Enable explicit CAS (compare-and-swap) check // changed: concurrency flag
+        #[arg(long)]
+        cas: bool,
+        /// Retry on conflict (auto-enables CAS when > 0) // changed: concurrency flag
+        #[arg(long, default_value = "0")]
+        retry: u32,
     },
     /// Set structured config key in JSON/TOML file
     Set {
@@ -766,6 +779,12 @@ enum WriteCommands {
         /// Use fast durability mode (skip fsync)
         #[arg(long)]
         fast: bool,
+        /// Enable explicit CAS (compare-and-swap) check // changed: concurrency flag
+        #[arg(long)]
+        cas: bool,
+        /// Retry on conflict (auto-enables CAS when > 0) // changed: concurrency flag
+        #[arg(long, default_value = "0")]
+        retry: u32,
     },
     /// Execute a batch of write operations from a JSON plan (single process, grouped I/O)
     Batch {
@@ -778,6 +797,12 @@ enum WriteCommands {
         /// Use fast durability mode (skip fsync)
         #[arg(long)]
         fast: bool,
+        /// Enable explicit CAS (compare-and-swap) check // changed: concurrency flag
+        #[arg(long)]
+        cas: bool,
+        /// Retry on conflict (auto-enables CAS when > 0) // changed: concurrency flag
+        #[arg(long, default_value = "0")]
+        retry: u32,
     },
 }
 
@@ -1172,8 +1197,21 @@ fn main() -> Result<()> {
                 all,
                 dry_run,
                 fast,
+                cas, // changed: concurrency flags
+                retry,
             } => {
-                write_cmd::run_replace(&file, &from, &to, all, dry_run, fast, cli.verbose, output)?;
+                let concurrency = write_cmd::ConcurrencyOpts {
+                    cas,
+                    max_retries: retry,
+                }; // changed: construct ConcurrencyOpts
+                let params = write_cmd::WriteParams {
+                    dry_run,
+                    fast,
+                    verbose: cli.verbose,
+                    output,
+                    concurrency,
+                };
+                write_cmd::run_replace(&file, &from, &to, all, params)?;
             }
             WriteCommands::Patch {
                 file,
@@ -1182,17 +1220,21 @@ fn main() -> Result<()> {
                 all,
                 dry_run,
                 fast,
+                cas, // changed: concurrency flags
+                retry,
             } => {
-                write_cmd::run_patch(
-                    &file,
-                    &old,
-                    &new_text,
-                    all,
+                let concurrency = write_cmd::ConcurrencyOpts {
+                    cas,
+                    max_retries: retry,
+                }; // changed: construct ConcurrencyOpts
+                let params = write_cmd::WriteParams {
                     dry_run,
                     fast,
-                    cli.verbose,
+                    verbose: cli.verbose,
                     output,
-                )?;
+                    concurrency,
+                };
+                write_cmd::run_patch(&file, &old, &new_text, all, params)?;
             }
             WriteCommands::Set {
                 file,
@@ -1202,25 +1244,41 @@ fn main() -> Result<()> {
                 format,
                 dry_run,
                 fast,
+                cas, // changed: concurrency flags
+                retry,
             } => {
-                write_cmd::run_set(
-                    &file,
-                    &key,
-                    &value,
-                    value_type,
-                    format,
+                let concurrency = write_cmd::ConcurrencyOpts {
+                    cas,
+                    max_retries: retry,
+                }; // changed: construct ConcurrencyOpts
+                let params = write_cmd::WriteParams {
                     dry_run,
                     fast,
-                    cli.verbose,
+                    verbose: cli.verbose,
                     output,
-                )?;
+                    concurrency,
+                };
+                write_cmd::run_set(&file, &key, &value, value_type, format, params)?;
             }
             WriteCommands::Batch {
                 plan,
                 dry_run,
                 fast,
+                cas, // changed: concurrency flags
+                retry,
             } => {
-                write_cmd::run_batch(&plan, dry_run, fast, cli.verbose, output)?;
+                let concurrency = write_cmd::ConcurrencyOpts {
+                    cas,
+                    max_retries: retry,
+                }; // changed: construct ConcurrencyOpts
+                let params = write_cmd::WriteParams {
+                    dry_run,
+                    fast,
+                    verbose: cli.verbose,
+                    output,
+                    concurrency,
+                };
+                write_cmd::run_batch(&plan, params)?;
             }
         },
 

@@ -180,7 +180,7 @@ elif [[ "$MATCH_CMD" =~ ^sed[[:space:]]+-i([[:space:]]+\'\'|[[:space:]]+\"\")?[[
   TO="${BASH_REMATCH[3]}"
   FLAGS="${BASH_REMATCH[4]}"
   FILE="${BASH_REMATCH[5]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi
@@ -190,7 +190,7 @@ elif [[ "$MATCH_CMD" =~ ^sed[[:space:]]+-i([[:space:]]+\'\'|[[:space:]]+\"\")?[[
   TO="${BASH_REMATCH[3]}"
   FLAGS="${BASH_REMATCH[4]}"
   FILE="${BASH_REMATCH[5]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi
@@ -200,7 +200,7 @@ elif [[ "$MATCH_CMD" =~ ^perl[[:space:]]+-pi[[:space:]]+-e[[:space:]]+\'s/([^/\'
   TO="${BASH_REMATCH[2]}"
   FLAGS="${BASH_REMATCH[3]}"
   FILE="${BASH_REMATCH[4]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi

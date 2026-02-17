@@ -1,6 +1,6 @@
 [package]
 name = "rtk"
-version = "0.20.1-fork.4"
+version = "0.20.1-fork.5"
 edition = "2021"
 authors = ["Patrick Szymkowiak"]
 description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
@@ -29,6 +29,7 @@ toml_edit = "0.22"
 chrono = "0.4"
 thiserror = "1.0"
 tempfile = "3"
+fs2 = "0.4" # cross-platform flock for concurrent write safety
 
 [dev-dependencies]
 

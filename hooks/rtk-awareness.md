@@ -51,13 +51,36 @@ rtk read src/main.rs --level none --from 200 --to 320
 
 ## Safe File Writes
 
-Use `rtk write` for deterministic, atomic edits (idempotent + durable by default):
+Use `rtk write` for deterministic, atomic edits (idempotent + durable by default).
+Native Edit/Write tools are blocked by hook — always use `rtk write` via Bash.
+
+### Single operations
 
 ```bash
-rtk write replace path/to/file --from old --to new [--all]
-rtk write patch path/to/file --old "block A" --new "block B" [--all]
+rtk write replace path/to/file --from old --to new [--all] [--dry-run]
+rtk write patch path/to/file --old "block A" --new "block B" [--all] [--dry-run]
+rtk write set path/to/config.json --key a.b --value 42 --value-type number
 rtk write set path/to/config.toml --key a.b --value true --format toml
 ```
+
+### Batch mode (multi-file, single process)
+
+```bash
+rtk write batch --plan '[
+  {"op":"replace","file":"src/lib.rs","from":"old_fn","to":"new_fn"},
+  {"op":"patch","file":"src/main.rs","old":"block A","new":"block B"},
+  {"op":"set","file":"config.json","key":"version","value":"2.0"}
+]' [--dry-run]
+```
+
+Batch groups I/O, reports `applied/failed/total`, and continues on partial failure.
+
+### Key properties
+
+- **Atomic**: tempfile + rename (no partial writes)
+- **Idempotent**: noop if content already matches (replace, patch, set)
+- **--dry-run**: preview without writing
+- **Output modes**: `--output quiet|concise|json`
 
 Prefer this over ad-hoc `sed -i` / `perl -pi` when the transformation fits these primitives.
 

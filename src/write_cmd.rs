@@ -1,6 +1,7 @@
 use crate::tracking;
-use crate::write_core::{AtomicWriter, WriteOptions};
-use crate::write_semantics::{semantics_for, WriteOperation};
+use crate::write_core::{AtomicWriter, CasError, CasOptions, WriteOptions}; // changed: import CAS types for locked_write
+use crate::write_lock::FileLockGuard; // changed: import flock guard for concurrent write safety
+
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
@@ -8,6 +9,8 @@ use serde_json::ser::{PrettyFormatter, Serializer};
 use serde_json::{Map, Value as JsonValue};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use toml::Value as TomlValue;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlEditValue};
 
@@ -40,6 +43,23 @@ pub enum OutputMode {
     Json,
 }
 
+/// Shared parameters for all write operations — fixes clippy::too_many_arguments
+#[derive(Debug, Clone, Copy)]
+pub struct WriteParams {
+    pub dry_run: bool,
+    pub fast: bool,
+    pub verbose: u8,
+    pub output: OutputMode,
+    pub concurrency: ConcurrencyOpts, // changed: added for flock + CAS + retry
+}
+
+/// Concurrency options for write safety (flock + CAS + retry) // changed: new struct
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConcurrencyOpts {
+    pub cas: bool,        // --cas: explicit CAS check
+    pub max_retries: u32, // --retry N
+}
+
 /// Structured response — single renderer for all write operations
 #[derive(Debug, Clone, Serialize)]
 pub struct WriteResponse {
@@ -58,6 +78,10 @@ pub struct WriteResponse {
     pub hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>, // changed: retry count when conflict resolved
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_resolved: Option<bool>, // changed: true when CAS conflict was resolved via retry
 }
 
 impl WriteResponse {
@@ -72,6 +96,8 @@ impl WriteResponse {
             error: None,
             hint: None,
             detail: None,
+            retries: None,           // changed: new field
+            conflict_resolved: None, // changed: new field
         }
     }
 
@@ -86,6 +112,8 @@ impl WriteResponse {
             error: None,
             hint: None,
             detail: None,
+            retries: None,           // changed: new field
+            conflict_resolved: None, // changed: new field
         }
     }
 
@@ -100,6 +128,8 @@ impl WriteResponse {
             error: None,
             hint: Some("no-op".to_string()),
             detail: None,
+            retries: None,           // changed: new field
+            conflict_resolved: None, // changed: new field
         }
     }
 
@@ -128,6 +158,8 @@ fn write_error(code: &str, hint: &str, mode: OutputMode) -> anyhow::Error {
             error: Some(code.to_string()),
             hint: Some(hint.to_string()),
             detail: None,
+            retries: None,           // changed: new field
+            conflict_resolved: None, // changed: new field
         };
         // Print JSON error to stdout before returning the anyhow::Error
         println!("{}", serde_json::to_string(&resp).unwrap());
@@ -160,6 +192,133 @@ pub struct BatchOp {
     pub format: Option<String>,
 }
 
+/// Generate concise message from WriteResponse for rendering. // changed: extracted from run_* functions
+fn format_response_msg(resp: &WriteResponse, op: &str) -> String {
+    if resp.dry_run == Some(true) {
+        return format!("dry-run: {} {} planned", op, resp.applied.unwrap_or(0));
+    }
+    if resp.hint.as_deref() == Some("no-op") {
+        return format!("no-op: {} produces identical content", op);
+    }
+    let mut msg = format!("OK {} applied={}", op, resp.applied.unwrap_or(0));
+    if let Some(retries) = resp.retries {
+        msg.push_str(&format!(" retries={}", retries));
+    }
+    msg
+}
+
+/// Result of a compute function inside locked_write. // changed: new enum for retry logic
+enum WriteAttempt {
+    /// Computed new content to write (updated_content, applied_count)
+    Success(String, usize),
+    /// No match found — retryable if content was stale
+    NoMatch(String),
+    /// Content unchanged (no-op)
+    Unchanged,
+}
+
+/// Core retry-with-lock function for concurrent write safety. // changed: new function
+/// Acquires flock, reads file, runs compute_fn, writes with optional CAS verification.
+/// Retries on NoMatch or CAS conflict with exponential backoff.
+fn locked_write<F>(
+    file: &Path,
+    params: WriteParams,
+    op_name: &str,
+    compute_fn: F,
+) -> Result<(WriteResponse, String)>
+where
+    F: Fn(&str) -> WriteAttempt,
+{
+    let max_retries = params.concurrency.max_retries;
+    let use_cas = params.concurrency.cas || max_retries > 0; // auto-enable CAS when retries > 0
+
+    for attempt in 0..=max_retries {
+        // Always acquire flock (transparent, ~0.1ms overhead)
+        let _guard = FileLockGuard::acquire(file)?;
+
+        let content = fs::read_to_string(file)
+            .with_context(|| format!("Failed to read {}", file.display()))?;
+
+        // Snapshot for CAS verification (before compute)
+        let snapshot = if use_cas {
+            crate::write_core::snapshot_file(file, true)?
+        } else {
+            None
+        };
+
+        match compute_fn(&content) {
+            WriteAttempt::Success(updated, count) => {
+                if updated == content {
+                    return Ok((WriteResponse::noop(op_name), content));
+                }
+
+                if params.dry_run {
+                    let resp = WriteResponse::dry_run(op_name, count);
+                    return Ok((resp, content));
+                }
+
+                // Write with optional CAS verification
+                let mut options = if params.fast {
+                    WriteOptions::fast()
+                } else {
+                    WriteOptions::durable()
+                };
+                options.idempotent_skip = false;
+                if let Some(ref snap) = snapshot {
+                    options.cas = Some(CasOptions::from_snapshot(snap));
+                }
+
+                let writer = AtomicWriter::new(options);
+                match writer.write_str(file, &updated) {
+                    Ok(stats) => {
+                        let mut resp = WriteResponse::success(op_name, count);
+                        if attempt > 0 {
+                            resp.retries = Some(attempt); // changed: report retry count
+                            resp.conflict_resolved = Some(true); // changed: conflict was resolved
+                        }
+                        if params.verbose > 1 {
+                            eprintln!(
+                                "bytes_written={}, fsync={}, rename={}",
+                                stats.bytes_written, stats.fsync_count, stats.rename_count
+                            );
+                        }
+                        return Ok((resp, content));
+                    }
+                    Err(e) => {
+                        // Check if this is a CAS conflict (retryable)
+                        if e.downcast_ref::<CasError>().is_some() && attempt < max_retries {
+                            drop(_guard); // release lock before sleeping
+                            let backoff = Duration::from_millis(50 * 2u64.pow(attempt).min(8)); // cap at 400ms
+                            thread::sleep(backoff);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            WriteAttempt::NoMatch(msg) => {
+                if attempt < max_retries {
+                    drop(_guard); // release lock before sleeping
+                    let backoff = Duration::from_millis(50 * 2u64.pow(attempt).min(8));
+                    thread::sleep(backoff);
+                    continue;
+                }
+                return Err(write_error("NO_MATCH", &msg, params.output));
+            }
+            WriteAttempt::Unchanged => {
+                return Ok((WriteResponse::noop(op_name), content));
+            }
+        }
+    }
+
+    // Exhausted retries (should not reach here, but safety net)
+    Err(write_error(
+        "RETRY_EXHAUSTED",
+        &format!("failed after {} retries", max_retries),
+        params.output,
+    ))
+}
+
 /// Build tracking arguments for write operations.
 /// Returns (native_estimate, rtk_output, normalized_cmd).
 /// - native_estimate: file content (what native Edit/sed would show in LLM context)
@@ -179,129 +338,74 @@ pub fn run_replace(
     from: &str,
     to: &str,
     all: bool,
-    dry_run: bool,
-    fast: bool,
-    verbose: u8,
-    output: OutputMode,
+    params: WriteParams,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
-    let _semantics = semantics_for(WriteOperation::Replace);
-
     if from.is_empty() {
         return Err(write_error(
             "EMPTY_PATTERN",
             "--from must be non-empty",
-            output,
+            params.output,
         ));
     }
 
-    let content =
-        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
+    // changed: delegate to locked_write for flock + CAS + retry
+    let from_owned = from.to_string();
+    let to_owned = to.to_string();
+    let (resp, content) = locked_write(file, params, "replace", |content| {
+        if !content.contains(from_owned.as_str()) {
+            return WriteAttempt::NoMatch("no matches for --from".to_string());
+        }
+        let (updated, count) = if all {
+            replace_all_counted(content, &from_owned, &to_owned)
+        } else {
+            (content.replacen(from_owned.as_str(), &to_owned, 1), 1)
+        };
+        if updated == content {
+            return WriteAttempt::Unchanged;
+        }
+        WriteAttempt::Success(updated, count)
+    })?;
 
-    // P0-2: single-pass — no separate matches().count() scan
-    if !content.contains(from) {
-        return Err(write_error("NO_MATCH", "no matches for --from", output));
-    }
-
-    let (updated, count) = if all {
-        replace_all_counted(&content, from, to)
-    } else {
-        (content.replacen(from, to, 1), 1)
-    };
-
-    if updated == content {
-        let msg = "no-op: replacement produces identical content"; // changed: capture msg for tracking
-        WriteResponse::noop("replace").render(output, msg);
-        let (ti, to, tc) = write_tracking_args("replace", &content, msg); // changed: use helper
-        timer.track(&format!("write replace {}", file.display()), tc, ti, to);
-        return Ok(());
-    }
-
-    if dry_run {
-        let msg = format!("dry-run: replace {} occurrence(s)", count); // changed: capture msg
-        WriteResponse::dry_run("replace", count).render(output, &msg);
-        let (ti, to, tc) = write_tracking_args("replace", &content, &msg); // changed: use helper
-        timer.track(&format!("write replace {}", file.display()), tc, ti, to);
-        return Ok(());
-    }
-
-    let stats = write_text(file, &updated, fast)?;
-    let msg = format!("OK replace applied={}", count); // changed: capture msg for tracking
-    WriteResponse::success("replace", count).render(output, &msg);
-    if verbose > 1 {
-        eprintln!(
-            "bytes_written={}, fsync={}, rename={}",
-            stats.bytes_written, stats.fsync_count, stats.rename_count
-        );
-    }
-
-    let (ti, to, tc) = write_tracking_args("replace", &content, &msg); // changed: use helper
-    timer.track(&format!("write replace {}", file.display()), tc, ti, to);
+    let msg = format_response_msg(&resp, "replace");
+    resp.render(params.output, &msg);
+    let (ti, to_str, tc) = write_tracking_args("replace", &content, &msg);
+    timer.track(&format!("write replace {}", file.display()), tc, ti, to_str);
     Ok(())
 }
 
-pub fn run_patch(
-    file: &Path,
-    old: &str,
-    new: &str,
-    all: bool,
-    dry_run: bool,
-    fast: bool,
-    verbose: u8,
-    output: OutputMode,
-) -> Result<()> {
+pub fn run_patch(file: &Path, old: &str, new: &str, all: bool, params: WriteParams) -> Result<()> {
     let timer = tracking::TimedExecution::start();
-    let _semantics = semantics_for(WriteOperation::Patch);
-
     if old.is_empty() {
         return Err(write_error(
             "EMPTY_PATTERN",
             "--old must be non-empty",
-            output,
+            params.output,
         ));
     }
 
-    let content =
-        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
+    // changed: delegate to locked_write for flock + CAS + retry
+    let old_owned = old.to_string();
+    let new_owned = new.to_string();
+    let (resp, content) = locked_write(file, params, "patch", |content| {
+        if !content.contains(old_owned.as_str()) {
+            return WriteAttempt::NoMatch("hunk not found".to_string());
+        }
+        let (updated, count) = if all {
+            replace_all_counted(content, &old_owned, &new_owned)
+        } else {
+            (content.replacen(old_owned.as_str(), &new_owned, 1), 1)
+        };
+        if updated == content {
+            return WriteAttempt::Unchanged;
+        }
+        WriteAttempt::Success(updated, count)
+    })?;
 
-    if !content.contains(old) {
-        return Err(write_error("NO_MATCH", "hunk not found", output));
-    }
-
-    let (updated, count) = if all {
-        replace_all_counted(&content, old, new)
-    } else {
-        (content.replacen(old, new, 1), 1)
-    };
-
-    if updated == content {
-        let msg = "no-op: patch produces identical content"; // changed: capture msg for tracking
-        WriteResponse::noop("patch").render(output, msg);
-        let (ti, to, tc) = write_tracking_args("patch", &content, msg); // changed: use helper
-        timer.track(&format!("write patch {}", file.display()), tc, ti, to);
-        return Ok(());
-    }
-
-    if dry_run {
-        let msg = format!("dry-run: patch {} hunk(s)", count); // changed: capture msg
-        WriteResponse::dry_run("patch", count).render(output, &msg);
-        let (ti, to, tc) = write_tracking_args("patch", &content, &msg); // changed: use helper
-        timer.track(&format!("write patch {}", file.display()), tc, ti, to);
-        return Ok(());
-    }
-
-    let stats = write_text(file, &updated, fast)?;
-    let msg = format!("OK patch applied={}", count); // changed: capture msg for tracking
-    WriteResponse::success("patch", count).render(output, &msg);
-    if verbose > 1 {
-        eprintln!(
-            "bytes_written={}, fsync={}, rename={}",
-            stats.bytes_written, stats.fsync_count, stats.rename_count
-        );
-    }
-
-    let (ti, to, tc) = write_tracking_args("patch", &content, &msg); // changed: use helper
-    timer.track(&format!("write patch {}", file.display()), tc, ti, to);
+    let msg = format_response_msg(&resp, "patch");
+    resp.render(params.output, &msg);
+    let (ti, to_str, tc) = write_tracking_args("patch", &content, &msg);
+    timer.track(&format!("write patch {}", file.display()), tc, ti, to_str);
     Ok(())
 }
 
@@ -311,54 +415,59 @@ pub fn run_set(
     value: &str,
     value_type: ConfigValueType,
     format: ConfigFormat,
-    dry_run: bool,
-    fast: bool,
-    verbose: u8,
-    output: OutputMode,
+    params: WriteParams,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
-    let _semantics = semantics_for(WriteOperation::Set);
-    let content =
-        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let format = resolve_format(file, format)?;
 
-    let (updated, format_label) = match format {
-        ConfigFormat::Json => {
-            let mut root: JsonValue = serde_json::from_str(&content)
-                .with_context(|| format!("Invalid JSON: {}", file.display()))?;
-            set_json_path(&mut root, key, parse_json_value(value, value_type)?)?;
-            (serialize_json_preserving_style(&root, &content)?, "json")
+    // changed: delegate to locked_write for flock + CAS + retry
+    let key_owned = key.to_string();
+    let value_owned = value.to_string();
+    let (resp, content) = locked_write(file, params, "set", |content| {
+        let result = match format {
+            ConfigFormat::Json => {
+                let mut root: JsonValue = match serde_json::from_str(content) {
+                    Ok(v) => v,
+                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid JSON: {}", e)),
+                };
+                let parsed = match parse_json_value(&value_owned, value_type) {
+                    Ok(v) => v,
+                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid value: {}", e)),
+                };
+                if let Err(e) = set_json_path(&mut root, &key_owned, parsed) {
+                    return WriteAttempt::NoMatch(e.to_string());
+                }
+                match serialize_json_preserving_style(&root, content) {
+                    Ok(s) => s,
+                    Err(e) => return WriteAttempt::NoMatch(e.to_string()),
+                }
+            }
+            ConfigFormat::Toml => {
+                let mut root: DocumentMut = match content.parse::<DocumentMut>() {
+                    Ok(v) => v,
+                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid TOML: {}", e)),
+                };
+                let parsed = match parse_toml_value(&value_owned, value_type) {
+                    Ok(v) => v,
+                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid value: {}", e)),
+                };
+                if let Err(e) = set_toml_path(&mut root, &key_owned, parsed) {
+                    return WriteAttempt::NoMatch(e.to_string());
+                }
+                root.to_string()
+            }
+            ConfigFormat::Auto => unreachable!(),
+        };
+        if result == content {
+            return WriteAttempt::Unchanged;
         }
-        ConfigFormat::Toml => {
-            let mut root: DocumentMut = content
-                .parse::<DocumentMut>()
-                .with_context(|| format!("Invalid TOML: {}", file.display()))?;
-            set_toml_path(&mut root, key, parse_toml_value(value, value_type)?)?;
-            (root.to_string(), "toml")
-        }
-        ConfigFormat::Auto => unreachable!(),
-    };
+        WriteAttempt::Success(result, 1)
+    })?;
 
-    if dry_run {
-        let msg = format!("dry-run: set {} ({})", key, format_label); // changed: capture msg
-        WriteResponse::dry_run("set", 1).render(output, &msg);
-        let (ti, to, tc) = write_tracking_args("set", &content, &msg); // changed: use helper
-        timer.track(&format!("write set {}", file.display()), tc, ti, to);
-        return Ok(());
-    }
-
-    let stats = write_text(file, &updated, fast)?;
-    let msg = format!("OK set {} ({})", key, format_label); // changed: capture msg for tracking
-    WriteResponse::success("set", 1).render(output, &msg);
-    if verbose > 1 {
-        eprintln!(
-            "bytes_written={}, fsync={}, rename={}",
-            stats.bytes_written, stats.fsync_count, stats.rename_count
-        );
-    }
-
-    let (ti, to, tc) = write_tracking_args("set", &content, &msg); // changed: use helper
-    timer.track(&format!("write set {}", file.display()), tc, ti, to);
+    let msg = format_response_msg(&resp, "set");
+    resp.render(params.output, &msg);
+    let (ti, to_str, tc) = write_tracking_args("set", &content, &msg);
+    timer.track(&format!("write set {}", file.display()), tc, ti, to_str);
     Ok(())
 }
 
@@ -366,10 +475,7 @@ pub fn run_set(
 /// Single process startup, grouped fsync, one summary output.
 pub fn run_batch(
     plan_json: &str,
-    dry_run: bool,
-    fast: bool,
-    verbose: u8,
-    output: OutputMode,
+    params: WriteParams, // changed: bundled dry_run/fast/verbose/output into WriteParams
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
@@ -386,11 +492,11 @@ pub fn run_batch(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
-        let result = execute_batch_op(op, dry_run, fast);
+        let result = execute_batch_op(op, params.dry_run, params.fast);
         match result {
             Ok(count) => {
                 applied += count;
-                if verbose > 0 && output == OutputMode::Concise {
+                if params.verbose > 0 && params.output == OutputMode::Concise {
                     eprintln!("[{}/{}] OK {} {}", i + 1, total, op.op, op.file.display());
                 }
             }
@@ -405,7 +511,7 @@ pub fn run_batch(
                     e
                 );
                 errors.push(msg.clone());
-                if output == OutputMode::Concise {
+                if params.output == OutputMode::Concise {
                     eprintln!("{}", msg);
                 }
             }
@@ -415,17 +521,17 @@ pub fn run_batch(
     // Render summary
     let mut resp = WriteResponse::success("batch", applied);
     resp.failed = Some(failed);
-    if dry_run {
+    if params.dry_run {
         resp.dry_run = Some(true);
     }
-    if !errors.is_empty() && output == OutputMode::Json {
+    if !errors.is_empty() && params.output == OutputMode::Json {
         resp.detail = Some(errors.join("; "));
     }
     if failed > 0 {
         resp.ok = failed < total; // partial failure is still ok=true if any succeeded
     }
 
-    let concise_msg = if dry_run {
+    let concise_msg = if params.dry_run {
         format!("dry-run: batch {}/{} planned", applied, total)
     } else {
         format!(
@@ -433,7 +539,7 @@ pub fn run_batch(
             applied, failed, total
         )
     };
-    resp.render(output, &concise_msg);
+    resp.render(params.output, &concise_msg);
 
     let (_, _, tc) = write_tracking_args("batch", plan_json, &concise_msg); // changed: normalize cmd
     timer.track(
@@ -450,7 +556,11 @@ pub fn run_batch(
 }
 
 /// Execute a single batch operation, return applied count.
+/// Uses flock for concurrent safety. // changed: added flock
 fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
+    // Acquire flock for each batch operation // changed: flock per-op
+    let _guard = FileLockGuard::acquire(&op.file)?;
+
     match op.op.as_str() {
         "replace" => {
             let from = op
@@ -811,13 +921,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Test-only helper: default WriteParams for concise, fast, quiet tests
+    fn tp(output: OutputMode) -> WriteParams {
+        WriteParams {
+            dry_run: false,
+            fast: true,
+            verbose: 0,
+            output,
+            concurrency: ConcurrencyOpts::default(),
+        } // changed: added concurrency
+    }
+
+    fn tp_dry(output: OutputMode) -> WriteParams {
+        WriteParams {
+            dry_run: true,
+            fast: true,
+            verbose: 0,
+            output,
+            concurrency: ConcurrencyOpts::default(),
+        } // changed: added concurrency
+    }
+
+    /// Test-only helper: WriteParams with retry enabled // changed: new helper for retry tests
+    fn tp_retry(output: OutputMode, max_retries: u32) -> WriteParams {
+        WriteParams {
+            dry_run: false,
+            fast: true,
+            verbose: 0,
+            output,
+            concurrency: ConcurrencyOpts {
+                cas: false,
+                max_retries,
+            },
+        }
+    }
+
     #[test]
     fn replace_first_only() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("a.txt");
         fs::write(&file, "a a a").unwrap();
 
-        run_replace(&file, "a", "b", false, false, true, 0, OutputMode::Concise).unwrap();
+        run_replace(&file, "a", "b", false, tp(OutputMode::Concise)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&file).unwrap(), "b a a");
     }
 
@@ -827,17 +972,7 @@ mod tests {
         let file = tmp.path().join("b.txt");
         fs::write(&file, "old\nold\n").unwrap();
 
-        run_patch(
-            &file,
-            "old",
-            "new",
-            true,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
-        )
-        .unwrap();
+        run_patch(&file, "old", "new", true, tp(OutputMode::Concise)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&file).unwrap(), "new\nnew\n");
     }
 
@@ -853,12 +988,9 @@ mod tests {
             "42",
             ConfigValueType::Number,
             ConfigFormat::Json,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap();
+        .unwrap(); // changed: use WriteParams
 
         let v: JsonValue = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(v["a"]["b"], JsonValue::from(42));
@@ -876,12 +1008,9 @@ mod tests {
             "true",
             ConfigValueType::Bool,
             ConfigFormat::Toml,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap();
+        .unwrap(); // changed: use WriteParams
 
         let v: TomlValue = fs::read_to_string(&file).unwrap().parse().unwrap();
         assert_eq!(v["a"]["b"], TomlValue::Boolean(true));
@@ -893,17 +1022,7 @@ mod tests {
         let file = tmp.path().join("e.txt");
         fs::write(&file, "hello world").unwrap();
 
-        run_replace(
-            &file,
-            "world",
-            "rtk",
-            false,
-            true,
-            true,
-            0,
-            OutputMode::Concise,
-        )
-        .unwrap();
+        run_replace(&file, "world", "rtk", false, tp_dry(OutputMode::Concise)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
     }
 
@@ -919,12 +1038,9 @@ mod tests {
             "2",
             ConfigValueType::Number,
             ConfigFormat::Json,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap_err();
+        .unwrap_err(); // changed: use WriteParams
         assert!(err.to_string().contains("not an object"));
     }
 
@@ -940,12 +1056,9 @@ mod tests {
             "true",
             ConfigValueType::Bool,
             ConfigFormat::Toml,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap();
+        .unwrap(); // changed: use WriteParams
 
         let out = fs::read_to_string(&file).unwrap();
         assert!(out.contains("# top"));
@@ -966,12 +1079,9 @@ mod tests {
             "2",
             ConfigValueType::Number,
             ConfigFormat::Json,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap();
+        .unwrap(); // changed: use WriteParams
 
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\":1,\"b\":2}");
     }
@@ -997,17 +1107,7 @@ mod tests {
         fs::write(&file, "hello world").unwrap();
 
         // Quiet mode should succeed without panicking
-        run_replace(
-            &file,
-            "world",
-            "rtk",
-            false,
-            false,
-            true,
-            0,
-            OutputMode::Quiet,
-        )
-        .unwrap();
+        run_replace(&file, "world", "rtk", false, tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello rtk");
     }
 
@@ -1020,8 +1120,8 @@ mod tests {
         fs::write(&f1, "a b c").unwrap();
         fs::write(&f2, "a b c").unwrap();
 
-        run_replace(&f1, "b", "X", false, false, true, 0, OutputMode::Concise).unwrap();
-        run_replace(&f2, "b", "X", false, false, true, 0, OutputMode::Json).unwrap();
+        run_replace(&f1, "b", "X", false, tp(OutputMode::Concise)).unwrap(); // changed: use WriteParams
+        run_replace(&f2, "b", "X", false, tp(OutputMode::Json)).unwrap(); // changed: use WriteParams
 
         assert_eq!(
             fs::read_to_string(&f1).unwrap(),
@@ -1066,7 +1166,7 @@ mod tests {
             {"op":"patch","file": f2.to_str().unwrap(), "old":"bar","new":"PATCHED"}
         ]);
 
-        run_batch(&plan.to_string(), false, true, 0, OutputMode::Quiet).unwrap();
+        run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&f1).unwrap(), "hello batch");
         assert_eq!(fs::read_to_string(&f2).unwrap(), "foo PATCHED baz");
     }
@@ -1081,7 +1181,7 @@ mod tests {
             {"op":"replace","file": f1.to_str().unwrap(), "from":"original","to":"changed"}
         ]);
 
-        run_batch(&plan.to_string(), true, true, 0, OutputMode::Quiet).unwrap();
+        run_batch(&plan.to_string(), tp_dry(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&f1).unwrap(), "original");
     }
 
@@ -1096,8 +1196,8 @@ mod tests {
             {"op":"replace","file": f1.to_str().unwrap(), "from":"hello","to":"done"}
         ]);
 
-        run_batch(&plan.to_string(), false, true, 0, OutputMode::Quiet).unwrap();
-        // Second op should still succeed despite first failure
+        run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
+                                                                      // Second op should still succeed despite first failure
         assert_eq!(fs::read_to_string(&f1).unwrap(), "done");
     }
 
@@ -1111,7 +1211,7 @@ mod tests {
             {"op":"set","file": f.to_str().unwrap(), "key":"b","value":"2","value_type":"number"}
         ]);
 
-        run_batch(&plan.to_string(), false, true, 0, OutputMode::Quiet).unwrap();
+        run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         let v: JsonValue = serde_json::from_str(&fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(v["b"], JsonValue::from(2));
     }
@@ -1128,12 +1228,9 @@ mod tests {
             "42",
             ConfigValueType::Number,
             ConfigFormat::Json,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap_err();
+        .unwrap_err(); // changed: use WriteParams
         assert!(err.to_string().contains("non-empty"));
         // File must not be modified
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\":1}");
@@ -1151,17 +1248,36 @@ mod tests {
             "2",
             ConfigValueType::Number,
             ConfigFormat::Json,
-            false,
-            true,
-            0,
-            OutputMode::Concise,
+            tp(OutputMode::Concise),
         )
-        .unwrap();
+        .unwrap(); // changed: use WriteParams
 
         let out = fs::read_to_string(&file).unwrap();
         assert!(out.contains("\n    \"a\": {"));
         assert!(out.contains("\n        \"b\": 1"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn set_json_idempotent_noop() {
+        // changed: verify set returns noop when value already matches
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("idem.json");
+        fs::write(&file, "{\"a\":1}").unwrap();
+
+        // First set — applies the change
+        run_set(
+            &file,
+            "a",
+            "1",
+            ConfigValueType::Number,
+            ConfigFormat::Json,
+            tp(OutputMode::Quiet),
+        )
+        .unwrap(); // changed: use WriteParams
+
+        // File should be unchanged (value already 1)
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\":1}");
     }
 
     // --- Tracking semantics tests ---
@@ -1203,5 +1319,108 @@ mod tests {
                 op
             );
         }
+    }
+
+    // --- Concurrency safety tests --- // changed: new tests for flock + CAS + retry
+
+    #[test]
+    fn locked_write_basic_replace() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("lock_basic.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let (resp, _content) = locked_write(&file, tp(OutputMode::Quiet), "replace", |content| {
+            if !content.contains("hello") {
+                return WriteAttempt::NoMatch("no match".to_string());
+            }
+            WriteAttempt::Success(content.replacen("hello", "hi", 1), 1)
+        })
+        .unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(resp.applied, Some(1));
+        assert!(resp.retries.is_none()); // no retries needed
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hi world");
+    }
+
+    #[test]
+    fn locked_write_no_match_with_retry() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("lock_nomatch.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let err = locked_write(
+            &file,
+            tp_retry(OutputMode::Quiet, 1),
+            "replace",
+            |_content| WriteAttempt::NoMatch("pattern not found".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("NO_MATCH"));
+    }
+
+    #[test]
+    fn locked_write_unchanged_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("lock_noop.txt");
+        fs::write(&file, "same").unwrap();
+
+        let (resp, _) = locked_write(&file, tp(OutputMode::Quiet), "replace", |_content| {
+            WriteAttempt::Unchanged
+        })
+        .unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(resp.hint.as_deref(), Some("no-op"));
+    }
+
+    #[test]
+    fn write_response_retries_field_omitted_when_none() {
+        // Verify new optional fields don't appear in JSON when not set
+        let resp = WriteResponse::success("replace", 1);
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let v: JsonValue = serde_json::from_str(&json_str).unwrap();
+        assert!(
+            v.get("retries").is_none(),
+            "retries should be omitted when None"
+        );
+        assert!(
+            v.get("conflict_resolved").is_none(),
+            "conflict_resolved should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn write_response_retries_field_present_when_set() {
+        let mut resp = WriteResponse::success("replace", 1);
+        resp.retries = Some(2);
+        resp.conflict_resolved = Some(true);
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let v: JsonValue = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["retries"], 2);
+        assert_eq!(v["conflict_resolved"], true);
+    }
+
+    #[test]
+    fn concurrency_opts_default_is_off() {
+        let opts = ConcurrencyOpts::default();
+        assert!(!opts.cas);
+        assert_eq!(opts.max_retries, 0);
+    }
+
+    #[test]
+    fn format_response_msg_includes_retries() {
+        let mut resp = WriteResponse::success("replace", 3);
+        resp.retries = Some(2);
+        let msg = format_response_msg(&resp, "replace");
+        assert!(msg.contains("retries=2"), "msg={}", msg);
+    }
+
+    #[test]
+    fn format_response_msg_normal_success() {
+        let resp = WriteResponse::success("patch", 1);
+        let msg = format_response_msg(&resp, "patch");
+        assert_eq!(msg, "OK patch applied=1");
     }
 }

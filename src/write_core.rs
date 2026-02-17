@@ -13,9 +13,8 @@ pub enum DurabilityMode {
     Fast,
 }
 
-// P1-5: CAS infrastructure — will be used by CAS CLI flags (PR-W6 P0-1)
+// CAS infrastructure — activated for concurrent write safety (flock + CAS + retry)
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct FileSnapshot {
     pub len: Option<u64>,
     pub modified: Option<SystemTime>,
@@ -30,8 +29,8 @@ pub struct CasOptions {
 }
 
 impl CasOptions {
-    #[allow(dead_code)] // P1-5: will be used by CAS CLI flags
     pub fn from_snapshot(snapshot: &FileSnapshot) -> Self {
+        // changed: removed dead_code — now used by locked_write
         Self {
             expected_len: snapshot.len,
             expected_modified: snapshot.modified,
@@ -45,6 +44,32 @@ impl CasOptions {
             || self.expected_hash.is_some()
     }
 }
+
+/// Typed CAS error for retry discrimination via downcast. // changed: new enum for concurrent write safety
+#[derive(Debug, Clone)]
+pub enum CasError {
+    LenMismatch { expected: u64, actual: u64 },
+    ModifiedChanged,
+    HashMismatch,
+}
+
+impl std::fmt::Display for CasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CasError::LenMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "CAS: length mismatch (expected {}, got {})",
+                    expected, actual
+                )
+            }
+            CasError::ModifiedChanged => write!(f, "CAS: modification time changed"),
+            CasError::HashMismatch => write!(f, "CAS: content hash changed"),
+        }
+    }
+}
+
+impl std::error::Error for CasError {}
 
 #[derive(Debug, Clone)]
 pub struct WriteOptions {
@@ -206,8 +231,8 @@ impl AtomicWriter {
     }
 }
 
-#[allow(dead_code)] // P1-5: will be used by CAS CLI flags
 pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnapshot>> {
+    // changed: removed dead_code — now used by locked_write
     if !path.exists() {
         return Ok(None);
     }
@@ -240,12 +265,12 @@ fn verify_cas(path: &Path, metadata: Option<&Metadata>, cas: &CasOptions) -> Res
 
     if let Some(expected_len) = cas.expected_len {
         if metadata.len() != expected_len {
-            bail!(
-                "CAS mismatch for {}: expected len {}, got {}",
-                path.display(),
-                expected_len,
-                metadata.len()
-            );
+            return Err(CasError::LenMismatch {
+                // changed: typed CasError for retry downcast
+                expected: expected_len,
+                actual: metadata.len(),
+            }
+            .into());
         }
     }
 
@@ -257,17 +282,14 @@ fn verify_cas(path: &Path, metadata: Option<&Metadata>, cas: &CasOptions) -> Res
             )
         })?;
         if actual_modified != expected_modified {
-            bail!(
-                "CAS mismatch for {}: modification time changed",
-                path.display()
-            );
+            return Err(CasError::ModifiedChanged.into()); // changed: typed CasError
         }
     }
 
     if let Some(expected_hash) = cas.expected_hash {
         let actual_hash = hash_file(path)?;
         if actual_hash != expected_hash {
-            bail!("CAS mismatch for {}: content hash changed", path.display());
+            return Err(CasError::HashMismatch.into()); // changed: typed CasError
         }
     }
 
@@ -324,7 +346,8 @@ fn hash_bytes(content: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn hash_file(path: &Path) -> Result<u64> {
+pub fn hash_file(path: &Path) -> Result<u64> {
+    // changed: pub for CAS snapshot verification in write_cmd
     let mut file = File::open(path)
         .with_context(|| format!("Failed to read existing file {}", path.display()))?;
     let mut hasher = DefaultHasher::new();
@@ -418,8 +441,28 @@ mod tests {
         let writer = AtomicWriter::new(opts);
 
         let err = writer.write_str(&path, "new content").unwrap_err();
-        assert!(err.to_string().contains("CAS mismatch"));
+        assert!(err.to_string().contains("CAS")); // changed: now uses typed CasError
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn cas_error_is_typed_for_downcast() {
+        // changed: verify CasError can be downcast for retry logic
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("typed_cas.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let mut opts = WriteOptions::default();
+        opts.cas = Some(CasOptions {
+            expected_len: Some(999),
+            expected_modified: None,
+            expected_hash: None,
+        });
+        let writer = AtomicWriter::new(opts);
+        let err = writer.write_str(&path, "new").unwrap_err();
+        // Must be downcastable to CasError::LenMismatch
+        let cas_err = err.downcast_ref::<CasError>().expect("should be CasError");
+        assert!(matches!(cas_err, CasError::LenMismatch { .. }));
     }
 
     #[test]

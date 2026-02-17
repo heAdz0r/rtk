@@ -200,17 +200,8 @@ section "Cargo (new)"
 
 assert_ok      "rtk cargo build"              rtk cargo build
 assert_ok      "rtk cargo clippy"             rtk cargo clippy
-# cargo test exits non-zero due to pre-existing failures; check output ignoring exit code
-output_cargo_test=$(rtk cargo test 2>&1 || true)
-if echo "$output_cargo_test" | grep -q "FAILURES\|test result:"; then
-    PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}  %s\n" "rtk cargo test"
-else
-    FAIL=$((FAIL + 1))
-    FAILURES+=("rtk cargo test")
-    printf "  ${RED}FAIL${NC}  %s\n" "rtk cargo test"
-    printf "        got: %s\n" "$(echo "$output_cargo_test" | head -3)"
-fi
+# rtk cargo test: pass if output contains summary line or "passed"
+assert_contains "rtk cargo test" "passed" rtk cargo test
 assert_help    "rtk cargo"                    rtk cargo
 
 # ── 7. Curl ──────────────────────────────────────────
@@ -379,19 +370,19 @@ section "Python (conditional)"
 if command -v pytest &>/dev/null; then
     assert_help    "rtk pytest"                    rtk pytest --help
 else
-    skip "pytest not installed"
+    skip_test "rtk pytest" "pytest not installed"
 fi
 
 if command -v ruff &>/dev/null; then
     assert_help    "rtk ruff"                      rtk ruff --help
 else
-    skip "ruff not installed"
+    skip_test "rtk ruff" "ruff not installed"
 fi
 
 if command -v pip &>/dev/null; then
     assert_help    "rtk pip"                       rtk pip --help
 else
-    skip "pip not installed"
+    skip_test "rtk pip" "pip not installed"
 fi
 
 # ── 28. Go (conditional) ────────────────────────────
@@ -404,13 +395,13 @@ if command -v go &>/dev/null; then
     assert_help    "rtk go build"                  rtk go build -h
     assert_help    "rtk go vet"                    rtk go vet -h
 else
-    skip "go not installed"
+    skip_test "rtk go" "go not installed"
 fi
 
 if command -v golangci-lint &>/dev/null; then
     assert_help    "rtk golangci-lint"             rtk golangci-lint --help
 else
-    skip "golangci-lint not installed"
+    skip_test "rtk golangci-lint" "golangci-lint not installed"
 fi
 
 # ── 29. Global flags ────────────────────────────────
@@ -432,6 +423,41 @@ section "Learn"
 
 assert_ok      "rtk learn --help"             rtk learn --help
 assert_ok      "rtk learn (no sessions)"      rtk learn --since 0 2>&1 || true
+
+# ── 32. Write ──────────────────────────────────────────
+
+section "Write"
+
+TMPWRITE=$(mktemp -d /tmp/rtk-write-XXXXX)
+
+# replace
+echo "hello world" > "$TMPWRITE/replace.txt"
+assert_ok      "rtk write replace"             rtk write replace "$TMPWRITE/replace.txt" --from world --to rtk
+assert_contains "write replace result"         "rtk" cat "$TMPWRITE/replace.txt"
+
+# patch
+echo "line1\nold block\nline3" > "$TMPWRITE/patch.txt"
+assert_ok      "rtk write patch"               rtk write patch "$TMPWRITE/patch.txt" --old "old block" --new "new block"
+
+# set JSON
+echo '{"a":1}' > "$TMPWRITE/set.json"
+assert_ok      "rtk write set JSON"            rtk write set "$TMPWRITE/set.json" --key b --value 2 --value-type number
+assert_contains "write set JSON result"        '"b"' cat "$TMPWRITE/set.json"
+
+# dry-run (file must not change)
+echo "original" > "$TMPWRITE/dryrun.txt"
+assert_ok      "rtk write replace --dry-run"   rtk write replace "$TMPWRITE/dryrun.txt" --from original --to changed --dry-run
+assert_contains "dry-run preserves file"       "original" cat "$TMPWRITE/dryrun.txt"
+
+# batch
+echo "aaa" > "$TMPWRITE/b1.txt"
+echo "bbb" > "$TMPWRITE/b2.txt"
+BATCH_PLAN="[{\"op\":\"replace\",\"file\":\"$TMPWRITE/b1.txt\",\"from\":\"aaa\",\"to\":\"XXX\"},{\"op\":\"replace\",\"file\":\"$TMPWRITE/b2.txt\",\"from\":\"bbb\",\"to\":\"YYY\"}]"
+assert_ok      "rtk write batch"               rtk write batch --plan "$BATCH_PLAN"
+assert_contains "batch result b1"              "XXX" cat "$TMPWRITE/b1.txt"
+assert_contains "batch result b2"              "YYY" cat "$TMPWRITE/b2.txt"
+
+rm -rf "$TMPWRITE"
 
 # ══════════════════════════════════════════════════════
 # Report

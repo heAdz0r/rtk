@@ -277,10 +277,12 @@ rtk ls .                                # Token-optimized directory tree
 ```bash
 rtk write replace file.rs --from "old" --to "new"         # Single replace
 rtk write replace file.rs --from "old" --to "new" --all   # Replace all
+rtk write patch file.rs --old "block A" --new "block B"    # Exact hunk replacement
 rtk write set config.toml --key "port" --value 8080        # TOML key-value
 rtk write set package.json --key "version" --value "2.0"   # JSON key-value
+rtk write batch --plan '[{"op":"replace","file":"f","from":"a","to":"b"}]'  # Multi-op batch
 rtk write replace file.rs --from "a" --to "b" --dry-run   # Preview without writing
-rtk write replace file.rs --from "a" --to "b" --json      # Machine-readable output
+rtk write replace file.rs --from "a" --to "b" --output json  # Machine-readable output
 ```
 
 ### Git
