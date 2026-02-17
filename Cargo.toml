@@ -32,6 +32,7 @@ tempfile = "3"
 fs2 = "0.4" # cross-platform flock for concurrent write safety
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+notify = "6" # E3.1: event-driven FS watcher (kqueue/inotify/ReadDirectoryChangesW)
 
 [dev-dependencies]
 

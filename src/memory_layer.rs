@@ -343,28 +343,103 @@ pub fn run_refresh(
 
 pub fn run_watch(
     project: &Path,
-    interval_secs: u64,
+    interval_secs: u64, // E3.1: debounce window in seconds (was: poll interval)
     detail: DetailLevel,
     format: &str,
     query_type: QueryType, // E2.3
     verbose: u8,
 ) -> Result<()> {
-    let interval = Duration::from_secs(interval_secs.max(1));
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher}; // E3.1
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let debounce = Duration::from_secs(interval_secs.max(1)); // E3.1: debounce window
+    let project = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+
+    // Initial snapshot before registering the watcher
+    {
+        let state = build_state(&project, false, verbose)?;
+        if !state.delta.changes.is_empty() || state.stale_previous || !state.previous_exists {
+            store_artifact(&state.artifact)?;
+            let response = build_response("watch", &state, detail, false, query_type);
+            print_response(&response, format)?;
+        }
+    }
+
+    // E3.1: set up event-driven watcher (kqueue on macOS, inotify on Linux)
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )
+    .context("Failed to create filesystem watcher")?;
+    watcher
+        .watch(&project, RecursiveMode::Recursive)
+        .context("Failed to watch project directory")?;
+
+    if verbose > 0 {
+        eprintln!(
+            "memory.watch start project={} debounce={}s backend=notify",
+            project.to_string_lossy(),
+            debounce.as_secs(),
+        );
+    }
 
     loop {
-        let state = build_state(project, false, verbose)?;
-        if !state.delta.changes.is_empty() || state.stale_previous || !state.previous_exists {
+        // Block until first relevant FS event arrives
+        let got_relevant = loop {
+            match rx.recv().context("Watcher channel closed")? {
+                Ok(event) => {
+                    // E3.1: filter out events from excluded dirs
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| should_watch_abs_path(&project, p))
+                    {
+                        break true;
+                    }
+                    // irrelevant path (target/, node_modules/, etc.) — keep waiting
+                }
+                Err(e) => {
+                    if verbose > 0 {
+                        eprintln!("memory.watch error: {e}");
+                    }
+                    break false; // log error, try again
+                }
+            }
+        };
+
+        if !got_relevant {
+            continue;
+        }
+
+        // E3.1: coalesce additional events within the debounce window
+        let deadline = Instant::now() + debounce;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("Watcher channel disconnected"));
+                }
+            }
+        }
+
+        // Build updated state and emit if anything changed
+        let state = build_state(&project, false, verbose)?;
+        if !state.delta.changes.is_empty() || state.stale_previous {
             store_artifact(&state.artifact)?;
             let response = build_response("watch", &state, detail, false, query_type);
             print_response(&response, format)?;
         } else if verbose > 0 {
             eprintln!(
                 "memory.watch project={} clean",
-                state.project_root.to_string_lossy()
+                project.to_string_lossy()
             );
         }
-
-        std::thread::sleep(interval);
     }
 }
 
@@ -822,7 +897,7 @@ fn should_skip_rel_path(path: &Path) -> bool {
 fn should_watch_abs_path(project_root: &Path, abs_path: &Path) -> bool {
     abs_path
         .strip_prefix(project_root)
-        .map(|rel| \!should_skip_rel_path(rel))
+        .map(|rel| !should_skip_rel_path(rel))
         .unwrap_or(false) // outside project root — ignore
 }
 
