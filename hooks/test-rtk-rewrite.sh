@@ -114,6 +114,10 @@ test_rewrite "git rebase (mutating guarded default)" \
   "git rebase upstream/master" \
   ""
 
+test_rewrite "git rm (mutating guarded default)" \
+  "git rm --cached .grepai/config.yaml" \
+  ""
+
 test_rewrite "git remote -v" \
   "git remote -v" \
   "rtk git remote -v"
@@ -125,6 +129,10 @@ test_rewrite "git merge-base" \
 test_rewrite "git rev-parse" \
   "git rev-parse HEAD" \
   "rtk git rev-parse HEAD"
+
+test_rewrite "git ls-files" \
+  "git ls-files --cached" \
+  "rtk git ls-files --cached"
 
 test_rewrite "git -C status" \
   "git -C /Users/andrew/Programming/rtk status -s" \
@@ -166,6 +174,10 @@ test_rewrite "grepai search rewrite" \
   "grepai search \"SharedDefaults App Group\"" \
   "rtk rgai \"SharedDefaults App Group\""
 
+test_rewrite "grepai absolute path rewrite" \
+  "/Users/andrew/.local/bin/grepai search \"SharedDefaults App Group\"" \
+  "rtk rgai \"SharedDefaults App Group\""
+
 test_rewrite "rgai direct rewrite" \
   "rgai token traces" \
   "rtk rgai token traces"
@@ -177,6 +189,10 @@ test_rewrite "cargo test" \
 test_rewrite "cargo run passthrough" \
   "cargo run -- rgai --builtin \"token trace\"" \
   "rtk cargo run -- rgai --builtin \"token trace\""
+
+test_rewrite "cargo absolute path rewrite" \
+  "/Users/andrew/.cargo/bin/cargo test -q" \
+  "rtk cargo test -q"
 
 test_rewrite "npx prisma migrate" \
   "npx prisma migrate" \
@@ -236,6 +252,11 @@ test_rewrite_with_env "git rebase with mutating enabled" \
   "rtk git rebase upstream/master" \
   "RTK_REWRITE_MUTATING=1"
 
+test_rewrite_with_env "git rm with mutating enabled" \
+  "git rm --cached .grepai/config.yaml" \
+  "rtk git rm --cached .grepai/config.yaml" \
+  "RTK_REWRITE_MUTATING=1"
+
 echo ""
 
 # ---- SECTION 2: Env var prefix handling (THE BIG FIX) ----
@@ -283,6 +304,18 @@ test_rewrite "npm run build" \
 test_rewrite "npm test" \
   "npm test" \
   "rtk npm test"
+
+test_rewrite "bun run typecheck" \
+  "bun run typecheck" \
+  "rtk bun run typecheck"
+
+test_rewrite "bun direct script" \
+  "bun packages/server/src/index.ts 2>&1" \
+  "rtk bun packages/server/src/index.ts 2>&1"
+
+test_rewrite "bun --version" \
+  "bun --version 2>/dev/null" \
+  "rtk bun --version 2>/dev/null"
 
 test_rewrite "vue-tsc -b" \
   "vue-tsc -b" \
@@ -408,6 +441,14 @@ test_rewrite "mkdir (no pattern)" \
 
 test_rewrite "python3 (no pattern)" \
   "python3 script.py" \
+  ""
+
+test_rewrite "pip absolute path rewrite" \
+  "/Users/andrew/anaconda3/bin/pip install requests" \
+  "rtk pip install requests"
+
+test_rewrite "bun install (no safe rewrite)" \
+  "bun install" \
   ""
 
 test_rewrite "node (no pattern)" \

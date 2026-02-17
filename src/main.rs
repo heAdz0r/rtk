@@ -1,3 +1,4 @@
+mod bun_cmd;
 mod cargo_cmd;
 mod cc_economics;
 mod ccusage;
@@ -509,6 +510,13 @@ enum Commands {
     /// npx with intelligent routing (tsc, eslint, prisma -> specialized filters)
     Npx {
         /// npx arguments (command + options)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Bun commands with compact output (script boilerplate stripped)
+    Bun {
+        /// Bun arguments (e.g., run typecheck, test, --version)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1754,6 +1762,10 @@ fn main() -> Result<()> {
                     npm_cmd::run(&args, cli.verbose, cli.skip_env)?;
                 }
             }
+        }
+
+        Commands::Bun { args } => {
+            bun_cmd::run(&args, cli.verbose, cli.skip_env)?;
         }
 
         Commands::Ruff { args } => {

@@ -71,8 +71,8 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
     -e 's/^[[:space:]]+//')
   GIT_VERB=$(echo "$GIT_SUBCMD" | awk '{print $1}')
   case "$GIT_VERB" in
-    status|diff|log|show|remote|merge-base|rev-parse) CMD_CLASS="read_only" ;;
-    add|commit|push|pull|fetch|checkout|cherry-pick|merge|rebase) CMD_CLASS="mutating" ;;
+    status|diff|log|show|remote|merge-base|rev-parse|ls-files) CMD_CLASS="read_only" ;;
+    add|commit|push|pull|fetch|checkout|cherry-pick|merge|rebase|rm) CMD_CLASS="mutating" ;;
     branch)
       BRANCH_ARGS="${GIT_SUBCMD#branch}"
       if echo "$BRANCH_ARGS" | grep -qE '(^|[[:space:]])-(d|D|m|M|c|C)([[:space:]]|$)'; then
@@ -103,7 +103,7 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   esac
 
   case "$GIT_SUBCMD" in
-    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|checkout|checkout\ *|cherry-pick|cherry-pick\ *|remote|remote\ *|merge-base|merge-base\ *|rev-parse|rev-parse\ *|merge|merge\ *|rebase|rebase\ *)
+    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|checkout|checkout\ *|cherry-pick|cherry-pick\ *|remote|remote\ *|merge-base|merge-base\ *|rev-parse|rev-parse\ *|ls-files|ls-files\ *|merge|merge\ *|rebase|rebase\ *|rm|rm\ *)
       REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
       ;;
   esac
@@ -119,24 +119,25 @@ elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release)([[:
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')"
 
 # --- Cargo ---
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]'; then
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?cargo[[:space:]]'; then
   CMD_CLASS="read_only"
-  CARGO_SUBCMD=$(echo "$MATCH_CMD" | sed -E 's/^cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?//')
+  CARGO_SUBCMD=$(echo "$MATCH_CMD" | sed -E 's|^([^[:space:]]*/)?cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?||')
+  CANON_CARGO_BODY=$(echo "$CMD_BODY" | sed -E 's|^([^[:space:]]*/)?cargo[[:space:]]+|cargo |')
   case "$CARGO_SUBCMD" in
     test|test\ *|build|build\ *|clippy|clippy\ *|check|check\ *|install|install\ *|nextest|nextest\ *|fmt|fmt\ *|run|run\ *)
-      REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
+      REWRITTEN="${ENV_PREFIX}rtk $CANON_CARGO_BODY"
       ;;
   esac
 
 # --- Semantic search (fork-specific: rgai/grepai) ---
 # Priority: rtk rgai (fuzzy/semantic) > rtk grep (exact/regex)
 # Use rgai first for intent-based discovery, grep for precise matches
-elif echo "$MATCH_CMD" | grep -qE '^(grepai|rgai)[[:space:]]+search([[:space:]]|$)'; then
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?(grepai|rgai)[[:space:]]+search([[:space:]]|$)'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(grepai|rgai)[[:space:]]+search[[:space:]]+/rtk rgai /')"
-elif echo "$MATCH_CMD" | grep -qE '^rgai[[:space:]]+'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^([^[:space:]]*\/)?(grepai|rgai)[[:space:]]+search[[:space:]]+/rtk rgai /')"
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?rgai[[:space:]]+'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^rgai[[:space:]]+/rtk rgai /')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's|^([^[:space:]]*/)?rgai[[:space:]]+|rtk rgai |')"
 
 # --- File operations ---
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
@@ -219,6 +220,17 @@ elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+test([[:space:]]|$)'; then
 elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+run[[:space:]]+'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^npm run /rtk npm /')"
+elif echo "$MATCH_CMD" | grep -qE '^bun[[:space:]]+'; then
+  BUN_SUBCMD=$(echo "$MATCH_CMD" | awk '{print $2}')
+  case "$BUN_SUBCMD" in
+    install|add|remove|update|upgrade|pm)
+      CMD_CLASS="mutating"
+      ;;
+    *)
+      CMD_CLASS="read_only"
+      REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^bun /rtk bun /')"
+      ;;
+  esac
 elif echo "$MATCH_CMD" | grep -qE '^((npx|bunx)[[:space:]]+)?vue-tsc([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx |bunx )?vue-tsc/rtk tsc/')"
@@ -303,9 +315,9 @@ elif echo "$MATCH_CMD" | grep -qE '^python3?[[:space:]]+-m[[:space:]]+pytest([[:
 elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')"
-elif echo "$MATCH_CMD" | grep -qE '^pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?pip[[:space:]]+(list|outdated|install|show|uninstall)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's|^([^[:space:]]*/)?pip[[:space:]]+|rtk pip |')"
 elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^uv pip /rtk pip /')"

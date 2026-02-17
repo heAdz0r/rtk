@@ -49,25 +49,30 @@ pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
 
 // Patterns ordered to match RTK_RULES indices exactly.
 const PATTERNS: &[&str] = &[
-    r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick|remote|merge-base|rev-parse|merge|rebase)(\s|$)",
+    r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick|remote|merge-base|rev-parse|ls-files|merge|rebase|rm)(\s|$)",
     r"^gh\s+(pr|issue|run|repo|api)",
-    r"^cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
-    r"^(grepai|rgai)\s+search(\s|$)",
-    r"^(rgai)\s+",
+    r"^(?:[^[:space:]]+/)?cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
+    r"^(?:[^[:space:]]+/)?(grepai|rgai)\s+search(\s|$)",
+    r"^(?:[^[:space:]]+/)?(rgai)\s+",
     r"^go\s+(test|build|vet)(\s|$)",
     r"^pnpm\s+(list|ls|outdated|install)",
     r"^npm\s+(run|exec)",
+    r"^bun\s+([^\s]+)(\s|$)",
     r"^npx\s+",
     r"^(cat|head)\s+",
     r"^(rg|grep)\s+",
     r"^ls(\s|$)",
+    r"^tree(\s|$)",
     r"^find\s+",
+    r"^((npx|bunx)\s+)?vue-tsc(\s|$)",
     r"^(npx\s+|pnpm\s+)?tsc(\s|$)",
     r"^(npx\s+|pnpm\s+)?(eslint|biome|lint)(\s|$)",
     r"^(npx\s+|pnpm\s+)?prettier",
     r"^(npx\s+|pnpm\s+)?next\s+build",
     r"^(pnpm\s+|npx\s+)?(vitest|jest|test)(\s|$)",
     r"^(?:python3?\s+-m\s+)?(pytest)(\s|$)",
+    r"^(?:[^[:space:]]+/)?pip\s+(list|outdated|install|show|uninstall)(\s|$)",
+    r"^golangci-lint\s+(run)(\s|$)",
     r"^(npx\s+|pnpm\s+)?playwright",
     r"^(npx\s+|pnpm\s+)?prisma",
     r"^docker\s+(ps|images|logs)",
@@ -92,8 +97,10 @@ const RULES: &[RtkRule] = &[
             ("remote", 0.0),
             ("merge-base", 0.0),
             ("rev-parse", 0.0),
+            ("ls-files", 0.0),
             ("merge", 0.0),
             ("rebase", 0.0),
+            ("rm", 0.0),
         ],
         subcmd_status: &[
             ("checkout", super::report::RtkStatus::Passthrough),
@@ -101,8 +108,10 @@ const RULES: &[RtkRule] = &[
             ("remote", super::report::RtkStatus::Passthrough),
             ("merge-base", super::report::RtkStatus::Passthrough),
             ("rev-parse", super::report::RtkStatus::Passthrough),
+            ("ls-files", super::report::RtkStatus::Passthrough),
             ("merge", super::report::RtkStatus::Passthrough),
             ("rebase", super::report::RtkStatus::Passthrough),
+            ("rm", super::report::RtkStatus::Passthrough),
         ],
     },
     RtkRule {
@@ -158,6 +167,31 @@ const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        rtk_cmd: "rtk bun",
+        category: "PackageManager",
+        savings_pct: 70.0,
+        subcmd_savings: &[
+            ("--version", 0.0),
+            ("-v", 0.0),
+            ("install", 0.0),
+            ("add", 0.0),
+            ("remove", 0.0),
+            ("update", 0.0),
+            ("upgrade", 0.0),
+            ("pm", 0.0),
+        ],
+        subcmd_status: &[
+            ("--version", super::report::RtkStatus::Passthrough),
+            ("-v", super::report::RtkStatus::Passthrough),
+            ("install", super::report::RtkStatus::Passthrough),
+            ("add", super::report::RtkStatus::Passthrough),
+            ("remove", super::report::RtkStatus::Passthrough),
+            ("update", super::report::RtkStatus::Passthrough),
+            ("upgrade", super::report::RtkStatus::Passthrough),
+            ("pm", super::report::RtkStatus::Passthrough),
+        ],
+    },
+    RtkRule {
         rtk_cmd: "rtk npx",
         category: "PackageManager",
         savings_pct: 70.0,
@@ -186,9 +220,23 @@ const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        rtk_cmd: "rtk tree",
+        category: "Files",
+        savings_pct: 65.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
         rtk_cmd: "rtk find",
         category: "Files",
         savings_pct: 70.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk tsc",
+        category: "Build",
+        savings_pct: 83.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
@@ -231,6 +279,20 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk pytest",
         category: "Tests",
         savings_pct: 90.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk pip",
+        category: "PackageManager",
+        savings_pct: 70.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk golangci-lint",
+        category: "Build",
+        savings_pct: 80.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
@@ -367,7 +429,10 @@ pub fn classify_command(cmd: &str) -> Classification {
         return Classification::Ignored;
     }
     if let Some(first_raw) = trimmed.split_whitespace().next() {
-        if first_raw.starts_with('"') || first_raw.starts_with('\'') || first_raw.starts_with('\\')
+        if first_raw.starts_with("--")
+            || first_raw.starts_with('"')
+            || first_raw.starts_with('\'')
+            || first_raw.starts_with('\\')
         {
             return Classification::Ignored;
         }
@@ -686,6 +751,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_git_ls_files_passthrough() {
+        assert_eq!(
+            classify_command("git ls-files --cached"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_git_merge_passthrough() {
         assert_eq!(
             classify_command("git merge origin/master"),
@@ -702,6 +780,19 @@ mod tests {
     fn test_classify_git_rebase_passthrough() {
         assert_eq!(
             classify_command("git rebase upstream/master"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_rm_passthrough() {
+        assert_eq!(
+            classify_command("git rm --cached .grepai/config.yaml"),
             Classification::Supported {
                 rtk_equivalent: "rtk git",
                 category: "Git",
@@ -751,6 +842,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_absolute_path_cargo_test() {
+        assert_eq!(
+            classify_command("/Users/andrew/.cargo/bin/cargo test -q"),
+            Classification::Supported {
+                rtk_equivalent: "rtk cargo",
+                category: "Cargo",
+                estimated_savings_pct: 90.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_npx_tsc() {
         assert_eq!(
             classify_command("npx tsc --noEmit"),
@@ -759,6 +863,71 @@ mod tests {
                 category: "Build",
                 estimated_savings_pct: 83.0,
                 status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bunx_vue_tsc() {
+        assert_eq!(
+            classify_command("bunx vue-tsc --noEmit"),
+            Classification::Supported {
+                rtk_equivalent: "rtk tsc",
+                category: "Build",
+                estimated_savings_pct: 83.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bun_run() {
+        assert_eq!(
+            classify_command("bun run typecheck"),
+            Classification::Supported {
+                rtk_equivalent: "rtk bun",
+                category: "PackageManager",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bun_version_passthrough() {
+        assert_eq!(
+            classify_command("bun --version"),
+            Classification::Supported {
+                rtk_equivalent: "rtk bun",
+                category: "PackageManager",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bun_direct_script() {
+        assert_eq!(
+            classify_command("bun packages/server/src/index.ts"),
+            Classification::Supported {
+                rtk_equivalent: "rtk bun",
+                category: "PackageManager",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bun_install_passthrough() {
+        assert_eq!(
+            classify_command("bun install"),
+            Classification::Supported {
+                rtk_equivalent: "rtk bun",
+                category: "PackageManager",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
             }
         );
     }
@@ -777,9 +946,35 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_pip_absolute_path() {
+        assert_eq!(
+            classify_command("/Users/andrew/anaconda3/bin/pip install requests"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pip",
+                category: "PackageManager",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_grepai_search() {
         assert_eq!(
             classify_command("grepai search \"SharedDefaults App Group\""),
+            Classification::Supported {
+                rtk_equivalent: "rtk rgai",
+                category: "Files",
+                estimated_savings_pct: 85.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_grepai_search_absolute_path() {
+        assert_eq!(
+            classify_command("/Users/andrew/.local/bin/grepai search \"token trace\""),
             Classification::Supported {
                 rtk_equivalent: "rtk rgai",
                 category: "Files",
@@ -829,6 +1024,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_golangci_lint_run() {
+        assert_eq!(
+            classify_command("golangci-lint run ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk golangci-lint",
+                category: "Build",
+                estimated_savings_pct: 80.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_cat_file() {
         assert_eq!(
             classify_command("cat src/main.rs"),
@@ -865,6 +1073,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_tree_supported() {
+        assert_eq!(
+            classify_command("tree src/"),
+            Classification::Supported {
+                rtk_equivalent: "rtk tree",
+                category: "Files",
+                estimated_savings_pct: 65.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_cd_ignored() {
         assert_eq!(classify_command("cd /tmp"), Classification::Ignored);
     }
@@ -891,6 +1112,14 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_dash_dash_noise_ignored() {
+        assert_eq!(
+            classify_command("-- Индексы для promo_code_user"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
     fn test_classify_quote_noise_ignored() {
         assert_eq!(classify_command("\"'"), Classification::Ignored);
     }
@@ -910,7 +1139,10 @@ mod tests {
 
     #[test]
     fn test_classify_heredoc_ignored() {
-        assert_eq!(classify_command("python3 << 'PYEOF'"), Classification::Ignored);
+        assert_eq!(
+            classify_command("python3 << 'PYEOF'"),
+            Classification::Ignored
+        );
     }
 
     #[test]
@@ -1014,7 +1246,9 @@ mod tests {
     fn test_registry_covers_all_cargo_subcommands() {
         // Verify that every CargoCommand variant with a dedicated handler
         // except Other has a matching pattern in the registry
-        for subcmd in ["build", "test", "clippy", "check", "fmt", "install", "nextest"] {
+        for subcmd in [
+            "build", "test", "clippy", "check", "fmt", "install", "nextest",
+        ] {
             let cmd = format!("cargo {subcmd}");
             match classify_command(&cmd) {
                 Classification::Supported { .. } => {}
@@ -1027,9 +1261,27 @@ mod tests {
     fn test_registry_covers_all_git_subcommands() {
         // Verify that every GitCommand subcommand has a matching pattern
         for subcmd in [
-            "status", "log", "diff", "show", "add", "commit", "push", "pull", "branch", "fetch",
-            "stash", "worktree", "checkout", "cherry-pick", "remote", "merge-base", "rev-parse",
-            "merge", "rebase",
+            "status",
+            "log",
+            "diff",
+            "show",
+            "add",
+            "commit",
+            "push",
+            "pull",
+            "branch",
+            "fetch",
+            "stash",
+            "worktree",
+            "checkout",
+            "cherry-pick",
+            "remote",
+            "merge-base",
+            "rev-parse",
+            "ls-files",
+            "merge",
+            "rebase",
+            "rm",
         ] {
             let cmd = format!("git {subcmd}");
             match classify_command(&cmd) {
