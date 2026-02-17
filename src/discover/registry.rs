@@ -360,8 +360,17 @@ pub fn classify_command(cmd: &str) -> Classification {
     if trimmed.is_empty() {
         return Classification::Ignored;
     }
+    if trimmed.contains("<<") {
+        return Classification::Ignored;
+    }
     if trimmed.chars().all(|c| !c.is_alphanumeric()) {
         return Classification::Ignored;
+    }
+    if let Some(first_raw) = trimmed.split_whitespace().next() {
+        if first_raw.starts_with('"') || first_raw.starts_with('\'') || first_raw.starts_with('\\')
+        {
+            return Classification::Ignored;
+        }
     }
 
     // Check ignored
@@ -892,6 +901,16 @@ mod tests {
             classify_command("CREATE INDEX IF NOT EXISTS idx_leaderboard_entries"),
             Classification::Ignored
         );
+    }
+
+    #[test]
+    fn test_classify_quoted_noise_with_redirection_ignored() {
+        assert_eq!(classify_command("\\\"\\\" 2>&1"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_heredoc_ignored() {
+        assert_eq!(classify_command("python3 << 'PYEOF'"), Classification::Ignored);
     }
 
     #[test]
