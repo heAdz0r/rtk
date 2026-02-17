@@ -530,6 +530,7 @@ Search rewrite order is strict and deterministic: `rgai > rg > grep`.
 | `gh pr/issue/run` | `rtk gh ...` |
 | `cargo test/build/clippy` | `rtk cargo ...` |
 | `cat <file>` | `rtk read <file>` |
+| `head -N <file>` / `head --lines=N <file>` | `rtk read <file> --max-lines N` |
 | `write replace/patch/set ...` | `rtk write ...` |
 | `sed -i 's/a/b/[g]' file` (simple form) | `rtk write replace file --from 'a' --to 'b' [--all]` |
 | `perl -pi -e 's/a/b/[g]' file` (simple form) | `rtk write replace file --from 'a' --to 'b' [--all]` |

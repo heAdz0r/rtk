@@ -118,6 +118,10 @@ test_rewrite "cat package.json" \
   "cat package.json" \
   "rtk read package.json"
 
+test_rewrite "head -20 package.json" \
+  "head -20 package.json" \
+  "rtk read package.json --max-lines 20"
+
 test_rewrite "grep -rn pattern src/" \
   "grep -rn pattern src/" \
   "rtk grep -rn pattern src/"
@@ -324,6 +328,10 @@ test_rewrite "python3 (no pattern)" \
 
 test_rewrite "node (no pattern)" \
   "node -e 'console.log(1)'" \
+  ""
+
+test_rewrite "tail (no safe rewrite)" \
+  "tail -20 package.json" \
   ""
 
 echo ""

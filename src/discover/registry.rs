@@ -55,7 +55,7 @@ const PATTERNS: &[&str] = &[
     r"^pnpm\s+(list|ls|outdated|install)",
     r"^npm\s+(run|exec)",
     r"^npx\s+",
-    r"^(cat|head|tail)\s+",
+    r"^(cat|head)\s+",
     r"^(rg|grep)\s+",
     r"^ls(\s|$)",
     r"^find\s+",
@@ -561,6 +561,29 @@ mod tests {
                 category: "Files",
                 estimated_savings_pct: 60.0,
                 status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_head_file() {
+        assert_eq!(
+            classify_command("head -20 src/main.rs"),
+            Classification::Supported {
+                rtk_equivalent: "rtk read",
+                category: "Files",
+                estimated_savings_pct: 60.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_tail_file_unsupported() {
+        assert_eq!(
+            classify_command("tail -20 src/main.rs"),
+            Classification::Unsupported {
+                base_command: "tail".to_string(),
             }
         );
     }
