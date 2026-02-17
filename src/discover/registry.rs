@@ -49,9 +49,9 @@ pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
 
 // Patterns ordered to match RTK_RULES indices exactly.
 const PATTERNS: &[&str] = &[
-    r"^git\s+(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree)",
+    r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick)(\s|$)",
     r"^gh\s+(pr|issue|run|repo|api)",
-    r"^cargo\s+(build|test|clippy|check|fmt)",
+    r"^cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
     r"^pnpm\s+(list|ls|outdated|install)",
     r"^npm\s+(run|exec)",
     r"^npx\s+",
@@ -64,6 +64,7 @@ const PATTERNS: &[&str] = &[
     r"^(npx\s+|pnpm\s+)?prettier",
     r"^(npx\s+|pnpm\s+)?next\s+build",
     r"^(pnpm\s+|npx\s+)?(vitest|jest|test)(\s|$)",
+    r"^(?:python3?\s+-m\s+)?(pytest)(\s|$)",
     r"^(npx\s+|pnpm\s+)?playwright",
     r"^(npx\s+|pnpm\s+)?prisma",
     r"^docker\s+(ps|images|logs)",
@@ -83,8 +84,13 @@ const RULES: &[RtkRule] = &[
             ("show", 80.0),
             ("add", 59.0),
             ("commit", 59.0),
+            ("checkout", 0.0),
+            ("cherry-pick", 0.0),
         ],
-        subcmd_status: &[],
+        subcmd_status: &[
+            ("checkout", super::report::RtkStatus::Passthrough),
+            ("cherry-pick", super::report::RtkStatus::Passthrough),
+        ],
     },
     RtkRule {
         rtk_cmd: "rtk gh",
@@ -97,8 +103,11 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk cargo",
         category: "Cargo",
         savings_pct: 80.0,
-        subcmd_savings: &[("test", 90.0), ("check", 80.0)],
-        subcmd_status: &[("fmt", super::report::RtkStatus::Passthrough)],
+        subcmd_savings: &[("test", 90.0), ("check", 80.0), ("run", 0.0)],
+        subcmd_status: &[
+            ("fmt", super::report::RtkStatus::Passthrough),
+            ("run", super::report::RtkStatus::Passthrough),
+        ],
     },
     RtkRule {
         rtk_cmd: "rtk pnpm",
@@ -181,6 +190,13 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk vitest",
         category: "Tests",
         savings_pct: 99.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk pytest",
+        category: "Tests",
+        savings_pct: 90.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
@@ -527,6 +543,45 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_git_with_global_options() {
+        assert_eq!(
+            classify_command("git -C /Users/andrew/Programming/rtk status -s"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_checkout_passthrough() {
+        assert_eq!(
+            classify_command("git checkout feat/gain-project-scope"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_cherry_pick_passthrough() {
+        assert_eq!(
+            classify_command("git cherry-pick 3d08e6c"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_cargo_test_filter() {
         assert_eq!(
             classify_command("cargo test filter::"),
@@ -540,6 +595,32 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_cargo_install() {
+        assert_eq!(
+            classify_command("cargo install --path ."),
+            Classification::Supported {
+                rtk_equivalent: "rtk cargo",
+                category: "Cargo",
+                estimated_savings_pct: 80.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_cargo_run_passthrough() {
+        assert_eq!(
+            classify_command("cargo run -- rgai --builtin \"token trace\""),
+            Classification::Supported {
+                rtk_equivalent: "rtk cargo",
+                category: "Cargo",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_npx_tsc() {
         assert_eq!(
             classify_command("npx tsc --noEmit"),
@@ -547,6 +628,19 @@ mod tests {
                 rtk_equivalent: "rtk tsc",
                 category: "Build",
                 estimated_savings_pct: 83.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_python3_pytest() {
+        assert_eq!(
+            classify_command("python3 -m pytest benchmarks/tests/test_baseline.py"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pytest",
+                category: "Tests",
+                estimated_savings_pct: 90.0,
                 status: RtkStatus::Existing,
             }
         );
@@ -705,9 +799,9 @@ mod tests {
 
     #[test]
     fn test_registry_covers_all_cargo_subcommands() {
-        // Verify that every CargoCommand variant (Build, Test, Clippy, Check, Fmt)
+        // Verify that every CargoCommand variant with a dedicated handler
         // except Other has a matching pattern in the registry
-        for subcmd in ["build", "test", "clippy", "check", "fmt"] {
+        for subcmd in ["build", "test", "clippy", "check", "fmt", "install", "nextest"] {
             let cmd = format!("cargo {subcmd}");
             match classify_command(&cmd) {
                 Classification::Supported { .. } => {}
@@ -721,7 +815,7 @@ mod tests {
         // Verify that every GitCommand subcommand has a matching pattern
         for subcmd in [
             "status", "log", "diff", "show", "add", "commit", "push", "pull", "branch", "fetch",
-            "stash", "worktree",
+            "stash", "worktree", "checkout", "cherry-pick",
         ] {
             let cmd = format!("git {subcmd}");
             match classify_command(&cmd) {

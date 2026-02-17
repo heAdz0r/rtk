@@ -296,9 +296,9 @@ elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+(list|ls|outdated)([[:space:
 elif echo "$MATCH_CMD" | grep -qE '^pytest([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')"
-elif echo "$MATCH_CMD" | grep -qE '^python[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
+elif echo "$MATCH_CMD" | grep -qE '^python3?[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^python -m pytest/rtk pytest/')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^python3?[[:space:]]+-m[[:space:]]+pytest/rtk pytest/')"
 elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')"

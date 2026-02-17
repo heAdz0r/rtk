@@ -180,7 +180,7 @@ elif [[ "$MATCH_CMD" =~ ^sed[[:space:]]+-i([[:space:]]+\'\'|[[:space:]]+\"\")?[[
   TO="${BASH_REMATCH[3]}"
   FLAGS="${BASH_REMATCH[4]}"
   FILE="${BASH_REMATCH[5]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi
@@ -190,7 +190,7 @@ elif [[ "$MATCH_CMD" =~ ^sed[[:space:]]+-i([[:space:]]+\'\'|[[:space:]]+\"\")?[[
   TO="${BASH_REMATCH[3]}"
   FLAGS="${BASH_REMATCH[4]}"
   FILE="${BASH_REMATCH[5]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi
@@ -200,7 +200,7 @@ elif [[ "$MATCH_CMD" =~ ^perl[[:space:]]+-pi[[:space:]]+-e[[:space:]]+\'s/([^/\'
   TO="${BASH_REMATCH[2]}"
   FLAGS="${BASH_REMATCH[3]}"
   FILE="${BASH_REMATCH[4]}"
-  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO'"
+  REWRITTEN="${ENV_PREFIX}rtk write replace $FILE --from '$FROM' --to '$TO' --retry 3" # changed: auto-inject --retry 3 for concurrent safety
   if [ "$FLAGS" = "g" ]; then
     REWRITTEN="$REWRITTEN --all"
   fi
@@ -296,9 +296,9 @@ elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+(list|ls|outdated)([[:space:
 elif echo "$MATCH_CMD" | grep -qE '^pytest([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')"
-elif echo "$MATCH_CMD" | grep -qE '^python[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
+elif echo "$MATCH_CMD" | grep -qE '^python3?[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^python -m pytest/rtk pytest/')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^python3?[[:space:]]+-m[[:space:]]+pytest/rtk pytest/')"
 elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')"

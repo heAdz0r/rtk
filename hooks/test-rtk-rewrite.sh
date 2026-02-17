@@ -138,6 +138,14 @@ test_rewrite "npx prisma migrate" \
   "npx prisma migrate" \
   "rtk prisma migrate"
 
+test_rewrite "python -m pytest" \
+  "python -m pytest benchmarks/tests/test_baseline.py" \
+  "rtk pytest benchmarks/tests/test_baseline.py"
+
+test_rewrite "python3 -m pytest" \
+  "python3 -m pytest benchmarks/tests/test_baseline.py" \
+  "rtk pytest benchmarks/tests/test_baseline.py"
+
 echo ""
 
 # ---- SECTION 1.5: Mutating rewrites (opt-in) ----
@@ -262,15 +270,15 @@ test_rewrite "write replace alias" \
 
 test_rewrite "sed -i single occurrence" \
   "sed -i 's/old/new/' file.txt" \
-  "rtk write replace file.txt --from 'old' --to 'new'"
+  "rtk write replace file.txt --from 'old' --to 'new' --retry 3"
 
 test_rewrite "sed -i global occurrence" \
   "sed -i 's/old/new/g' file.txt" \
-  "rtk write replace file.txt --from 'old' --to 'new' --all"
+  "rtk write replace file.txt --from 'old' --to 'new' --retry 3 --all"
 
 test_rewrite "perl -pi replacement" \
   "perl -pi -e 's/old/new/g' file.txt" \
-  "rtk write replace file.txt --from 'old' --to 'new' --all"
+  "rtk write replace file.txt --from 'old' --to 'new' --retry 3 --all"
 
 echo ""
 
