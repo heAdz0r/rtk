@@ -49,9 +49,12 @@ pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
 
 // Patterns ordered to match RTK_RULES indices exactly.
 const PATTERNS: &[&str] = &[
-    r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick)(\s|$)",
+    r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick|remote|merge-base|rev-parse|merge|rebase)(\s|$)",
     r"^gh\s+(pr|issue|run|repo|api)",
     r"^cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
+    r"^(grepai|rgai)\s+search(\s|$)",
+    r"^(rgai)\s+",
+    r"^go\s+(test|build|vet)(\s|$)",
     r"^pnpm\s+(list|ls|outdated|install)",
     r"^npm\s+(run|exec)",
     r"^npx\s+",
@@ -86,10 +89,20 @@ const RULES: &[RtkRule] = &[
             ("commit", 59.0),
             ("checkout", 0.0),
             ("cherry-pick", 0.0),
+            ("remote", 0.0),
+            ("merge-base", 0.0),
+            ("rev-parse", 0.0),
+            ("merge", 0.0),
+            ("rebase", 0.0),
         ],
         subcmd_status: &[
             ("checkout", super::report::RtkStatus::Passthrough),
             ("cherry-pick", super::report::RtkStatus::Passthrough),
+            ("remote", super::report::RtkStatus::Passthrough),
+            ("merge-base", super::report::RtkStatus::Passthrough),
+            ("rev-parse", super::report::RtkStatus::Passthrough),
+            ("merge", super::report::RtkStatus::Passthrough),
+            ("rebase", super::report::RtkStatus::Passthrough),
         ],
     },
     RtkRule {
@@ -108,6 +121,27 @@ const RULES: &[RtkRule] = &[
             ("fmt", super::report::RtkStatus::Passthrough),
             ("run", super::report::RtkStatus::Passthrough),
         ],
+    },
+    RtkRule {
+        rtk_cmd: "rtk rgai",
+        category: "Files",
+        savings_pct: 85.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk rgai",
+        category: "Files",
+        savings_pct: 85.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk go",
+        category: "Build",
+        savings_pct: 80.0,
+        subcmd_savings: &[("test", 90.0)],
+        subcmd_status: &[],
     },
     RtkRule {
         rtk_cmd: "rtk pnpm",
@@ -326,6 +360,9 @@ pub fn classify_command(cmd: &str) -> Classification {
     if trimmed.is_empty() {
         return Classification::Ignored;
     }
+    if trimmed.chars().all(|c| !c.is_alphanumeric()) {
+        return Classification::Ignored;
+    }
 
     // Check ignored
     for exact in IGNORED_EXACT {
@@ -344,6 +381,24 @@ pub fn classify_command(cmd: &str) -> Classification {
     let cmd_clean = stripped.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
+    }
+    if let Some(first) = cmd_clean.split_whitespace().next() {
+        if matches!(
+            first,
+            "SELECT"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "CREATE"
+                | "ALTER"
+                | "DROP"
+                | "PRAGMA"
+                | "BEGIN"
+                | "COMMIT"
+                | "ROLLBACK"
+        ) {
+            return Classification::Ignored;
+        }
     }
 
     // Fast check with RegexSet — take the last (most specific) match
@@ -583,6 +638,71 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_git_remote_passthrough() {
+        assert_eq!(
+            classify_command("git remote -v"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_merge_base_passthrough() {
+        assert_eq!(
+            classify_command("git merge-base HEAD origin/master"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_rev_parse_passthrough() {
+        assert_eq!(
+            classify_command("git rev-parse HEAD"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_merge_passthrough() {
+        assert_eq!(
+            classify_command("git merge origin/master"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_rebase_passthrough() {
+        assert_eq!(
+            classify_command("git rebase upstream/master"),
+            Classification::Supported {
+                rtk_equivalent: "rtk git",
+                category: "Git",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_cargo_test_filter() {
         assert_eq!(
             classify_command("cargo test filter::"),
@@ -648,6 +768,58 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_grepai_search() {
+        assert_eq!(
+            classify_command("grepai search \"SharedDefaults App Group\""),
+            Classification::Supported {
+                rtk_equivalent: "rtk rgai",
+                category: "Files",
+                estimated_savings_pct: 85.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_rgai_direct() {
+        assert_eq!(
+            classify_command("rgai token traces"),
+            Classification::Supported {
+                rtk_equivalent: "rtk rgai",
+                category: "Files",
+                estimated_savings_pct: 85.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_go_build() {
+        assert_eq!(
+            classify_command("go build ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk go",
+                category: "Build",
+                estimated_savings_pct: 80.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_go_test_savings() {
+        assert_eq!(
+            classify_command("go test ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk go",
+                category: "Build",
+                estimated_savings_pct: 90.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_cat_file() {
         assert_eq!(
             classify_command("cat src/main.rs"),
@@ -705,6 +877,19 @@ mod tests {
     fn test_classify_comment_ignored() {
         assert_eq!(
             classify_command("# Test hook rewrite for ssh commands"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
+    fn test_classify_quote_noise_ignored() {
+        assert_eq!(classify_command("\"'"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_sql_ignored() {
+        assert_eq!(
+            classify_command("CREATE INDEX IF NOT EXISTS idx_leaderboard_entries"),
             Classification::Ignored
         );
     }
@@ -824,12 +1009,24 @@ mod tests {
         // Verify that every GitCommand subcommand has a matching pattern
         for subcmd in [
             "status", "log", "diff", "show", "add", "commit", "push", "pull", "branch", "fetch",
-            "stash", "worktree", "checkout", "cherry-pick",
+            "stash", "worktree", "checkout", "cherry-pick", "remote", "merge-base", "rev-parse",
+            "merge", "rebase",
         ] {
             let cmd = format!("git {subcmd}");
             match classify_command(&cmd) {
                 Classification::Supported { .. } => {}
                 other => panic!("git {subcmd} should be Supported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_registry_covers_all_go_subcommands() {
+        for subcmd in ["test", "build", "vet"] {
+            let cmd = format!("go {subcmd}");
+            match classify_command(&cmd) {
+                Classification::Supported { .. } => {}
+                other => panic!("go {subcmd} should be Supported, got {other:?}"),
             }
         }
     }

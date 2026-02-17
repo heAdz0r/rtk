@@ -106,6 +106,30 @@ test_rewrite "git cherry-pick (mutating guarded default)" \
   "git cherry-pick 3d08e6c" \
   ""
 
+test_rewrite "git merge (mutating guarded default)" \
+  "git merge origin/master" \
+  ""
+
+test_rewrite "git rebase (mutating guarded default)" \
+  "git rebase upstream/master" \
+  ""
+
+test_rewrite "git remote -v" \
+  "git remote -v" \
+  "rtk git remote -v"
+
+test_rewrite "git merge-base" \
+  "git merge-base HEAD origin/master" \
+  "rtk git merge-base HEAD origin/master"
+
+test_rewrite "git rev-parse" \
+  "git rev-parse HEAD" \
+  "rtk git rev-parse HEAD"
+
+test_rewrite "git -C status" \
+  "git -C /Users/andrew/Programming/rtk status -s" \
+  "rtk git -C /Users/andrew/Programming/rtk status -s"
+
 test_rewrite "gh pr list" \
   "gh pr list" \
   "rtk gh pr list"
@@ -138,6 +162,14 @@ test_rewrite "rg pattern src/" \
   "rg pattern src/" \
   "rtk grep pattern src/"
 
+test_rewrite "grepai search rewrite" \
+  "grepai search \"SharedDefaults App Group\"" \
+  "rtk rgai \"SharedDefaults App Group\""
+
+test_rewrite "rgai direct rewrite" \
+  "rgai token traces" \
+  "rtk rgai token traces"
+
 test_rewrite "cargo test" \
   "cargo test" \
   "rtk cargo test"
@@ -157,6 +189,18 @@ test_rewrite "python -m pytest" \
 test_rewrite "python3 -m pytest" \
   "python3 -m pytest benchmarks/tests/test_baseline.py" \
   "rtk pytest benchmarks/tests/test_baseline.py"
+
+test_rewrite "go build rewrite" \
+  "go build ./internal/domain/game/services/..." \
+  "rtk go build ./internal/domain/game/services/..."
+
+test_rewrite "go test rewrite" \
+  "go test ./internal/domain/character/..." \
+  "rtk go test ./internal/domain/character/..."
+
+test_rewrite "go vet rewrite" \
+  "go vet ./internal/domain/game/services/..." \
+  "rtk go vet ./internal/domain/game/services/..."
 
 echo ""
 
@@ -180,6 +224,16 @@ test_rewrite_with_env "git checkout with mutating enabled" \
 test_rewrite_with_env "git cherry-pick with mutating enabled" \
   "git cherry-pick 3d08e6c" \
   "rtk git cherry-pick 3d08e6c" \
+  "RTK_REWRITE_MUTATING=1"
+
+test_rewrite_with_env "git merge with mutating enabled" \
+  "git merge origin/master" \
+  "rtk git merge origin/master" \
+  "RTK_REWRITE_MUTATING=1"
+
+test_rewrite_with_env "git rebase with mutating enabled" \
+  "git rebase upstream/master" \
+  "rtk git rebase upstream/master" \
   "RTK_REWRITE_MUTATING=1"
 
 echo ""

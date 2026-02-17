@@ -34,10 +34,11 @@ fi
 # We only rewrite if the FIRST command in a chain matches.
 FIRST_CMD="$CMD"
 CMD_CLASS="unknown"
+FIRST_TOKEN=$(echo "$FIRST_CMD" | awk '{print $1}')
 
 # Skip if already using rtk
-case "$FIRST_CMD" in
-  rtk\ *|*/rtk\ *) _rtk_audit_log "skip:already_rtk" "$CMD" "-" "$CMD_CLASS"; exit 0 ;;
+case "$FIRST_TOKEN" in
+  rtk|*/rtk) _rtk_audit_log "skip:already_rtk" "$CMD" "-" "$CMD_CLASS"; exit 0 ;;
 esac
 
 # Skip commands with heredocs, variable assignments as the whole command, etc.
@@ -70,8 +71,8 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
     -e 's/^[[:space:]]+//')
   GIT_VERB=$(echo "$GIT_SUBCMD" | awk '{print $1}')
   case "$GIT_VERB" in
-    status|diff|log|show) CMD_CLASS="read_only" ;;
-    add|commit|push|pull|fetch|checkout|cherry-pick) CMD_CLASS="mutating" ;;
+    status|diff|log|show|remote|merge-base|rev-parse) CMD_CLASS="read_only" ;;
+    add|commit|push|pull|fetch|checkout|cherry-pick|merge|rebase) CMD_CLASS="mutating" ;;
     branch)
       BRANCH_ARGS="${GIT_SUBCMD#branch}"
       if echo "$BRANCH_ARGS" | grep -qE '(^|[[:space:]])-(d|D|m|M|c|C)([[:space:]]|$)'; then
@@ -102,7 +103,7 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   esac
 
   case "$GIT_SUBCMD" in
-    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|checkout|checkout\ *|cherry-pick|cherry-pick\ *)
+    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|checkout|checkout\ *|cherry-pick|cherry-pick\ *|remote|remote\ *|merge-base|merge-base\ *|rev-parse|rev-parse\ *|merge|merge\ *|rebase|rebase\ *)
       REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
       ;;
   esac
