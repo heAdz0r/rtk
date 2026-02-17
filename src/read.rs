@@ -1,27 +1,180 @@
+//! Read orchestrator: thin dispatch layer that delegates to submodules.
+//! Heavy logic lives in read_source, read_cache, read_digest, read_render.
+//! Refactored in PR-2 from a 1081-line monolith.
+
 use crate::filter::{self, FilterLevel, Language};
+use crate::read_cache;
+use crate::read_digest;
+use crate::read_render;
+use crate::read_source;
 use crate::tracking;
 use anyhow::{Context, Result};
-use std::fs;
+use std::io::Write as IoWrite;
 use std::path::Path;
+
+// Re-export ReadMode from read_types for backward compat with main.rs
+pub use crate::read_types::ReadMode;
 
 pub fn run(
     file: &Path,
     level: FilterLevel,
+    from: Option<usize>,
+    to: Option<usize>,
     max_lines: Option<usize>,
     line_numbers: bool,
+    dedup: bool,
     verbose: u8,
 ) -> Result<()> {
+    let run_start = std::time::Instant::now();
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
         eprintln!("Reading: {} (filter: {})", file.display(), level);
     }
 
-    // Read file content
-    let content = fs::read_to_string(file)
-        .with_context(|| format!("Failed to read file: {}", file.display()))?;
+    // ── Cache lookup ────────────────────────────────────────
+    let cache_key =
+        if read_cache::should_use_read_cache(level, from, to, max_lines, line_numbers, dedup) {
+            match read_cache::build_read_cache_key(
+                file,
+                level,
+                from,
+                to,
+                max_lines,
+                line_numbers,
+                dedup,
+            ) {
+                Ok(key) => Some(key),
+                Err(err) => {
+                    if verbose > 1 {
+                        eprintln!("Read cache key disabled: {err}");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-    // Detect language from extension
+    if let Some(key) = cache_key.as_deref() {
+        if let Some(output) = read_cache::load_read_cache(key) {
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            let input_tokens = std::fs::metadata(file)
+                .ok()
+                .map(|meta| ((meta.len() as usize).saturating_add(3)) / 4)
+                .unwrap_or_else(|| tracking::estimate_tokens(&output));
+            let output_tokens = tracking::estimate_tokens(&output);
+            let elapsed_ms = run_start.elapsed().as_millis() as u64;
+            if let Ok(tracker) = tracking::Tracker::new() {
+                let _ = tracker.record(
+                    &format!("cat {}", file.display()),
+                    "rtk read (cache)",
+                    input_tokens,
+                    output_tokens,
+                    elapsed_ms,
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    // ── Read file content ───────────────────────────────────
+    let content_bytes = read_source::read_file_bytes(file, from, to)?;
+
+    // ── Binary detection ────────────────────────────────────
+    if read_source::looks_binary(&content_bytes) {
+        let preview = read_source::format_binary_preview(&content_bytes);
+        println!("{preview}");
+        let input_marker = format!("[binary:{} bytes]", content_bytes.len());
+        timer.track(
+            &format!("cat {}", file.display()),
+            "rtk read",
+            &input_marker,
+            &preview,
+        );
+        return Ok(());
+    }
+
+    // ── Special format digest (lock files, package.json, etc.) ──
+    if level != FilterLevel::None
+        && from.is_none()
+        && to.is_none()
+        && max_lines.is_none()
+        && !line_numbers
+        && read_digest::has_special_digest(file)
+    {
+        let content_str = String::from_utf8_lossy(&content_bytes);
+        if let Some(digest) = read_digest::try_special_digest(file, &content_str, level) {
+            print!("{digest}");
+            if !digest.ends_with('\n') {
+                println!();
+            }
+            if let Some(key) = cache_key.as_deref() {
+                read_cache::store_read_cache(key, &digest);
+            }
+            timer.track(
+                &format!("cat {}", file.display()),
+                "rtk read",
+                &content_str,
+                &digest,
+            );
+            return Ok(());
+        }
+        // fallback: strategy returned None (parse error), continue to normal read
+    }
+
+    // ── Tabular digest (CSV/TSV) ────────────────────────────
+    if read_digest::should_use_tabular_digest(file, level, from, to, max_lines, line_numbers) {
+        if let Some(delimiter) = read_digest::tabular_delimiter(file) {
+            match read_digest::build_tabular_digest(&content_bytes, delimiter, level) {
+                Ok(digest) => {
+                    print!("{digest}");
+                    if !digest.ends_with('\n') {
+                        println!();
+                    }
+                    if let Some(key) = cache_key.as_deref() {
+                        read_cache::store_read_cache(key, &digest);
+                    }
+                    let input = String::from_utf8_lossy(&content_bytes);
+                    timer.track(
+                        &format!("cat {}", file.display()),
+                        "rtk read",
+                        &input,
+                        &digest,
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    if verbose > 0 {
+                        eprintln!("Tabular digest skipped: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Level none: exact cat parity ────────────────────────
+    if level == FilterLevel::None && max_lines.is_none() && !line_numbers {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&content_bytes)
+            .context("Failed to write output")?;
+        let input = String::from_utf8_lossy(&content_bytes);
+        timer.track(
+            &format!("cat {}", file.display()),
+            "rtk read",
+            &input,
+            &input,
+        );
+        return Ok(());
+    }
+
+    // ── Filter pipeline ─────────────────────────────────────
+    let content = String::from_utf8_lossy(&content_bytes).into_owned();
+
     let lang = file
         .extension()
         .and_then(|e| e.to_str())
@@ -32,7 +185,6 @@ pub fn run(
         eprintln!("Detected language: {:?}", lang);
     }
 
-    // Apply filter
     let filter = filter::get_filter(level);
     let mut filtered = filter.filter(&content, &lang);
 
@@ -50,17 +202,27 @@ pub fn run(
         );
     }
 
-    // Apply smart truncation if max_lines is set
     if let Some(max) = max_lines {
         filtered = filter::smart_truncate(&filtered, max, &lang);
     }
 
+    // PR-6: truncate long lines in minimal/aggressive modes
+    filtered = read_digest::truncate_long_lines(&filtered, level);
+
+    // PR-7: opt-in dedup of repetitive blocks
+    if dedup {
+        filtered = read_render::dedup_repetitive_blocks(&filtered);
+    }
+
     let rtk_output = if line_numbers {
-        format_with_line_numbers(&filtered)
+        read_render::format_with_line_numbers(&filtered)
     } else {
         filtered.clone()
     };
-    println!("{}", rtk_output);
+    if let Some(key) = cache_key.as_deref() {
+        read_cache::store_read_cache(key, &rtk_output);
+    }
+    print!("{rtk_output}");
     timer.track(
         &format!("cat {}", file.display()),
         "rtk read",
@@ -70,35 +232,141 @@ pub fn run(
     Ok(())
 }
 
+/// Run changed/since mode for a file (git diff-aware reading).
+pub fn run_changed(file: &Path, revision: Option<&str>, context: usize, verbose: u8) -> Result<()> {
+    use crate::read_changed;
+
+    let timer = tracking::TimedExecution::start();
+
+    if verbose > 0 {
+        eprintln!(
+            "Diff reading: {} (revision: {:?}, context: {})",
+            file.display(),
+            revision,
+            context
+        );
+    }
+
+    let hunks = read_changed::git_diff_hunks(file, revision, context)?;
+    let output = read_changed::render_changed_hunks(&hunks, file);
+
+    print!("{output}");
+
+    let mode_label = if revision.is_some() {
+        "since"
+    } else {
+        "changed"
+    };
+    let input_estimate = std::fs::read_to_string(file).map(|s| s.len()).unwrap_or(0);
+    let input_marker = format!("[file:{} bytes]", input_estimate);
+    timer.track(
+        &format!("cat {}", file.display()),
+        &format!("rtk read --{mode_label}"),
+        &input_marker,
+        &output,
+    );
+    Ok(())
+}
+
+/// Run outline or symbols mode for a file.
+pub fn run_symbols(file: &Path, mode: &ReadMode, verbose: u8) -> Result<()> {
+    use crate::filter::Language;
+    use crate::read_symbols::{render_outline, render_symbols_json, SymbolExtractor};
+    use crate::symbols_regex::RegexExtractor;
+
+    let timer = tracking::TimedExecution::start();
+
+    let content = std::fs::read_to_string(file)
+        .with_context(|| format!("Failed to read file: {}", file.display()))?;
+
+    let lang = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::Unknown);
+
+    if verbose > 0 {
+        eprintln!(
+            "Extracting symbols: {} (lang: {:?}, mode: {:?})",
+            file.display(),
+            lang,
+            mode
+        );
+    }
+
+    let extractor = RegexExtractor;
+    let symbols = extractor.extract(&content, &lang);
+    let total_lines = content.lines().count();
+
+    let output = match mode {
+        ReadMode::Outline => render_outline(&symbols, total_lines),
+        ReadMode::Symbols => render_symbols_json(symbols, &lang, total_lines),
+        _ => unreachable!("run_symbols called with non-symbol mode"),
+    };
+
+    println!("{output}");
+
+    timer.track(
+        &format!("cat {}", file.display()),
+        &format!(
+            "rtk read --{}",
+            if matches!(mode, ReadMode::Outline) {
+                "outline"
+            } else {
+                "symbols"
+            }
+        ),
+        &content,
+        &output,
+    );
+    Ok(())
+}
+
 pub fn run_stdin(
     level: FilterLevel,
+    from: Option<usize>,
+    to: Option<usize>,
     max_lines: Option<usize>,
     line_numbers: bool,
     verbose: u8,
 ) -> Result<()> {
-    use std::io::{self, Read as IoRead};
-
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
         eprintln!("Reading from stdin (filter: {})", level);
     }
 
-    // Read from stdin
-    let mut content = String::new();
-    io::stdin()
-        .lock()
-        .read_to_string(&mut content)
-        .context("Failed to read from stdin")?;
+    // Read stdin bytes
+    let bytes = read_source::read_stdin_bytes()?;
 
-    // No file extension, so use Unknown language
+    if read_source::looks_binary(&bytes) {
+        let preview = read_source::format_binary_preview(&bytes);
+        println!("{preview}");
+        let input_marker = format!("[binary:{} bytes]", bytes.len());
+        timer.track("cat - (stdin)", "rtk read -", &input_marker, &preview);
+        return Ok(());
+    }
+
+    // Level none: preserve exact bytes
+    if level == FilterLevel::None && max_lines.is_none() && !line_numbers {
+        let ranged = read_source::apply_line_range_bytes(&bytes, from, to)?;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&ranged)
+            .context("Failed to write output")?;
+        let input = String::from_utf8_lossy(&ranged);
+        timer.track("cat - (stdin)", "rtk read -", &input, &input);
+        return Ok(());
+    }
+
+    let content = read_source::apply_line_range(&String::from_utf8_lossy(&bytes), from, to)?;
+
     let lang = Language::Unknown;
 
     if verbose > 1 {
         eprintln!("Language: {:?} (stdin has no extension)", lang);
     }
 
-    // Apply filter
     let filter = filter::get_filter(level);
     let mut filtered = filter.filter(&content, &lang);
 
@@ -116,30 +384,19 @@ pub fn run_stdin(
         );
     }
 
-    // Apply smart truncation if max_lines is set
     if let Some(max) = max_lines {
         filtered = filter::smart_truncate(&filtered, max, &lang);
     }
 
     let rtk_output = if line_numbers {
-        format_with_line_numbers(&filtered)
+        read_render::format_with_line_numbers(&filtered)
     } else {
         filtered.clone()
     };
-    println!("{}", rtk_output);
+    print!("{rtk_output}");
 
     timer.track("cat - (stdin)", "rtk read -", &content, &rtk_output);
     Ok(())
-}
-
-fn format_with_line_numbers(content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let width = lines.len().to_string().len();
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        out.push_str(&format!("{:>width$} │ {}\n", i + 1, line, width = width));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -159,15 +416,21 @@ fn main() {{
 }}"#
         )?;
 
-        // Just verify it doesn't panic
-        run(file.path(), FilterLevel::Minimal, None, false, 0)?;
+        run(
+            file.path(),
+            FilterLevel::Minimal,
+            None,
+            None,
+            None,
+            false,
+            false,
+            0,
+        )?;
         Ok(())
     }
 
     #[test]
     fn test_stdin_support_signature() {
-        // Test that run_stdin has correct signature and compiles
-        // We don't actually run it because it would hang waiting for stdin
-        // Compile-time verification that the function exists with correct signature
+        // Compile-time verification that run_stdin exists with correct signature
     }
 }

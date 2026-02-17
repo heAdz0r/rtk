@@ -57,7 +57,8 @@ where
         .unwrap_or(if output.status.success() { 0 } else { 1 });
     let filtered = filter_fn(&raw);
 
-    if let Some(hint) = crate::tee::tee_and_hint(&raw, &format!("cargo_{}", subcommand), exit_code) // upstream sync: tee
+    if let Some(hint) = crate::tee::tee_and_hint(&raw, &format!("cargo_{}", subcommand), exit_code)
+    // upstream sync: tee
     {
         println!("{}\n{}", filtered, hint);
     } else {

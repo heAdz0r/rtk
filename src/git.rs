@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitCommandClass {
+    ReadOnly,
+    Mutating,
+}
+
 #[derive(Debug, Clone)]
 pub enum GitCommand {
     Diff,
@@ -20,6 +26,11 @@ pub enum GitCommand {
 }
 
 pub fn run(cmd: GitCommand, args: &[String], max_lines: Option<usize>, verbose: u8) -> Result<()> {
+    let command_class = classify_git_command(&cmd, args);
+    if verbose > 2 {
+        eprintln!("git command class: {:?}", command_class);
+    }
+
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose),
         GitCommand::Log => run_log(args, max_lines, verbose),
@@ -34,6 +45,75 @@ pub fn run(cmd: GitCommand, args: &[String], max_lines: Option<usize>, verbose: 
         GitCommand::Stash { subcommand } => run_stash(subcommand.as_deref(), args, verbose),
         GitCommand::Worktree => run_worktree(args, verbose),
     }
+}
+
+fn is_branch_action(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "-d" || a == "-D" || a == "-m" || a == "-M" || a == "-c" || a == "-C")
+}
+
+fn is_stash_mutating(subcommand: Option<&str>) -> bool {
+    match subcommand {
+        Some("list") | Some("show") => false,
+        Some("pop") | Some("apply") | Some("drop") | Some("push") | None => true,
+        Some(_) => true,
+    }
+}
+
+fn is_worktree_action(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "add" || a == "remove" || a == "prune" || a == "lock" || a == "unlock" || a == "move"
+    })
+}
+
+pub(crate) fn classify_git_command(cmd: &GitCommand, args: &[String]) -> GitCommandClass {
+    match cmd {
+        GitCommand::Diff | GitCommand::Log | GitCommand::Status | GitCommand::Show => {
+            GitCommandClass::ReadOnly
+        }
+        GitCommand::Add
+        | GitCommand::Commit { .. }
+        | GitCommand::Push
+        | GitCommand::Pull
+        | GitCommand::Fetch => GitCommandClass::Mutating,
+        GitCommand::Branch => {
+            if is_branch_action(args) {
+                GitCommandClass::Mutating
+            } else {
+                GitCommandClass::ReadOnly
+            }
+        }
+        GitCommand::Stash { subcommand } => {
+            if is_stash_mutating(subcommand.as_deref()) {
+                GitCommandClass::Mutating
+            } else {
+                GitCommandClass::ReadOnly
+            }
+        }
+        GitCommand::Worktree => {
+            if is_worktree_action(args) {
+                GitCommandClass::Mutating
+            } else {
+                GitCommandClass::ReadOnly
+            }
+        }
+    }
+}
+
+fn exit_with_git_failure(
+    label: &str,
+    stdout: &str,
+    stderr: &str,
+    status: std::process::ExitStatus,
+) -> ! {
+    eprintln!("FAILED: {}", label);
+    if !stderr.trim().is_empty() {
+        eprintln!("{}", stderr);
+    }
+    if !stdout.trim().is_empty() {
+        eprintln!("{}", stdout);
+    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn run_diff(args: &[String], max_lines: Option<usize>, verbose: u8) -> Result<()> {
@@ -699,23 +779,13 @@ fn run_commit(message: &str, verbose: u8) -> Result<()> {
             &compact,
         );
     } else {
-        if stderr.contains("nothing to commit") || stdout.contains("nothing to commit") {
-            println!("ok (nothing to commit)");
-            timer.track(
-                &format!("git commit -m \"{}\"", message),
-                "rtk git commit",
-                &raw_output,
-                "ok (nothing to commit)",
-            );
-        } else {
-            eprintln!("FAILED: git commit");
-            if !stderr.trim().is_empty() {
-                eprintln!("{}", stderr);
-            }
-            if !stdout.trim().is_empty() {
-                eprintln!("{}", stdout);
-            }
-        }
+        timer.track(
+            &format!("git commit -m \"{}\"", message),
+            "rtk git commit",
+            &raw_output,
+            "FAILED",
+        );
+        exit_with_git_failure("git commit", &stdout, &stderr, output.status);
     }
 
     Ok(())
@@ -770,13 +840,13 @@ fn run_push(args: &[String], verbose: u8) -> Result<()> {
             &compact,
         );
     } else {
-        eprintln!("FAILED: git push");
-        if !stderr.trim().is_empty() {
-            eprintln!("{}", stderr);
-        }
-        if !stdout.trim().is_empty() {
-            eprintln!("{}", stdout);
-        }
+        timer.track(
+            &format!("git push {}", args.join(" ")),
+            &format!("rtk git push {}", args.join(" ")),
+            &raw,
+            "FAILED",
+        );
+        exit_with_git_failure("git push", &stdout, &stderr, output.status);
     }
 
     Ok(())
@@ -855,13 +925,13 @@ fn run_pull(args: &[String], verbose: u8) -> Result<()> {
             &compact,
         );
     } else {
-        eprintln!("FAILED: git pull");
-        if !stderr.trim().is_empty() {
-            eprintln!("{}", stderr);
-        }
-        if !stdout.trim().is_empty() {
-            eprintln!("{}", stdout);
-        }
+        timer.track(
+            &format!("git pull {}", args.join(" ")),
+            &format!("rtk git pull {}", args.join(" ")),
+            &raw_output,
+            "FAILED",
+        );
+        exit_with_git_failure("git pull", &stdout, &stderr, output.status);
     }
 
     Ok(())
@@ -878,9 +948,7 @@ fn run_branch(args: &[String], verbose: u8) -> Result<()> {
     cmd.arg("branch");
 
     // If user passes flags like -d, -D, -m, pass through directly
-    let has_action_flag = args
-        .iter()
-        .any(|a| a == "-d" || a == "-D" || a == "-m" || a == "-M" || a == "-c" || a == "-C");
+    let has_action_flag = is_branch_action(args);
 
     if has_action_flag {
         for arg in args {
@@ -907,13 +975,7 @@ fn run_branch(args: &[String], verbose: u8) -> Result<()> {
         if output.status.success() {
             println!("ok ✓");
         } else {
-            eprintln!("FAILED: git branch");
-            if !stderr.trim().is_empty() {
-                eprintln!("{}", stderr);
-            }
-            if !stdout.trim().is_empty() {
-                eprintln!("{}", stdout);
-            }
+            exit_with_git_failure("git branch", &stdout, &stderr, output.status);
         }
         return Ok(());
     }
@@ -1014,11 +1076,8 @@ fn run_fetch(args: &[String], verbose: u8) -> Result<()> {
     let raw = format!("{}{}", stdout, stderr);
 
     if !output.status.success() {
-        eprintln!("FAILED: git fetch");
-        if !stderr.trim().is_empty() {
-            eprintln!("{}", stderr);
-        }
-        return Ok(());
+        timer.track("git fetch", "rtk git fetch", &raw, "FAILED");
+        exit_with_git_failure("git fetch", &stdout, &stderr, output.status);
     }
 
     // Count new refs from stderr (git fetch outputs to stderr)
@@ -1105,11 +1164,18 @@ fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8) -> Result<(
                 println!("{}", msg);
                 msg
             } else {
-                eprintln!("FAILED: git stash {}", sub);
-                if !stderr.trim().is_empty() {
-                    eprintln!("{}", stderr);
-                }
-                combined.clone()
+                timer.track(
+                    &format!("git stash {}", sub),
+                    &format!("rtk git stash {}", sub),
+                    &combined,
+                    "FAILED",
+                );
+                exit_with_git_failure(
+                    &format!("git stash {}", sub),
+                    &stdout,
+                    &stderr,
+                    output.status,
+                );
             };
 
             timer.track(
@@ -1142,11 +1208,8 @@ fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8) -> Result<(
                     msg.to_string()
                 }
             } else {
-                eprintln!("FAILED: git stash");
-                if !stderr.trim().is_empty() {
-                    eprintln!("{}", stderr);
-                }
-                combined.clone()
+                timer.track("git stash", "rtk git stash", &combined, "FAILED");
+                exit_with_git_failure("git stash", &stdout, &stderr, output.status);
             };
 
             timer.track("git stash", "rtk git stash", &combined, &msg);
@@ -1185,9 +1248,7 @@ fn run_worktree(args: &[String], verbose: u8) -> Result<()> {
     }
 
     // If args contain "add", "remove", "prune" etc., pass through
-    let has_action = args.iter().any(|a| {
-        a == "add" || a == "remove" || a == "prune" || a == "lock" || a == "unlock" || a == "move"
-    });
+    let has_action = is_worktree_action(args);
 
     if has_action {
         let mut cmd = Command::new("git");
@@ -1216,10 +1277,12 @@ fn run_worktree(args: &[String], verbose: u8) -> Result<()> {
         if output.status.success() {
             println!("ok ✓");
         } else {
-            eprintln!("FAILED: git worktree {}", args.join(" "));
-            if !stderr.trim().is_empty() {
-                eprintln!("{}", stderr);
-            }
+            exit_with_git_failure(
+                &format!("git worktree {}", args.join(" ")),
+                &stdout,
+                &stderr,
+                output.status,
+            );
         }
         return Ok(());
     }
@@ -1294,6 +1357,64 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_classify_git_command_read_only() {
+        assert_eq!(
+            classify_git_command(&GitCommand::Status, &[]),
+            GitCommandClass::ReadOnly
+        );
+        assert_eq!(
+            classify_git_command(
+                &GitCommand::Stash {
+                    subcommand: Some("list".to_string())
+                },
+                &[]
+            ),
+            GitCommandClass::ReadOnly
+        );
+        assert_eq!(
+            classify_git_command(&GitCommand::Worktree, &[]),
+            GitCommandClass::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_classify_git_command_mutating() {
+        assert_eq!(
+            classify_git_command(&GitCommand::Add, &[]),
+            GitCommandClass::Mutating
+        );
+        assert_eq!(
+            classify_git_command(
+                &GitCommand::Commit {
+                    message: "x".to_string()
+                },
+                &[]
+            ),
+            GitCommandClass::Mutating
+        );
+        assert_eq!(
+            classify_git_command(&GitCommand::Branch, &["-d".to_string(), "tmp".to_string()]),
+            GitCommandClass::Mutating
+        );
+        assert_eq!(
+            classify_git_command(
+                &GitCommand::Stash {
+                    subcommand: Some("drop".to_string())
+                },
+                &[]
+            ),
+            GitCommandClass::Mutating
+        );
+        assert_eq!(
+            classify_git_command(
+                &GitCommand::Worktree,
+                &["remove".to_string(), "/tmp/wt".to_string()]
+            ),
+            GitCommandClass::Mutating
+        );
+    }
 
     #[test]
     fn test_compact_diff() {

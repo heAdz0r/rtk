@@ -37,10 +37,19 @@ mod prettier_cmd;
 mod prisma_cmd;
 mod pytest_cmd;
 mod read;
+mod read_cache; // PR-2: extracted read cache logic
+mod read_changed; // PR-5: git-aware diff reading
+mod read_digest; // PR-2: extracted tabular digest logic
+mod read_render; // PR-2: extracted render helpers
+mod read_source; // PR-2: extracted source I/O and line-range logic
+mod read_symbols; // PR-3: symbol model and extraction traits
+mod read_types; // PR-2: shared read types (ReadMode, ReadRequest)
 mod rgai_cmd; // semantic search command (grepai-style intent matching)
 mod ruff_cmd;
 mod runner;
+mod ssh_cmd;
 mod summary;
+mod symbols_regex; // PR-3: regex-based symbol extractor
 mod tee; // upstream sync: tee raw output to file for LLM re-read
 mod tracking;
 mod tree;
@@ -48,6 +57,9 @@ mod tsc_cmd;
 mod utils;
 mod vitest_cmd;
 mod wget_cmd;
+mod write_cmd;
+mod write_core;
+mod write_semantics;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,7 +69,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "rtk",
-    version = "0.20.0-fork.1",
+    version = "0.20.1-fork.4",
     about = "Rust Token Killer - Minimize LLM token consumption",
     long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
@@ -94,19 +106,45 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Read file with intelligent filtering
+    /// Read file with intelligent filtering (CSV/TSV auto-digest in filtered modes)
     Read {
         /// File to read
         file: PathBuf,
-        /// Filter: none, minimal, aggressive
+        /// Filter: none (exact), minimal, aggressive
         #[arg(short, long, default_value = "minimal")]
         level: filter::FilterLevel,
+        /// Start line (1-based, inclusive)
+        #[arg(long)]
+        from: Option<usize>,
+        /// End line (1-based, inclusive)
+        #[arg(long)]
+        to: Option<usize>,
         /// Max lines
         #[arg(short, long)]
         max_lines: Option<usize>,
         /// Show line numbers
         #[arg(short = 'n', long)]
         line_numbers: bool,
+
+        // ── Read mode flags (mutually exclusive) ──
+        /// Show structural outline with line spans
+        #[arg(long, group = "read_mode")]
+        outline: bool,
+        /// Show machine-readable JSON symbol index
+        #[arg(long, group = "read_mode")]
+        symbols: bool,
+        /// Show only changed hunks from git working tree
+        #[arg(long, group = "read_mode")]
+        changed: bool,
+        /// Show changed hunks relative to a revision (e.g., HEAD~3, main)
+        #[arg(long, group = "read_mode")]
+        since: Option<String>,
+        /// Context lines for --changed/--since (default: 3)
+        #[arg(long, default_value = "3", requires = "read_mode")]
+        diff_context: usize,
+        /// Deduplicate repetitive blocks (opt-in, disabled by default)
+        #[arg(long)]
+        dedup: bool,
     },
 
     /// Generate 2-line technical summary (heuristic-based)
@@ -125,6 +163,12 @@ enum Commands {
     Git {
         #[command(subcommand)]
         command: GitCommands,
+    },
+
+    /// Safe file writes (atomic + idempotent) with dry-run support
+    Write {
+        #[command(subcommand)]
+        command: WriteCommands,
     },
 
     /// GitHub CLI (gh) commands with token-optimized output
@@ -472,6 +516,13 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// SSH with smart output filtering (psql/json/html/generic)
+    Ssh {
+        /// SSH arguments (host + remote command + flags)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Discover missed RTK savings from Claude Code history
     Discover {
         /// Filter by project path (substring match)
@@ -646,6 +697,73 @@ enum GitCommands {
     /// Passthrough: runs any unsupported git subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum WriteCommands {
+    /// Replace exact text in a file (first match by default)
+    Replace {
+        /// Target file
+        file: PathBuf,
+        /// Text to find (exact match)
+        #[arg(long)]
+        from: String,
+        /// Replacement text
+        #[arg(long)]
+        to: String,
+        /// Replace all matches
+        #[arg(long)]
+        all: bool,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Use fast durability mode (skip fsync)
+        #[arg(long)]
+        fast: bool,
+    },
+    /// Apply exact old->new hunk replacement
+    Patch {
+        /// Target file
+        file: PathBuf,
+        /// Old block to replace (exact match)
+        #[arg(long)]
+        old: String,
+        /// New block
+        #[arg(long = "new")]
+        new_text: String,
+        /// Replace all matching hunks
+        #[arg(long)]
+        all: bool,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Use fast durability mode (skip fsync)
+        #[arg(long)]
+        fast: bool,
+    },
+    /// Set structured config key in JSON/TOML file
+    Set {
+        /// Target file
+        file: PathBuf,
+        /// Dotted key path (e.g. hooks.PreToolUse.0.matcher)
+        #[arg(long)]
+        key: String,
+        /// Value payload
+        #[arg(long)]
+        value: String,
+        /// Value parser
+        #[arg(long, value_enum, default_value = "auto")]
+        value_type: write_cmd::ConfigValueType,
+        /// Config format
+        #[arg(long, value_enum, default_value = "auto")]
+        format: write_cmd::ConfigFormat,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Use fast durability mode (skip fsync)
+        #[arg(long)]
+        fast: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -871,13 +989,108 @@ fn main() -> Result<()> {
         Commands::Read {
             file,
             level,
+            from,
+            to,
             max_lines,
             line_numbers,
+            outline,
+            symbols,
+            changed,
+            since,
+            diff_context,
+            dedup,
         } => {
-            if file == Path::new("-") {
-                read::run_stdin(level, max_lines, line_numbers, cli.verbose)?;
+            // Determine ReadMode from flags
+            let mode = if outline {
+                read::ReadMode::Outline
+            } else if symbols {
+                read::ReadMode::Symbols
+            } else if changed {
+                read::ReadMode::Changed
+            } else if let Some(rev) = since {
+                read::ReadMode::Since(rev)
             } else {
-                read::run(&file, level, max_lines, line_numbers, cli.verbose)?;
+                read::ReadMode::Full
+            };
+
+            // Reject incompatible flags in non-full modes.
+            if !matches!(mode, read::ReadMode::Full) {
+                let mut incompatible = Vec::new();
+                if from.is_some() {
+                    incompatible.push("--from");
+                }
+                if to.is_some() {
+                    incompatible.push("--to");
+                }
+                if max_lines.is_some() {
+                    incompatible.push("--max-lines");
+                }
+                if line_numbers {
+                    incompatible.push("-n/--line-numbers");
+                }
+                if dedup {
+                    incompatible.push("--dedup");
+                }
+                if level != filter::FilterLevel::Minimal {
+                    incompatible.push("--level");
+                }
+                if matches!(mode, read::ReadMode::Outline | read::ReadMode::Symbols)
+                    && diff_context != 3
+                {
+                    incompatible.push("--diff-context");
+                }
+                if !incompatible.is_empty() {
+                    let mode_flag = match &mode {
+                        read::ReadMode::Outline => "--outline",
+                        read::ReadMode::Symbols => "--symbols",
+                        read::ReadMode::Changed => "--changed",
+                        read::ReadMode::Since(_) => "--since",
+                        read::ReadMode::Full => unreachable!(),
+                    };
+                    anyhow::bail!(
+                        "{} incompatible with {}",
+                        incompatible.join(", "),
+                        mode_flag
+                    );
+                }
+            }
+
+            // Dispatch by mode
+            match mode {
+                read::ReadMode::Outline | read::ReadMode::Symbols => {
+                    if file == Path::new("-") {
+                        anyhow::bail!("--outline and --symbols require a file path, not stdin");
+                    }
+                    read::run_symbols(&file, &mode, cli.verbose)?;
+                }
+                read::ReadMode::Changed => {
+                    if file == Path::new("-") {
+                        anyhow::bail!("--changed requires a file path, not stdin");
+                    }
+                    read::run_changed(&file, None, diff_context, cli.verbose)?;
+                }
+                read::ReadMode::Since(ref rev) => {
+                    if file == Path::new("-") {
+                        anyhow::bail!("--since requires a file path, not stdin");
+                    }
+                    read::run_changed(&file, Some(rev), diff_context, cli.verbose)?;
+                }
+                read::ReadMode::Full => {
+                    if file == Path::new("-") {
+                        read::run_stdin(level, from, to, max_lines, line_numbers, cli.verbose)?;
+                    } else {
+                        read::run(
+                            &file,
+                            level,
+                            from,
+                            to,
+                            max_lines,
+                            line_numbers,
+                            dedup,
+                            cli.verbose,
+                        )?;
+                    }
+                }
             }
         }
 
@@ -933,6 +1146,49 @@ fn main() -> Result<()> {
             }
             GitCommands::Other(args) => {
                 git::run_passthrough(&args, cli.verbose)?;
+            }
+        },
+
+        Commands::Write { command } => match command {
+            WriteCommands::Replace {
+                file,
+                from,
+                to,
+                all,
+                dry_run,
+                fast,
+            } => {
+                write_cmd::run_replace(&file, &from, &to, all, dry_run, fast, cli.verbose)?;
+            }
+            WriteCommands::Patch {
+                file,
+                old,
+                new_text,
+                all,
+                dry_run,
+                fast,
+            } => {
+                write_cmd::run_patch(&file, &old, &new_text, all, dry_run, fast, cli.verbose)?;
+            }
+            WriteCommands::Set {
+                file,
+                key,
+                value,
+                value_type,
+                format,
+                dry_run,
+                fast,
+            } => {
+                write_cmd::run_set(
+                    &file,
+                    &key,
+                    &value,
+                    value_type,
+                    format,
+                    dry_run,
+                    fast,
+                    cli.verbose,
+                )?;
             }
         },
 
@@ -1298,6 +1554,10 @@ fn main() -> Result<()> {
             curl_cmd::run(&args, cli.verbose)?;
         }
 
+        Commands::Ssh { args } => {
+            ssh_cmd::run(&args, cli.verbose)?;
+        }
+
         Commands::Discover {
             project,
             limit,
@@ -1437,7 +1697,8 @@ fn main() -> Result<()> {
             golangci_cmd::run(&args, cli.verbose)?;
         }
 
-        Commands::HookAudit { since } => { // upstream sync: hook audit command
+        Commands::HookAudit { since } => {
+            // upstream sync: hook audit command
             hook_audit_cmd::run(since, cli.verbose)?;
         }
 

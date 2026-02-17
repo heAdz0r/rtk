@@ -33,7 +33,7 @@ Search priority (mandatory): rgai > rg > grep.
 
 - `rtk rgai` — semantic/intention-based discovery (first choice)
 - `rtk grep` — exact/regex matching (second choice, internal rg -> grep fallback)
-- Native Grep tool — only if rtk commands are unavailable or broken
+- Native Grep/Read tools may be blocked by hook; use `rtk grep` / `rtk read` via Bash
 
 ## Semantic Search
 
@@ -42,5 +42,33 @@ rtk rgai "auth token refresh"         # Intent-aware code search
 rtk rgai auth token refresh --compact # Unquoted multi-word query
 rtk rgai "auth token refresh" --json  # Machine-readable output
 ```
+
+## Precise File Reads
+
+```bash
+rtk read src/main.rs --level none --from 200 --to 320
+```
+
+## Safe File Writes
+
+Use `rtk write` for deterministic, atomic edits (idempotent + durable by default):
+
+```bash
+rtk write replace path/to/file --from old --to new [--all]
+rtk write patch path/to/file --old "block A" --new "block B" [--all]
+rtk write set path/to/config.toml --key a.b --value true --format toml
+```
+
+Prefer this over ad-hoc `sed -i` / `perl -pi` when the transformation fits these primitives.
+
+## Tabular Files (CSV/TSV)
+
+- `rtk read <file>` in filtered modes returns a compact digest (rows/cols/sample/sampled-stats).
+- Use `--level none --from/--to` for exact row content.
+
+## Read Cache
+
+- Filtered `rtk read` output is cached for repeat reads.
+- Cache auto-invalidates when file path/size/mtime change.
 
 Refer to CLAUDE.md for full command reference.

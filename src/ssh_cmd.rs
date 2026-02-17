@@ -19,21 +19,72 @@ enum DetectedFormat {
     PsqlSchema,
     JsonLogs,
     Html,
+    DockerPs,     // added: docker ps tabular output
+    DockerImages, // added: docker images tabular output
     Generic,
+}
+
+// added: parsed SSH options for --tail and --format flags
+struct SshOptions {
+    tail: Option<usize>,    // --tail N: limit output to last N lines
+    format: Option<String>, // --format psql|json|docker|docker-images|html|generic: force format
+    ssh_args: Vec<String>,  // remaining args passed to ssh
+}
+
+/// Parse --tail and --format from args before passing rest to SSH.
+fn parse_ssh_options(args: &[String]) -> SshOptions {
+    let mut tail: Option<usize> = None;
+    let mut format: Option<String> = None;
+    let mut ssh_args: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--tail" && i + 1 < args.len() {
+            // added: --tail N extraction
+            tail = args[i + 1].parse().ok();
+            i += 2;
+        } else if args[i].starts_with("--tail=") {
+            tail = args[i].strip_prefix("--tail=").and_then(|v| v.parse().ok());
+            i += 1;
+        } else if args[i] == "--format" && i + 1 < args.len() {
+            // added: --format X extraction
+            format = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i].starts_with("--format=") {
+            format = args[i].strip_prefix("--format=").map(|v| v.to_string());
+            i += 1;
+        } else {
+            ssh_args.push(args[i].clone());
+            i += 1;
+        }
+    }
+
+    SshOptions {
+        tail,
+        format,
+        ssh_args,
+    }
 }
 
 /// SSH commands with smart output filtering.
 /// Executes ssh with all args, captures output, detects format, applies filter.
 pub fn run(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
+    let options = parse_ssh_options(args); // added: parse --tail/--format before SSH
 
     if verbose > 0 {
-        eprintln!("ssh args: {:?}", args);
+        eprintln!("ssh args: {:?}", options.ssh_args);
+        if let Some(n) = options.tail {
+            eprintln!("--tail: {}", n);
+        }
+        if let Some(ref f) = options.format {
+            eprintln!("--format: {}", f);
+        }
     }
 
-    // 1. Execute: ssh <all args as-is>
+    // 1. Execute: ssh <ssh_args only (--tail/--format stripped)>
     let output = Command::new("ssh")
-        .args(args)
+        .args(&options.ssh_args) // changed: use parsed ssh_args
         .output()
         .context("Failed to execute ssh")?;
 
@@ -49,20 +100,40 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
     // 3. Strip SSH noise from stderr
     let filtered_stderr = strip_ssh_noise(&clean_stderr);
 
-    // 4. Detect output format from stdout
-    let combined_clean = clean_stdout.trim().to_string();
-    let format = detect_format(&combined_clean);
+    // 4. Apply --tail: limit to last N lines if specified
+    let combined_clean = if let Some(n) = options.tail {
+        // added: --tail truncation before format detection
+        let lines: Vec<&str> = clean_stdout.trim().lines().collect();
+        let start = lines.len().saturating_sub(n);
+        lines[start..].join("\n")
+    } else {
+        clean_stdout.trim().to_string()
+    };
+
+    // 5. Detect output format (or use --format override)
+    let format = match options.format.as_deref() {
+        // added: --format override for manual format selection
+        Some("psql") => DetectedFormat::PsqlTable,
+        Some("json") => DetectedFormat::JsonLogs,
+        Some("docker") => DetectedFormat::DockerPs,
+        Some("docker-images") => DetectedFormat::DockerImages,
+        Some("html") => DetectedFormat::Html,
+        Some("generic") => DetectedFormat::Generic,
+        _ => detect_format(&combined_clean),
+    };
 
     if verbose > 0 {
         eprintln!("Detected format: {:?}", format);
     }
 
-    // 5. Apply appropriate filter
+    // 6. Apply appropriate filter
     let filtered_stdout = match format {
         DetectedFormat::PsqlTable => filter_psql_table(&combined_clean, verbose),
         DetectedFormat::PsqlSchema => filter_psql_schema(&combined_clean, verbose),
         DetectedFormat::JsonLogs => filter_json_logs(&combined_clean),
         DetectedFormat::Html => filter_html(&combined_clean, verbose),
+        DetectedFormat::DockerPs => filter_docker_ps(&combined_clean, verbose), // added
+        DetectedFormat::DockerImages => filter_docker_images(&combined_clean, verbose), // added
         DetectedFormat::Generic => filter_generic(&combined_clean, verbose),
     };
 
@@ -78,7 +149,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         filtered_stderr
     };
 
-    // 6. Build final output
+    // 7. Build final output
     let mut result = String::new();
     if !final_stderr.is_empty() {
         result.push_str(&final_stderr);
@@ -88,14 +159,14 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
     }
     result.push_str(&final_stdout);
 
-    // 7. Print filtered output
+    // 8. Print filtered output
     print!("{}", result);
 
-    // 8. Track savings
+    // 9. Track savings
     let args_str = args.join(" ");
     timer.track(&format!("ssh {}", args_str), "rtk ssh", &raw, &result);
 
-    // 9. Preserve exit code
+    // 10. Preserve exit code
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -160,6 +231,16 @@ fn detect_format(output: &str) -> DetectedFormat {
         return DetectedFormat::Html;
     }
 
+    // added: docker ps tabular output
+    if is_docker_ps(output) {
+        return DetectedFormat::DockerPs;
+    }
+
+    // added: docker images tabular output
+    if is_docker_images(output) {
+        return DetectedFormat::DockerImages;
+    }
+
     DetectedFormat::Generic
 }
 
@@ -214,6 +295,26 @@ fn is_json_logs(output: &str) -> bool {
 fn is_html(output: &str) -> bool {
     let lower = output.to_lowercase();
     lower.contains("<!doctype") || lower.contains("<html")
+}
+
+// added: docker ps header detection (CONTAINER ID + IMAGE + STATUS)
+fn is_docker_ps(output: &str) -> bool {
+    if let Some(first_line) = output.lines().next() {
+        let upper = first_line.to_uppercase();
+        upper.contains("CONTAINER ID") && upper.contains("IMAGE") && upper.contains("STATUS")
+    } else {
+        false
+    }
+}
+
+// added: docker images header detection (REPOSITORY + TAG or SIZE)
+fn is_docker_images(output: &str) -> bool {
+    if let Some(first_line) = output.lines().next() {
+        let upper = first_line.to_uppercase();
+        upper.contains("REPOSITORY") && (upper.contains("TAG") || upper.contains("SIZE"))
+    } else {
+        false
+    }
 }
 
 // ── psql Tabular Filter ──
@@ -290,9 +391,7 @@ fn filter_psql_table(output: &str, _verbose: u8) -> String {
     };
     if visible_cols.is_empty() && num_cols > 0 {
         // Keep at least one column to avoid an empty table skeleton.
-        let keep = (0..num_cols)
-            .min_by_key(|&i| col_stats[i].1)
-            .unwrap_or(0);
+        let keep = (0..num_cols).min_by_key(|&i| col_stats[i].1).unwrap_or(0);
         visible_cols.push(keep);
     }
     let hidden_cols: Vec<&str> = (0..num_cols)
@@ -761,6 +860,247 @@ fn filter_html(output: &str, _verbose: u8) -> String {
     result.join("\n")
 }
 
+// ── Docker PS Filter ──
+
+/// Filter docker ps tabular output: show Name, Image, Status, Ports (compact). Limit 15 rows.
+fn filter_docker_ps(output: &str, _verbose: u8) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() < 2 {
+        return output.to_string();
+    }
+
+    // Parse header to find column positions
+    let header = lines[0];
+    let col_starts = parse_docker_columns(header);
+
+    let data_lines: Vec<&str> = lines[1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+    let num_rows = data_lines.len();
+
+    let mut result = Vec::new();
+    result.push(format!("{} containers", num_rows)); // added: summary line
+
+    // Extract columns: NAME, IMAGE, STATUS, PORTS
+    let name_idx = col_starts.iter().position(|(name, _)| *name == "NAMES");
+    let image_idx = col_starts.iter().position(|(name, _)| *name == "IMAGE");
+    let status_idx = col_starts.iter().position(|(name, _)| *name == "STATUS");
+    let ports_idx = col_starts.iter().position(|(name, _)| *name == "PORTS");
+
+    let show_rows = num_rows.min(15); // added: limit to 15 rows
+    for line in data_lines.iter().take(show_rows) {
+        let fields = extract_docker_fields(line, &col_starts);
+        let name = name_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+        let image = image_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+        let status = status_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+        let ports = ports_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+
+        let compact_port = compact_ports(ports); // added: compact port display
+        result.push(format!(
+            " {} | {} | {} | {}",
+            truncate_val(name, 30),
+            truncate_val(image, 35),
+            truncate_val(status, 20),
+            compact_port
+        ));
+    }
+
+    if num_rows > 15 {
+        result.push(format!("[+{} containers]", num_rows - 15)); // added: overflow indicator
+    }
+
+    result.join("\n")
+}
+
+// ── Docker Images Filter ──
+
+/// Filter docker images tabular output: show Repository, Tag, Size. Aggregate total size. Limit 15 rows.
+fn filter_docker_images(output: &str, _verbose: u8) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() < 2 {
+        return output.to_string();
+    }
+
+    let header = lines[0];
+    let col_starts = parse_docker_columns(header);
+
+    let data_lines: Vec<&str> = lines[1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+    let num_rows = data_lines.len();
+
+    let repo_idx = col_starts
+        .iter()
+        .position(|(name, _)| *name == "REPOSITORY");
+    let tag_idx = col_starts.iter().position(|(name, _)| *name == "TAG");
+    let size_idx = col_starts.iter().position(|(name, _)| *name == "SIZE");
+
+    let mut result = Vec::new();
+
+    // Collect sizes for aggregation
+    let mut total_mb: f64 = 0.0; // added: total size aggregation
+    let show_rows = num_rows.min(15);
+    for line in data_lines.iter().take(show_rows) {
+        let fields = extract_docker_fields(line, &col_starts);
+        let repo = repo_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+        let tag = tag_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+        let size = size_idx
+            .map(|i| fields.get(i).copied().unwrap_or(""))
+            .unwrap_or("");
+
+        total_mb += parse_size_mb(size);
+        result.push(format!(
+            " {} | {} | {}",
+            truncate_val(repo, 40),
+            truncate_val(tag, 15),
+            size
+        ));
+    }
+
+    if num_rows > 15 {
+        // Parse remaining sizes for total
+        for line in data_lines.iter().skip(15) {
+            let fields = extract_docker_fields(line, &col_starts);
+            let size = size_idx
+                .map(|i| fields.get(i).copied().unwrap_or(""))
+                .unwrap_or("");
+            total_mb += parse_size_mb(size);
+        }
+        result.push(format!("[+{} images]", num_rows - 15));
+    }
+
+    // Summary header with total size
+    let summary = if total_mb >= 1024.0 {
+        format!("{} images, {:.1}GB total", num_rows, total_mb / 1024.0) // added: GB display
+    } else {
+        format!("{} images, {:.0}MB total", num_rows, total_mb)
+    };
+    result.insert(0, summary);
+
+    result.join("\n")
+}
+
+/// Parse docker-style fixed-width column headers. Returns (name, start_pos) pairs.
+fn parse_docker_columns(header: &str) -> Vec<(&str, usize)> {
+    let mut cols = Vec::new();
+    let mut i = 0;
+    let bytes = header.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        // Skip whitespace
+        while i < len && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let start = i;
+        // Find end of column name (next run of 2+ spaces or end)
+        while i < len && bytes[i] != b' ' {
+            i += 1;
+        }
+        // Check for multi-word column names like "CONTAINER ID"
+        while i < len {
+            // Peek: if exactly one space followed by uppercase letter, continue
+            if i + 1 < len
+                && bytes[i] == b' '
+                && bytes[i + 1] != b' '
+                && bytes[i + 1].is_ascii_uppercase()
+            {
+                i += 1; // skip the single space
+                while i < len && bytes[i] != b' ' {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let name = header[start..i].trim();
+        if !name.is_empty() {
+            cols.push((name, start));
+        }
+    }
+    cols
+}
+
+/// Extract field values from a docker output line using column positions.
+fn extract_docker_fields<'a>(line: &'a str, cols: &[(&str, usize)]) -> Vec<&'a str> {
+    let mut fields = Vec::new();
+    for (idx, &(_, start)) in cols.iter().enumerate() {
+        let end = if idx + 1 < cols.len() {
+            cols[idx + 1].1
+        } else {
+            line.len()
+        };
+        let s = start.min(line.len());
+        let e = end.min(line.len());
+        fields.push(line[s..e].trim());
+    }
+    fields
+}
+
+/// Compact port display: extract port numbers, limit to 3. (Logic from container.rs)
+fn compact_ports(ports: &str) -> String {
+    if ports.is_empty() || ports == "-" {
+        return "-".to_string();
+    }
+    let port_nums: Vec<&str> = ports
+        .split(',')
+        .filter_map(|p| p.split("->").next().and_then(|s| s.split(':').last()))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if port_nums.is_empty() {
+        return "-".to_string();
+    }
+    if port_nums.len() <= 3 {
+        port_nums.join(", ")
+    } else {
+        format!(
+            "{}, ... +{}",
+            port_nums[..2].join(", "),
+            port_nums.len() - 2
+        )
+    }
+}
+
+/// Parse a docker size string (e.g. "150MB", "1.2GB") into megabytes.
+fn parse_size_mb(s: &str) -> f64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0.0;
+    }
+    let lower = s.to_lowercase();
+    if let Some(num) = lower.strip_suffix("gb") {
+        num.trim().parse::<f64>().unwrap_or(0.0) * 1024.0
+    } else if let Some(num) = lower.strip_suffix("mb") {
+        num.trim().parse::<f64>().unwrap_or(0.0)
+    } else if let Some(num) = lower.strip_suffix("kb") {
+        num.trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+    } else if let Some(num) = lower.strip_suffix('b') {
+        num.trim().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0)
+    } else {
+        0.0
+    }
+}
+
 // ── Generic Fallback ──
 
 /// Truncate generic output: limit rows to 20, truncate wide lines to 120 chars.
@@ -1133,6 +1473,138 @@ Triggers:
         let input =
             "trg_link_visit AFTER INSERT ON utm_visits FOR EACH ROW EXECUTE FUNCTION link_visit()";
         assert_eq!(compact_trigger(input), "trg_link_visit");
+    }
+
+    // ── Docker PS detection tests ──
+
+    #[test]
+    fn test_detect_docker_ps() {
+        // added: docker ps header detection
+        let output = "CONTAINER ID   IMAGE                    COMMAND       CREATED       STATUS         PORTS                    NAMES\nabc123def456   nginx:latest             \"nginx -g…\"   2 hours ago   Up 2 hours     0.0.0.0:80->80/tcp       web-1";
+        assert_eq!(detect_format(output), DetectedFormat::DockerPs);
+    }
+
+    #[test]
+    fn test_detect_docker_images() {
+        // added: docker images header detection
+        let output = "REPOSITORY          TAG       IMAGE ID       CREATED        SIZE\nnginx               latest    abc123def456   2 weeks ago    187MB\npostgres            15        bcd234efg567   3 weeks ago    412MB";
+        assert_eq!(detect_format(output), DetectedFormat::DockerImages);
+    }
+
+    // ── Docker PS filter tests ──
+
+    #[test]
+    fn test_filter_docker_ps_basic() {
+        // added: basic docker ps filter test
+        let output = "CONTAINER ID   IMAGE            COMMAND        CREATED       STATUS         PORTS                    NAMES\nabc123def456   nginx:latest     \"nginx -g…\"    2 hours ago   Up 2 hours     0.0.0.0:80->80/tcp       web-1\nbcd234efg567   postgres:15      \"postgres\"     3 hours ago   Up 3 hours     0.0.0.0:5432->5432/tcp   db-1";
+        let result = filter_docker_ps(output, 0);
+        assert!(result.contains("2 containers"), "got: {}", result);
+        assert!(result.contains("web-1"), "got: {}", result);
+        assert!(result.contains("db-1"), "got: {}", result);
+        assert!(result.contains("nginx"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_docker_ps_limits_rows() {
+        // added: 15 row limit test
+        let mut lines = vec![
+            "CONTAINER ID   IMAGE            COMMAND   CREATED       STATUS       PORTS   NAMES"
+                .to_string(),
+        ];
+        for i in 0..20 {
+            lines.push(format!(
+                "abc{:03}def456   nginx:latest     \"nginx\"   1h ago        Up 1h        80/tcp  container-{}",
+                i, i
+            ));
+        }
+        let output = lines.join("\n");
+        let result = filter_docker_ps(&output, 0);
+        assert!(result.contains("20 containers"), "got: {}", result);
+        assert!(result.contains("[+5 containers]"), "got: {}", result);
+    }
+
+    // ── Docker Images filter tests ──
+
+    #[test]
+    fn test_filter_docker_images_basic() {
+        // added: basic docker images filter with size aggregation
+        let output = "REPOSITORY          TAG       IMAGE ID       CREATED        SIZE\nnginx               latest    abc123def456   2 weeks ago    187MB\npostgres            15        bcd234efg567   3 weeks ago    412MB";
+        let result = filter_docker_images(&output, 0);
+        assert!(result.contains("2 images"), "got: {}", result);
+        assert!(result.contains("599MB"), "got: {}", result);
+        assert!(result.contains("nginx"), "got: {}", result);
+        assert!(result.contains("postgres"), "got: {}", result);
+    }
+
+    // ── Parse SSH options tests ──
+
+    #[test]
+    fn test_parse_ssh_options_tail() {
+        // added: --tail extraction
+        let args: Vec<String> = vec!["--tail", "50", "host", "uptime"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let opts = parse_ssh_options(&args);
+        assert_eq!(opts.tail, Some(50));
+        assert_eq!(opts.ssh_args, vec!["host", "uptime"]);
+    }
+
+    #[test]
+    fn test_parse_ssh_options_format() {
+        // added: --format extraction
+        let args: Vec<String> = vec!["--format=psql", "host", "psql -c 'SELECT 1'"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let opts = parse_ssh_options(&args);
+        assert_eq!(opts.format, Some("psql".to_string()));
+        assert_eq!(opts.ssh_args, vec!["host", "psql -c 'SELECT 1'"]);
+    }
+
+    #[test]
+    fn test_parse_ssh_options_passthrough() {
+        // added: flags not consumed should pass through to SSH
+        let args: Vec<String> = vec!["-o", "StrictHostKeyChecking=no", "user@host", "ls -la"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let opts = parse_ssh_options(&args);
+        assert_eq!(opts.tail, None);
+        assert_eq!(opts.format, None);
+        assert_eq!(
+            opts.ssh_args,
+            vec!["-o", "StrictHostKeyChecking=no", "user@host", "ls -la"]
+        );
+    }
+
+    // ── compact_ports tests ──
+
+    #[test]
+    fn test_compact_ports_empty() {
+        assert_eq!(compact_ports(""), "-");
+    }
+
+    #[test]
+    fn test_compact_ports_simple() {
+        assert_eq!(compact_ports("0.0.0.0:80->80/tcp"), "80");
+    }
+
+    #[test]
+    fn test_compact_ports_multiple() {
+        assert_eq!(
+            compact_ports("0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp"),
+            "80, 443"
+        );
+    }
+
+    // ── parse_size_mb tests ──
+
+    #[test]
+    fn test_parse_size_mb() {
+        assert!((parse_size_mb("187MB") - 187.0).abs() < 0.01);
+        assert!((parse_size_mb("1.2GB") - 1228.8).abs() < 0.1);
+        assert!((parse_size_mb("512KB") - 0.5).abs() < 0.01);
     }
 
     // ── Visual review test (prints all filter outputs for human/LLM inspection) ──

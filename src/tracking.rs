@@ -31,8 +31,9 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -63,6 +64,13 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
 
 /// Number of days to retain tracking history before automatic cleanup.
 const HISTORY_DAYS: i64 = 90;
+/// Minimum interval between cleanup runs to reduce write amplification.
+const CLEANUP_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
+
+thread_local! {
+    /// Process-local tracker cache to avoid reopening/migrating SQLite for every track call.
+    static TRACKER_CACHE: RefCell<Option<Tracker>> = const { RefCell::new(None) };
+}
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -251,6 +259,7 @@ impl Tracker {
         }
 
         let conn = Connection::open(&db_path)?;
+        configure_connection(&conn);
         conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY,
@@ -267,6 +276,13 @@ impl Tracker {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tracking_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )",
             [],
         )?;
 
@@ -358,7 +374,35 @@ impl Tracker {
             ],
         )?;
 
+        self.maybe_cleanup_old()?;
+        Ok(())
+    }
+
+    fn maybe_cleanup_old(&self) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let last_cleanup: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM tracking_meta WHERE key = 'last_cleanup_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if last_cleanup
+            .map(|ts| now.saturating_sub(ts) < CLEANUP_INTERVAL_SECS)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         self.cleanup_old()?;
+        self.conn.execute(
+            "INSERT INTO tracking_meta (key, value)
+             VALUES ('last_cleanup_ts', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![now],
+        )?;
         Ok(())
     }
 
@@ -904,7 +948,7 @@ impl TimedExecution {
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
 
-        if let Ok(tracker) = Tracker::new() {
+        with_cached_tracker(|tracker| {
             let _ = tracker.record(
                 original_cmd,
                 rtk_cmd,
@@ -912,7 +956,7 @@ impl TimedExecution {
                 output_tokens,
                 elapsed_ms,
             );
-        }
+        });
     }
 
     /// Track passthrough commands (timing-only, no token counting).
@@ -938,10 +982,36 @@ impl TimedExecution {
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
-        if let Ok(tracker) = Tracker::new() {
+        with_cached_tracker(|tracker| {
             let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
-        }
+        });
     }
+}
+
+fn with_cached_tracker<F>(f: F)
+where
+    F: FnOnce(&Tracker),
+{
+    TRACKER_CACHE.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        if cache.is_none() {
+            if let Ok(tracker) = Tracker::new() {
+                *cache = Some(tracker);
+            } else {
+                return;
+            }
+        }
+        if let Some(tracker) = cache.as_ref() {
+            f(tracker);
+        }
+    });
+}
+
+fn configure_connection(conn: &Connection) {
+    // Best-effort pragmas: never fail command execution if sqlite rejects a setting.
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(2500));
 }
 
 /// Format OsString args for tracking display.

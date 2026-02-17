@@ -177,7 +177,8 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         .status
         .code()
         .unwrap_or(if output.status.success() { 0 } else { 1 });
-    if let Some(hint) = crate::tee::tee_and_hint(&raw, "lint", exit_code) { // upstream sync: tee
+    if let Some(hint) = crate::tee::tee_and_hint(&raw, "lint", exit_code) {
+        // upstream sync: tee
         println!("{}\n{}", filtered, hint);
     } else {
         println!("{}", filtered);

@@ -70,6 +70,7 @@ const PATTERNS: &[&str] = &[
     r"^kubectl\s+(get|logs)",
     r"^curl\s+",
     r"^wget\s+",
+    r"^ssh\s+", // added: ssh command detection for discover
 ];
 
 const RULES: &[RtkRule] = &[
@@ -222,6 +223,14 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk wget",
         category: "Network",
         savings_pct: 65.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        // added: ssh rule for discover
+        rtk_cmd: "rtk ssh",
+        category: "Network",
+        savings_pct: 75.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },

@@ -503,16 +503,12 @@ CREATE INDEX idx_timestamp ON commands(timestamp);
 
 ### Automatic Cleanup
 
-On every write operation (`Tracker::record`), records older than 90 days are deleted:
+Cleanup is rate-limited. RTK checks a metadata marker and runs deletion at most once per hour, instead of on every write:
 
 ```rust
-fn cleanup_old(&self) -> Result<()> {
-    let cutoff = Utc::now() - chrono::Duration::days(90);
-    self.conn.execute(
-        "DELETE FROM commands WHERE timestamp < ?1",
-        params![cutoff.to_rfc3339()],
-    )?;
-    Ok(())
+fn maybe_cleanup_old(&self) -> Result<()> {
+    // skip if last cleanup was recent
+    // else DELETE rows older than 90 days and update marker
 }
 ```
 
@@ -530,9 +526,11 @@ let _ = conn.execute(
 
 ## Performance Considerations
 
-- **SQLite WAL mode**: Not enabled (may add in future for concurrent writes)
+- **SQLite WAL mode**: Enabled (`journal_mode=WAL`)
+- **Busy timeout**: Enabled (`busy_timeout=2500ms`)
+- **Synchronous mode**: Tuned for CLI workload (`synchronous=NORMAL`)
 - **Index on timestamp**: Enables fast date-range queries
-- **Automatic cleanup**: Prevents database from growing unbounded
+- **Automatic cleanup**: Prevents database growth without deleting on every write
 - **Token estimation**: ~4 chars = 1 token (simple, fast approximation)
 - **Aggregation queries**: Use SQL GROUP BY for efficient aggregation
 
@@ -571,7 +569,6 @@ Planned improvements (contributions welcome):
 
 - [ ] Export to Prometheus/OpenMetrics format
 - [ ] Support for custom retention periods (not just 90 days)
-- [ ] SQLite WAL mode for concurrent writes
 - [ ] Per-project tracking (multiple databases)
 - [ ] Integration with Claude API for precise token counts
 - [ ] Web dashboard (localhost) for visualizing trends

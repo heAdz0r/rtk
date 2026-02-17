@@ -145,6 +145,8 @@ rtk init --show # Verify hook is installed and executable
 rtk ls .                        # Token-optimized directory tree
 rtk read file.rs                # Smart file reading
 rtk read file.rs -l aggressive  # Signatures only (strips bodies)
+rtk read file.rs --from 120 --to 220  # Read only a line range
+rtk read file.rs --level none --from 120 --to 220  # Exact read (no filtering)
 rtk smart file.rs               # 2-line heuristic code summary
 rtk find "*.rs" .               # Compact find results
 rtk rgai "auth token refresh"   # Semantic code search
@@ -173,6 +175,7 @@ rtk gh pr view 42                # PR details + checks summary
 rtk gh issue list                # Compact issue listing
 rtk gh run list                  # Workflow run status
 rtk wget https://example.com    # Download, strip progress bars
+rtk ssh user@host "docker ps"   # SSH output filtering for remote diagnostics
 rtk config                       # Show config (--create to generate)
 rtk ruff check                   # Python linting (JSON, 80% reduction)
 rtk pytest                       # Python tests (failures only, 90% reduction)
@@ -527,6 +530,9 @@ Search rewrite order is strict and deterministic: `rgai > rg > grep`.
 | `gh pr/issue/run` | `rtk gh ...` |
 | `cargo test/build/clippy` | `rtk cargo ...` |
 | `cat <file>` | `rtk read <file>` |
+| `write replace/patch/set ...` | `rtk write ...` |
+| `sed -i 's/a/b/[g]' file` (simple form) | `rtk write replace file --from 'a' --to 'b' [--all]` |
+| `perl -pi -e 's/a/b/[g]' file` (simple form) | `rtk write replace file --from 'a' --to 'b' [--all]` |
 | `grepai/rgai search <query>` | `rtk rgai <query>` |
 | `rgai <query>` | `rtk rgai <query>` |
 | `rg/grep <pattern>` | `rtk grep <pattern>` |
@@ -544,6 +550,7 @@ Search rewrite order is strict and deterministic: `rgai > rg > grep`.
 | `golangci-lint run` | `rtk golangci-lint run` |
 | `docker ps/images/logs` | `rtk docker ...` |
 | `kubectl get/logs` | `rtk kubectl ...` |
+| `ssh` | `rtk ssh ...` |
 | `curl` | `rtk curl` |
 | `pnpm list/ls/outdated` | `rtk pnpm ...` |
 

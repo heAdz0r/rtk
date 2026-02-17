@@ -1,6 +1,6 @@
 [package]
 name = "rtk"
-version = "0.20.0-fork.1"
+version = "0.20.1-fork.4"
 edition = "2021"
 authors = ["Patrick Szymkowiak"]
 description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
@@ -20,10 +20,12 @@ regex = "1"
 lazy_static = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+csv = "1"
 colored = "2"
 dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
 toml = "0.8"
+toml_edit = "0.22"
 chrono = "0.4"
 thiserror = "1.0"
 tempfile = "3"

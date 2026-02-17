@@ -16,15 +16,24 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 test_rewrite() {
+  test_rewrite_with_env "$1" "$2" "$3" ""
+}
+
+test_rewrite_with_env() {
   local description="$1"
   local input_cmd="$2"
   local expected_cmd="$3"  # empty string = expect no rewrite
+  local env_spec="${4:-}"
   TOTAL=$((TOTAL + 1))
 
   local input_json
   input_json=$(jq -n --arg cmd "$input_cmd" '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
   local output
-  output=$(echo "$input_json" | bash "$HOOK" 2>/dev/null) || true
+  if [ -n "$env_spec" ]; then
+    output=$(echo "$input_json" | env $env_spec bash "$HOOK" 2>/dev/null) || true
+  else
+    output=$(echo "$input_json" | bash "$HOOK" 2>/dev/null) || true
+  fi
 
   if [ -z "$expected_cmd" ]; then
     # Expect no rewrite (hook exits 0 with no output)
@@ -79,7 +88,15 @@ test_rewrite "git show abc123" \
 
 test_rewrite "git add ." \
   "git add ." \
-  "rtk git add ."
+  ""
+
+test_rewrite "git commit -m msg (mutating guarded default)" \
+  "git commit -m 'msg'" \
+  ""
+
+test_rewrite "git push (mutating guarded default)" \
+  "git push" \
+  ""
 
 test_rewrite "gh pr list" \
   "gh pr list" \
@@ -116,6 +133,20 @@ test_rewrite "cargo test" \
 test_rewrite "npx prisma migrate" \
   "npx prisma migrate" \
   "rtk prisma migrate"
+
+echo ""
+
+# ---- SECTION 1.5: Mutating rewrites (opt-in) ----
+echo "--- Mutating rewrites (RTK_REWRITE_MUTATING=1) ---"
+test_rewrite_with_env "git add . with mutating enabled" \
+  "git add ." \
+  "rtk git add ." \
+  "RTK_REWRITE_MUTATING=1"
+
+test_rewrite_with_env "git commit with mutating enabled" \
+  "git commit -m 'msg'" \
+  "rtk git commit -m 'msg'" \
+  "RTK_REWRITE_MUTATING=1"
 
 echo ""
 
@@ -220,6 +251,22 @@ test_rewrite "kubectl describe pod foo" \
 test_rewrite "kubectl apply -f deploy.yaml" \
   "kubectl apply -f deploy.yaml" \
   "rtk kubectl apply -f deploy.yaml"
+
+test_rewrite "write replace alias" \
+  "write replace src/main.rs --from old --to new" \
+  "rtk write replace src/main.rs --from old --to new"
+
+test_rewrite "sed -i single occurrence" \
+  "sed -i 's/old/new/' file.txt" \
+  "rtk write replace file.txt --from 'old' --to 'new'"
+
+test_rewrite "sed -i global occurrence" \
+  "sed -i 's/old/new/g' file.txt" \
+  "rtk write replace file.txt --from 'old' --to 'new' --all"
+
+test_rewrite "perl -pi replacement" \
+  "perl -pi -e 's/old/new/g' file.txt" \
+  "rtk write replace file.txt --from 'old' --to 'new' --all"
 
 echo ""
 
@@ -345,18 +392,22 @@ test_audit_log "audit: rewrite cargo test" \
   "cargo test" \
   "rewrite"
 
-# Test log format (4 pipe-separated fields)
+test_audit_log "audit: mutating guard for git add" \
+  "git add ." \
+  "skip:mutating_guard"
+
+# Test log format (5 pipe-separated fields: timestamp | action | class=... | original | rewritten)
 rm -f "$AUDIT_TMPDIR/hook-audit.log"
 input_json=$(jq -n --arg cmd "git status" '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
 echo "$input_json" | RTK_HOOK_AUDIT=1 RTK_AUDIT_DIR="$AUDIT_TMPDIR" bash "$HOOK" 2>/dev/null || true
 TOTAL=$((TOTAL + 1))
 log_line=$(cat "$AUDIT_TMPDIR/hook-audit.log" 2>/dev/null || echo "")
 field_count=$(echo "$log_line" | awk -F' \\| ' '{print NF}')
-if [ "$field_count" = "4" ]; then
-  printf "  ${GREEN}PASS${RESET} audit: log format has 4 fields ${DIM}→ %s${RESET}\n" "$log_line"
+if [ "$field_count" = "5" ]; then
+  printf "  ${GREEN}PASS${RESET} audit: log format has 5 fields ${DIM}→ %s${RESET}\n" "$log_line"
   PASS=$((PASS + 1))
 else
-  printf "  ${RED}FAIL${RESET} audit: log format (expected 4 fields, got %s)\n" "$field_count"
+  printf "  ${RED}FAIL${RESET} audit: log format (expected 5 fields, got %s)\n" "$field_count"
   printf "       log line: %s\n" "$log_line"
   FAIL=$((FAIL + 1))
 fi

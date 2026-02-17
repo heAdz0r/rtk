@@ -42,7 +42,8 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
     let filtered = filter_tsc_output(&raw);
 
     let exit_code = output.status.code().unwrap_or(1); // upstream sync: tee integration
-    if let Some(hint) = crate::tee::tee_and_hint(&raw, "tsc", exit_code) { // upstream sync: tee
+    if let Some(hint) = crate::tee::tee_and_hint(&raw, "tsc", exit_code) {
+        // upstream sync: tee
         println!("{}\n{}", filtered, hint);
     } else {
         println!("{}", filtered);

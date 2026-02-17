@@ -18,21 +18,40 @@ fn default_log_path() -> PathBuf {
 struct AuditEntry {
     timestamp: String,
     action: String,
+    class: String,
     original_cmd: String,
     _rewritten_cmd: String,
 }
 
-/// Parse a single log line: "timestamp | action | original_cmd | rewritten_cmd"
+/// Parse a single log line:
+/// - new format: "timestamp | action | class=... | original_cmd | rewritten_cmd"
+/// - old format: "timestamp | action | original_cmd | rewritten_cmd"
 fn parse_line(line: &str) -> Option<AuditEntry> {
-    let parts: Vec<&str> = line.splitn(4, " | ").collect();
+    let parts: Vec<&str> = line.splitn(5, " | ").collect();
     if parts.len() < 3 {
         return None;
     }
+
+    let (class, original_idx, rewritten_idx) = if parts.len() >= 5 && parts[2].starts_with("class=")
+    {
+        (
+            parts[2]
+                .strip_prefix("class=")
+                .unwrap_or("unknown")
+                .to_string(),
+            3,
+            4,
+        )
+    } else {
+        ("unknown".to_string(), 2, 3)
+    };
+
     Some(AuditEntry {
         timestamp: parts[0].to_string(),
         action: parts[1].to_string(),
-        original_cmd: parts[2].to_string(),
-        _rewritten_cmd: parts.get(3).unwrap_or(&"-").to_string(),
+        class,
+        original_cmd: parts.get(original_idx).unwrap_or(&"-").to_string(),
+        _rewritten_cmd: parts.get(rewritten_idx).unwrap_or(&"-").to_string(),
     })
 }
 
@@ -95,10 +114,14 @@ pub fn run(since_days: u64, verbose: u8) -> Result<()> {
     // Count by action
     let mut action_counts: HashMap<&str, usize> = HashMap::new();
     let mut cmd_counts: HashMap<String, usize> = HashMap::new();
+    let mut class_totals: HashMap<String, usize> = HashMap::new();
+    let mut class_rewrites: HashMap<String, usize> = HashMap::new();
 
     for entry in &filtered {
         *action_counts.entry(&entry.action).or_insert(0) += 1;
+        *class_totals.entry(entry.class.clone()).or_insert(0) += 1;
         if entry.action == "rewrite" {
+            *class_rewrites.entry(entry.class.clone()).or_insert(0) += 1;
             *cmd_counts
                 .entry(base_command(&entry.original_cmd))
                 .or_insert(0) += 1;
@@ -131,6 +154,29 @@ pub fn run(since_days: u64, verbose: u8) -> Result<()> {
     println!("Total invocations: {}", total);
     println!("Rewrites:          {} ({:.1}%)", rewrites, rewrite_pct);
     println!("Skips:             {} ({:.1}%)", skips, skip_pct);
+
+    let read_only_total = class_totals.get("read_only").copied().unwrap_or(0);
+    let read_only_rewrites = class_rewrites.get("read_only").copied().unwrap_or(0);
+    let mutating_total = class_totals.get("mutating").copied().unwrap_or(0);
+    let mutating_rewrites = class_rewrites.get("mutating").copied().unwrap_or(0);
+    let read_only_rate = if read_only_total > 0 {
+        read_only_rewrites as f64 / read_only_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let mutating_rate = if mutating_total > 0 {
+        mutating_rewrites as f64 / mutating_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "Rewrite rate (read_only): {} / {} ({:.1}%)",
+        read_only_rewrites, read_only_total, read_only_rate
+    );
+    println!(
+        "Rewrite rate (mutating):  {} / {} ({:.1}%)",
+        mutating_rewrites, mutating_total, mutating_rate
+    );
 
     // Skip breakdown
     let skip_actions: Vec<(&str, usize)> = action_counts
@@ -178,18 +224,28 @@ mod tests {
 
     #[test]
     fn test_parse_line_rewrite() {
-        let line = "2026-02-16T14:30:01Z | rewrite | git status | rtk git status";
+        let line = "2026-02-16T14:30:01Z | rewrite | class=read_only | git status | rtk git status";
         let entry = parse_line(line).unwrap();
         assert_eq!(entry.action, "rewrite");
+        assert_eq!(entry.class, "read_only");
         assert_eq!(entry.original_cmd, "git status");
         assert_eq!(entry._rewritten_cmd, "rtk git status");
     }
 
     #[test]
     fn test_parse_line_skip() {
-        let line = "2026-02-16T14:30:02Z | skip:no_match | echo hello | -";
+        let line = "2026-02-16T14:30:02Z | skip:no_match | class=unknown | echo hello | -";
         let entry = parse_line(line).unwrap();
         assert_eq!(entry.action, "skip:no_match");
+        assert_eq!(entry.class, "unknown");
+        assert_eq!(entry.original_cmd, "echo hello");
+    }
+
+    #[test]
+    fn test_parse_line_backward_compatible_old_format() {
+        let line = "2026-02-16T14:30:02Z | skip:no_match | echo hello | -";
+        let entry = parse_line(line).unwrap();
+        assert_eq!(entry.class, "unknown");
         assert_eq!(entry.original_cmd, "echo hello");
     }
 
@@ -221,6 +277,7 @@ mod tests {
         AuditEntry {
             timestamp: "2026-02-16T14:30:00Z".to_string(),
             action: action.to_string(),
+            class: "read_only".to_string(),
             original_cmd: cmd.to_string(),
             _rewritten_cmd: "-".to_string(),
         }
@@ -239,14 +296,14 @@ mod tests {
     #[test]
     fn test_token_savings() {
         // Simulate what rtk hook-audit would output vs raw log dump
-        let raw_log = r#"2026-02-16T14:30:01Z | rewrite | git status | rtk git status
-2026-02-16T14:30:02Z | skip:no_match | echo hello | -
-2026-02-16T14:30:03Z | rewrite | cargo test | rtk cargo test
-2026-02-16T14:30:04Z | skip:already_rtk | rtk git log | -
-2026-02-16T14:30:05Z | rewrite | git log --oneline -10 | rtk git log --oneline -10
-2026-02-16T14:30:06Z | rewrite | gh pr view 42 | rtk gh pr view 42
-2026-02-16T14:30:07Z | skip:no_match | mkdir -p foo | -
-2026-02-16T14:30:08Z | rewrite | cargo clippy --all-targets | rtk cargo clippy --all-targets"#;
+        let raw_log = r#"2026-02-16T14:30:01Z | rewrite | class=read_only | git status | rtk git status
+2026-02-16T14:30:02Z | skip:no_match | class=unknown | echo hello | -
+2026-02-16T14:30:03Z | rewrite | class=read_only | cargo test | rtk cargo test
+2026-02-16T14:30:04Z | skip:already_rtk | class=unknown | rtk git log | -
+2026-02-16T14:30:05Z | rewrite | class=read_only | git log --oneline -10 | rtk git log --oneline -10
+2026-02-16T14:30:06Z | rewrite | class=read_only | gh pr view 42 | rtk gh pr view 42
+2026-02-16T14:30:07Z | skip:no_match | class=unknown | mkdir -p foo | -
+2026-02-16T14:30:08Z | rewrite | class=read_only | cargo clippy --all-targets | rtk cargo clippy --all-targets"#;
 
         let entries: Vec<AuditEntry> = raw_log.lines().filter_map(parse_line).collect();
         assert_eq!(entries.len(), 8);
