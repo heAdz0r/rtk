@@ -733,10 +733,10 @@ enum WriteCommands {
         /// Target file
         file: PathBuf,
         /// Text to find (exact match)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         from: String,
         /// Replacement text
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         to: String,
         /// Replace all matches
         #[arg(long)]
@@ -759,10 +759,10 @@ enum WriteCommands {
         /// Target file
         file: PathBuf,
         /// Old block to replace (exact match)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         old: String,
         /// New block
-        #[arg(long = "new")]
+        #[arg(long = "new", allow_hyphen_values = true)]
         new_text: String,
         /// Replace all matching hunks
         #[arg(long)]

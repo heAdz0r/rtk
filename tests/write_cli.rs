@@ -115,6 +115,33 @@ fn write_patch_missing_hunk_fails() {
 }
 
 #[test]
+fn write_patch_accepts_old_with_leading_dash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("dash.txt");
+    fs::write(&file, "- headline\nnext\n").expect("seed file");
+
+    let out = rtk_bin()
+        .args([
+            "write",
+            "patch",
+            file.to_str().unwrap(),
+            "--old",
+            "- headline",
+            "--new",
+            "* headline",
+        ])
+        .output()
+        .expect("run rtk write patch with leading dash");
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "* headline\nnext\n");
+}
+
+#[test]
 fn write_set_path_conflict_keeps_file_unchanged() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let file = tmp.path().join("e.json");
