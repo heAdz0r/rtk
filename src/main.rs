@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "rtk",
-    version = "0.20.1-fork.5",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Rust Token Killer - Minimize LLM token consumption",
     long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
