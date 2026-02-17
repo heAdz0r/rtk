@@ -254,6 +254,7 @@ const RULES: &[RtkRule] = &[
 
 /// Commands to ignore (shell builtins, trivial, already rtk).
 const IGNORED_PREFIXES: &[&str] = &[
+    "#",
     "cd ",
     "cd\t",
     "echo ",
@@ -696,6 +697,14 @@ mod tests {
     fn test_classify_echo_ignored() {
         assert_eq!(
             classify_command("echo hello world"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
+    fn test_classify_comment_ignored() {
+        assert_eq!(
+            classify_command("# Test hook rewrite for ssh commands"),
             Classification::Ignored
         );
     }
