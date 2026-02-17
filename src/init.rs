@@ -1459,7 +1459,7 @@ mod tests {
     fn test_block_grep_hook_has_correct_schema() {
         // Verify block-grep hook uses canonical deny schema
         assert!(BLOCK_GREP_HOOK.contains("\"permissionDecision\": \"deny\""));
-        assert!(BLOCK_GREP_HOOK.contains("\"continue\": false"));
+        assert!(BLOCK_GREP_HOOK.contains("\"hookEventName\": \"PreToolUse\"")); // updated: canonical PreToolUse schema
         assert!(BLOCK_GREP_HOOK.contains("rtk grep"));
         assert!(BLOCK_GREP_HOOK.contains("rtk rgai"));
     }
