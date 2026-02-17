@@ -1183,7 +1183,16 @@ fn main() -> Result<()> {
                 dry_run,
                 fast,
             } => {
-                write_cmd::run_patch(&file, &old, &new_text, all, dry_run, fast, cli.verbose, output)?;
+                write_cmd::run_patch(
+                    &file,
+                    &old,
+                    &new_text,
+                    all,
+                    dry_run,
+                    fast,
+                    cli.verbose,
+                    output,
+                )?;
             }
             WriteCommands::Set {
                 file,

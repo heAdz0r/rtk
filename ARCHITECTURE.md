@@ -176,7 +176,7 @@ Database: ~/.local/share/rtk/history.db
 
 ## Module Organization
 
-### Complete Module Map (49 Modules)
+### Complete Module Map (63 Modules)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -198,6 +198,16 @@ CODE SEARCH       grep_cmd.rs       grep                   60-80%     ✓
 
 FILE OPS          ls.rs             ls                     50-70%     ✓
                   read.rs           read                   40-90%     ✓
+                  read_cache.rs     (read caching)         N/A        ✓
+                  read_changed.rs   (git-aware diff)       N/A        ✓
+                  read_digest.rs    (tabular digest)       N/A        ✓
+                  read_render.rs    (render helpers)       N/A        ✓
+                  read_source.rs    (source I/O)           N/A        ✓
+                  read_symbols.rs   (symbol extraction)    N/A        ✓
+                  read_types.rs     (shared read types)    N/A        ✓
+                  write_cmd.rs      write                  40-90%     ✓
+                  write_core.rs     (write core logic)     N/A        ✓
+                  write_semantics.rs (write semantics)     N/A        ✓
                   tree.rs           (internal for ls)      N/A        ✓
 
 EXECUTION         runner.rs         err, test              60-99%     ✓
@@ -233,6 +243,7 @@ VCS               gh_cmd.rs         gh                     26-87%     ✓
 
 NETWORK           curl_cmd.rs       curl                   70%        ✓
                   wget_cmd.rs       wget                   85-95%     ✓
+                  ssh_cmd.rs        ssh                    60-80%     ✓
 
 DEPENDENCIES      deps.rs           deps                   80-90%     ✓
 
@@ -243,6 +254,7 @@ ANALYTICS         cc_economics.rs   cc-economics           N/A        ✓
                   display_helpers.rs (internal)            N/A        ✓
                   discover/         discover               N/A        ✓
                   learn/            (error learning)       N/A        ✓
+                  hook_audit_cmd.rs hook-audit             N/A        ✓
 
 SYSTEM            init.rs           init                   N/A        ✓
                   gain.rs           gain                   N/A        ✓
@@ -252,15 +264,17 @@ SHARED            utils.rs          Helpers                N/A        ✓
                   filter.rs         Language filters       N/A        ✓
                   tracking.rs       Token tracking         N/A        ✓
                   parser/           Output parser fwk      N/A        ✓
+                  symbols_regex.rs  Regex symbol extractor N/A        ✓
+                  tee.rs            Raw output tee         N/A        ✓
                   rgai_arg_tests    (test-only)            N/A        ✓
 ```
 
-**Total: 49 modules** (33 command modules + 16 infrastructure/internal modules)
+**Total: 63 modules** (36 command modules + 27 infrastructure/internal modules)
 
 ### Module Count Breakdown
 
-- **Command Modules**: 33 (directly exposed to users)
-- **Infrastructure Modules**: 16 (utils, filter, tracking, config, init, gain, parser, display, etc.)
+- **Command Modules**: 36 (directly exposed to users)
+- **Infrastructure Modules**: 27 (utils, filter, tracking, config, init, gain, parser, display, read_*, write_*, symbols, tee, etc.)
 - **Git Commands**: 7 operations (status, diff, log, add, commit, push, branch/checkout)
 - **JS/TS Tooling**: 10 modules (modern frontend/fullstack development)
 - **Python Tooling**: 3 modules (ruff, pytest, pip/uv)

@@ -160,6 +160,20 @@ pub struct BatchOp {
     pub format: Option<String>,
 }
 
+/// Build tracking arguments for write operations.
+/// Returns (native_estimate, rtk_output, normalized_cmd).
+/// - native_estimate: file content (what native Edit/sed would show in LLM context)
+/// - rtk_output: compact message rtk actually printed
+/// - normalized_cmd: always "rtk write" for gain grouping
+fn write_tracking_args<'a>(
+    op: &str,
+    file_content: &'a str,
+    rtk_msg: &'a str,
+) -> (&'a str, &'a str, &'static str) {
+    let _ = op; // op is not used — all write ops normalize to same cmd // changed: unified grouping
+    (file_content, rtk_msg, "rtk write")
+}
+
 pub fn run_replace(
     file: &Path,
     from: &str,
@@ -174,7 +188,11 @@ pub fn run_replace(
     let _semantics = semantics_for(WriteOperation::Replace);
 
     if from.is_empty() {
-        return Err(write_error("EMPTY_PATTERN", "--from must be non-empty", output));
+        return Err(write_error(
+            "EMPTY_PATTERN",
+            "--from must be non-empty",
+            output,
+        ));
     }
 
     let content =
@@ -192,32 +210,24 @@ pub fn run_replace(
     };
 
     if updated == content {
-        WriteResponse::noop("replace")
-            .render(output, "no-op: replacement produces identical content");
-        timer.track(
-            &format!("write replace {}", file.display()),
-            "rtk write replace (noop)",
-            &content,
-            &updated,
-        );
+        let msg = "no-op: replacement produces identical content"; // changed: capture msg for tracking
+        WriteResponse::noop("replace").render(output, msg);
+        let (ti, to, tc) = write_tracking_args("replace", &content, msg); // changed: use helper
+        timer.track(&format!("write replace {}", file.display()), tc, ti, to);
         return Ok(());
     }
 
     if dry_run {
-        WriteResponse::dry_run("replace", count)
-            .render(output, &format!("dry-run: replace {} occurrence(s)", count));
-        timer.track(
-            &format!("write replace {}", file.display()),
-            "rtk write replace (dry-run)",
-            &content,
-            &updated,
-        );
+        let msg = format!("dry-run: replace {} occurrence(s)", count); // changed: capture msg
+        WriteResponse::dry_run("replace", count).render(output, &msg);
+        let (ti, to, tc) = write_tracking_args("replace", &content, &msg); // changed: use helper
+        timer.track(&format!("write replace {}", file.display()), tc, ti, to);
         return Ok(());
     }
 
     let stats = write_text(file, &updated, fast)?;
-    WriteResponse::success("replace", count)
-        .render(output, &format!("OK replace applied={}", count));
+    let msg = format!("OK replace applied={}", count); // changed: capture msg for tracking
+    WriteResponse::success("replace", count).render(output, &msg);
     if verbose > 1 {
         eprintln!(
             "bytes_written={}, fsync={}, rename={}",
@@ -225,12 +235,8 @@ pub fn run_replace(
         );
     }
 
-    timer.track(
-        &format!("write replace {}", file.display()),
-        "rtk write replace",
-        &content,
-        &updated,
-    );
+    let (ti, to, tc) = write_tracking_args("replace", &content, &msg); // changed: use helper
+    timer.track(&format!("write replace {}", file.display()), tc, ti, to);
     Ok(())
 }
 
@@ -248,7 +254,11 @@ pub fn run_patch(
     let _semantics = semantics_for(WriteOperation::Patch);
 
     if old.is_empty() {
-        return Err(write_error("EMPTY_PATTERN", "--old must be non-empty", output));
+        return Err(write_error(
+            "EMPTY_PATTERN",
+            "--old must be non-empty",
+            output,
+        ));
     }
 
     let content =
@@ -265,32 +275,24 @@ pub fn run_patch(
     };
 
     if updated == content {
-        WriteResponse::noop("patch")
-            .render(output, "no-op: patch produces identical content");
-        timer.track(
-            &format!("write patch {}", file.display()),
-            "rtk write patch (noop)",
-            &content,
-            &updated,
-        );
+        let msg = "no-op: patch produces identical content"; // changed: capture msg for tracking
+        WriteResponse::noop("patch").render(output, msg);
+        let (ti, to, tc) = write_tracking_args("patch", &content, msg); // changed: use helper
+        timer.track(&format!("write patch {}", file.display()), tc, ti, to);
         return Ok(());
     }
 
     if dry_run {
-        WriteResponse::dry_run("patch", count)
-            .render(output, &format!("dry-run: patch {} hunk(s)", count));
-        timer.track(
-            &format!("write patch {}", file.display()),
-            "rtk write patch (dry-run)",
-            &content,
-            &updated,
-        );
+        let msg = format!("dry-run: patch {} hunk(s)", count); // changed: capture msg
+        WriteResponse::dry_run("patch", count).render(output, &msg);
+        let (ti, to, tc) = write_tracking_args("patch", &content, &msg); // changed: use helper
+        timer.track(&format!("write patch {}", file.display()), tc, ti, to);
         return Ok(());
     }
 
     let stats = write_text(file, &updated, fast)?;
-    WriteResponse::success("patch", count)
-        .render(output, &format!("OK patch applied={}", count));
+    let msg = format!("OK patch applied={}", count); // changed: capture msg for tracking
+    WriteResponse::success("patch", count).render(output, &msg);
     if verbose > 1 {
         eprintln!(
             "bytes_written={}, fsync={}, rename={}",
@@ -298,12 +300,8 @@ pub fn run_patch(
         );
     }
 
-    timer.track(
-        &format!("write patch {}", file.display()),
-        "rtk write patch",
-        &content,
-        &updated,
-    );
+    let (ti, to, tc) = write_tracking_args("patch", &content, &msg); // changed: use helper
+    timer.track(&format!("write patch {}", file.display()), tc, ti, to);
     Ok(())
 }
 
@@ -342,24 +340,16 @@ pub fn run_set(
     };
 
     if dry_run {
-        WriteResponse::dry_run("set", 1).render(
-            output,
-            &format!("dry-run: set {} ({})", key, format_label),
-        );
-        timer.track(
-            &format!("write set {}", file.display()),
-            "rtk write set (dry-run)",
-            &content,
-            &updated,
-        );
+        let msg = format!("dry-run: set {} ({})", key, format_label); // changed: capture msg
+        WriteResponse::dry_run("set", 1).render(output, &msg);
+        let (ti, to, tc) = write_tracking_args("set", &content, &msg); // changed: use helper
+        timer.track(&format!("write set {}", file.display()), tc, ti, to);
         return Ok(());
     }
 
     let stats = write_text(file, &updated, fast)?;
-    WriteResponse::success("set", 1).render(
-        output,
-        &format!("OK set {} ({})", key, format_label),
-    );
+    let msg = format!("OK set {} ({})", key, format_label); // changed: capture msg for tracking
+    WriteResponse::success("set", 1).render(output, &msg);
     if verbose > 1 {
         eprintln!(
             "bytes_written={}, fsync={}, rename={}",
@@ -367,12 +357,8 @@ pub fn run_set(
         );
     }
 
-    timer.track(
-        &format!("write set {}", file.display()),
-        "rtk write set",
-        &content,
-        &updated,
-    );
+    let (ti, to, tc) = write_tracking_args("set", &content, &msg); // changed: use helper
+    timer.track(&format!("write set {}", file.display()), tc, ti, to);
     Ok(())
 }
 
@@ -387,8 +373,8 @@ pub fn run_batch(
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
-    let ops: Vec<BatchOp> = serde_json::from_str(plan_json)
-        .context("Failed to parse batch plan JSON")?;
+    let ops: Vec<BatchOp> =
+        serde_json::from_str(plan_json).context("Failed to parse batch plan JSON")?;
 
     if ops.is_empty() {
         bail!("Batch plan is empty");
@@ -410,7 +396,14 @@ pub fn run_batch(
             }
             Err(e) => {
                 failed += 1;
-                let msg = format!("[{}/{}] {} {}: {}", i + 1, total, op.op, op.file.display(), e);
+                let msg = format!(
+                    "[{}/{}] {} {}: {}",
+                    i + 1,
+                    total,
+                    op.op,
+                    op.file.display(),
+                    e
+                );
                 errors.push(msg.clone());
                 if output == OutputMode::Concise {
                     eprintln!("{}", msg);
@@ -435,13 +428,17 @@ pub fn run_batch(
     let concise_msg = if dry_run {
         format!("dry-run: batch {}/{} planned", applied, total)
     } else {
-        format!("OK batch applied={} failed={} total={}", applied, failed, total)
+        format!(
+            "OK batch applied={} failed={} total={}",
+            applied, failed, total
+        )
     };
     resp.render(output, &concise_msg);
 
+    let (_, _, tc) = write_tracking_args("batch", plan_json, &concise_msg); // changed: normalize cmd
     timer.track(
         &format!("write batch ({})", total),
-        "rtk write batch",
+        tc,
         plan_json,
         &concise_msg,
     );
@@ -456,9 +453,13 @@ pub fn run_batch(
 fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
     match op.op.as_str() {
         "replace" => {
-            let from = op.from.as_deref()
+            let from = op
+                .from
+                .as_deref()
                 .with_context(|| "batch replace: missing 'from' field")?;
-            let to = op.to.as_deref()
+            let to = op
+                .to
+                .as_deref()
                 .with_context(|| "batch replace: missing 'to' field")?;
             if from.is_empty() {
                 bail!("batch replace: 'from' must be non-empty");
@@ -486,9 +487,13 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             Ok(count)
         }
         "patch" => {
-            let old = op.old.as_deref()
+            let old = op
+                .old
+                .as_deref()
                 .with_context(|| "batch patch: missing 'old' field")?;
-            let new = op.new.as_deref()
+            let new = op
+                .new
+                .as_deref()
                 .with_context(|| "batch patch: missing 'new' field")?;
             if old.is_empty() {
                 bail!("batch patch: 'old' must be non-empty");
@@ -516,9 +521,13 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             Ok(count)
         }
         "set" => {
-            let key = op.key.as_deref()
+            let key = op
+                .key
+                .as_deref()
                 .with_context(|| "batch set: missing 'key' field")?;
-            let value = op.value.as_deref()
+            let value = op
+                .value
+                .as_deref()
                 .with_context(|| "batch set: missing 'value' field")?;
 
             let vt = match op.value_type.as_deref() {
@@ -547,7 +556,8 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
                     serialize_json_preserving_style(&root, &content)?
                 }
                 ConfigFormat::Toml => {
-                    let mut root: DocumentMut = content.parse::<DocumentMut>()
+                    let mut root: DocumentMut = content
+                        .parse::<DocumentMut>()
                         .with_context(|| format!("Invalid TOML: {}", op.file.display()))?;
                     set_toml_path(&mut root, key, parse_toml_value(value, vt)?)?;
                     root.to_string()
@@ -817,7 +827,17 @@ mod tests {
         let file = tmp.path().join("b.txt");
         fs::write(&file, "old\nold\n").unwrap();
 
-        run_patch(&file, "old", "new", true, false, true, 0, OutputMode::Concise).unwrap();
+        run_patch(
+            &file,
+            "old",
+            "new",
+            true,
+            false,
+            true,
+            0,
+            OutputMode::Concise,
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "new\nnew\n");
     }
 
@@ -873,7 +893,17 @@ mod tests {
         let file = tmp.path().join("e.txt");
         fs::write(&file, "hello world").unwrap();
 
-        run_replace(&file, "world", "rtk", false, true, true, 0, OutputMode::Concise).unwrap();
+        run_replace(
+            &file,
+            "world",
+            "rtk",
+            false,
+            true,
+            true,
+            0,
+            OutputMode::Concise,
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
     }
 
@@ -967,7 +997,17 @@ mod tests {
         fs::write(&file, "hello world").unwrap();
 
         // Quiet mode should succeed without panicking
-        run_replace(&file, "world", "rtk", false, false, true, 0, OutputMode::Quiet).unwrap();
+        run_replace(
+            &file,
+            "world",
+            "rtk",
+            false,
+            false,
+            true,
+            0,
+            OutputMode::Quiet,
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello rtk");
     }
 
@@ -1083,9 +1123,17 @@ mod tests {
         fs::write(&file, "{\"a\":1}").unwrap();
 
         let err = run_set(
-            &file, "", "42", ConfigValueType::Number, ConfigFormat::Json,
-            false, true, 0, OutputMode::Concise,
-        ).unwrap_err();
+            &file,
+            "",
+            "42",
+            ConfigValueType::Number,
+            ConfigFormat::Json,
+            false,
+            true,
+            0,
+            OutputMode::Concise,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("non-empty"));
         // File must not be modified
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\":1}");
@@ -1114,5 +1162,46 @@ mod tests {
         assert!(out.contains("\n    \"a\": {"));
         assert!(out.contains("\n        \"b\": 1"));
         assert!(out.ends_with('\n'));
+    }
+
+    // --- Tracking semantics tests ---
+
+    #[test]
+    fn tracking_input_represents_native_cost() {
+        // input must be file content (native cost), not the updated content
+        // output must be the compact rtk message, not updated file content
+        let content = "a".repeat(1000); // 1000 chars ~ 250 tokens
+        let rtk_msg = "OK replace applied=1"; // ~5 tokens
+        let (input, output, cmd) = write_tracking_args("replace", &content, rtk_msg);
+        assert_eq!(input, content, "input should be file content (native cost)");
+        assert_eq!(output, rtk_msg, "output should be compact rtk message");
+        assert_eq!(
+            cmd, "rtk write",
+            "rtk_cmd should be normalized to 'rtk write'"
+        );
+        // Token savings: input ~250 tokens, output ~5 tokens → ~98% savings
+        assert!(
+            input.len() > output.len() * 10,
+            "must show significant savings"
+        );
+    }
+
+    #[test]
+    fn tracking_normalized_cmd_for_all_ops() {
+        for op in &[
+            "replace",
+            "patch",
+            "set",
+            "batch",
+            "replace (dry-run)",
+            "set (noop)",
+        ] {
+            let (_, _, cmd) = write_tracking_args(op, "content", "ok");
+            assert_eq!(
+                cmd, "rtk write",
+                "op '{}' must normalize to 'rtk write'",
+                op
+            );
+        }
     }
 }

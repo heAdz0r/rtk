@@ -1,7 +1,7 @@
 #!/bin/bash
-# RTK block hook for Claude Code PreToolUse:Grep/Read
-# Blocks native Grep and Read tools and instructs Claude to use rtk via Bash instead.
-# This ensures search/read operations go through RTK for filtering and token savings.
+# RTK block hook for Claude Code PreToolUse:Grep
+# Blocks native Grep tool and instructs Claude to use rtk grep/rgai via Bash instead.
+# This ensures search operations go through RTK for filtering and token savings.
 
 # Output deny decision with guidance (canonical schema per Context7 docs)
 cat <<'EOF'
@@ -9,7 +9,7 @@ cat <<'EOF'
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Native Grep/Read tools are disabled. Use `rtk rgai <query>` (semantic/fuzzy), `rtk grep <pattern> [path]` (exact/regex), or `rtk read <file> [--level none] [--from N --to M]` via Bash instead."
+    "permissionDecisionReason": "Native Grep tool is disabled. Use `rtk rgai <query>` (semantic/fuzzy) or `rtk grep <pattern> [path]` (exact/regex) via Bash instead."
   }
 }
 EOF
