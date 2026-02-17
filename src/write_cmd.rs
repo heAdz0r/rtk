@@ -8,6 +8,7 @@ use memchr::memmem::Finder;
 use serde::Serialize;
 use serde_json::ser::{PrettyFormatter, Serializer};
 use serde_json::{Map, Value as JsonValue};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -354,6 +355,75 @@ fn write_tracking_enabled() -> bool {
     })
 }
 
+/// Best-effort unescape for shell-escaped punctuation (e.g. "\!" -> "!").
+/// Used only as a fallback when exact matching fails.
+fn maybe_unescape_shell_escapes(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_punctuation() && next != '\\' {
+                    out.push(next);
+                    chars.next();
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+
+    changed.then_some(out)
+}
+
+fn smart_no_match_hint(base: &str, flag: &str, pattern: &str) -> String {
+    let mut hints: Vec<String> = Vec::new();
+
+    if maybe_unescape_shell_escapes(pattern).is_some() {
+        hints.push(format!(
+            "pattern for {} looks shell-escaped (for example, '\\\\!'); pass literal text or single-quote the argument",
+            flag
+        ));
+    }
+
+    if pattern.contains("\\n") && !pattern.contains('\n') {
+        hints.push(format!(
+            "pattern for {} contains literal '\\\\n'; for multi-line hunks pass real newline characters",
+            flag
+        ));
+    }
+
+    if hints.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}; {}", base, hints.join("; "))
+    }
+}
+
+/// Resolve exact or shell-unescaped match pair.
+fn resolve_match_pair<'a>(
+    content: &str,
+    pattern: &'a str,
+    replacement: &'a str,
+) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+    if content.contains(pattern) {
+        return Some((Cow::Borrowed(pattern), Cow::Borrowed(replacement)));
+    }
+
+    let unescaped_pattern = maybe_unescape_shell_escapes(pattern)?;
+    if !content.contains(unescaped_pattern.as_str()) {
+        return None;
+    }
+
+    let unescaped_replacement = maybe_unescape_shell_escapes(replacement)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(replacement));
+    Some((Cow::Owned(unescaped_pattern), unescaped_replacement))
+}
+
 pub fn run_replace(
     file: &Path,
     from: &str,
@@ -374,16 +444,22 @@ pub fn run_replace(
     let from_owned = from.to_string();
     let to_owned = to.to_string();
     let (resp, content) = locked_write(file, params, "replace", |content| {
-        if !content.contains(from_owned.as_str()) {
+        let Some((from_match, to_match)) =
+            resolve_match_pair(content, from_owned.as_str(), to_owned.as_str())
+        else {
             return WriteAttempt::TerminalError {
                 code: "NO_MATCH",
-                hint: "no matches for --from".to_string(),
+                hint: smart_no_match_hint("no matches for --from", "--from", from_owned.as_str()),
             };
-        }
+        };
+
         let (updated, count) = if all {
-            replace_all_counted(content, &from_owned, &to_owned)
+            replace_all_counted(content, from_match.as_ref(), to_match.as_ref())
         } else {
-            (content.replacen(from_owned.as_str(), &to_owned, 1), 1)
+            (
+                content.replacen(from_match.as_ref(), to_match.as_ref(), 1),
+                1,
+            )
         };
         if updated == content {
             return WriteAttempt::Unchanged;
@@ -414,16 +490,22 @@ pub fn run_patch(file: &Path, old: &str, new: &str, all: bool, params: WritePara
     let old_owned = old.to_string();
     let new_owned = new.to_string();
     let (resp, content) = locked_write(file, params, "patch", |content| {
-        if !content.contains(old_owned.as_str()) {
+        let Some((old_match, new_match)) =
+            resolve_match_pair(content, old_owned.as_str(), new_owned.as_str())
+        else {
             return WriteAttempt::TerminalError {
                 code: "NO_MATCH",
-                hint: "hunk not found".to_string(),
+                hint: smart_no_match_hint("hunk not found", "--old", old_owned.as_str()),
             };
-        }
+        };
+
         let (updated, count) = if all {
-            replace_all_counted(content, &old_owned, &new_owned)
+            replace_all_counted(content, old_match.as_ref(), new_match.as_ref())
         } else {
-            (content.replacen(old_owned.as_str(), &new_owned, 1), 1)
+            (
+                content.replacen(old_match.as_ref(), new_match.as_ref(), 1),
+                1,
+            )
         };
         if updated == content {
             return WriteAttempt::Unchanged;
@@ -723,14 +805,20 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
             if from.is_empty() {
                 bail!("batch replace: 'from' must be non-empty");
             }
-            if !content.contains(from) {
-                bail!("NO_MATCH");
-            }
+            let Some((from_match, to_match)) = resolve_match_pair(content, from, to) else {
+                bail!(
+                    "NO_MATCH {}",
+                    smart_no_match_hint("no matches for --from", "--from", from)
+                );
+            };
 
             let (updated, count) = if op.all {
-                replace_all_counted(&content, from, to)
+                replace_all_counted(&content, from_match.as_ref(), to_match.as_ref())
             } else {
-                (content.replacen(from, to, 1), 1)
+                (
+                    content.replacen(from_match.as_ref(), to_match.as_ref(), 1),
+                    1,
+                )
             };
 
             if updated == content {
@@ -750,14 +838,20 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
             if old.is_empty() {
                 bail!("batch patch: 'old' must be non-empty");
             }
-            if !content.contains(old) {
-                bail!("NO_MATCH");
-            }
+            let Some((old_match, new_match)) = resolve_match_pair(content, old, new) else {
+                bail!(
+                    "NO_MATCH {}",
+                    smart_no_match_hint("hunk not found", "--old", old)
+                );
+            };
 
             let (updated, count) = if op.all {
-                replace_all_counted(&content, old, new)
+                replace_all_counted(&content, old_match.as_ref(), new_match.as_ref())
             } else {
-                (content.replacen(old, new, 1), 1)
+                (
+                    content.replacen(old_match.as_ref(), new_match.as_ref(), 1),
+                    1,
+                )
             };
 
             if updated == content {
@@ -1108,6 +1202,80 @@ mod tests {
     }
 
     #[test]
+    fn replace_unescapes_shell_escaped_bang_as_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("escaped_bang_replace.txt");
+        fs::write(&file, "if a != b { return; }\n").unwrap();
+
+        run_replace(&file, "\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "if a == b { return; }\n"
+        );
+    }
+
+    #[test]
+    fn patch_unescapes_shell_escaped_bang_as_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("escaped_bang_patch.txt");
+        fs::write(&file, "if left != right {\n    return;\n}\n").unwrap();
+
+        run_patch(
+            &file,
+            "if left \\!= right {\n    return;\n}\n",
+            "if left == right {\n    return;\n}\n",
+            false,
+            tp(OutputMode::Quiet),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "if left == right {\n    return;\n}\n"
+        );
+    }
+
+    #[test]
+    fn replace_prefers_exact_match_over_unescape_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("escaped_bang_exact_precedence.txt");
+        fs::write(&file, "\\!= and !=\n").unwrap();
+
+        run_replace(&file, "\\!=", "MATCH", false, tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "MATCH and !=\n");
+    }
+
+    #[test]
+    fn replace_no_match_hint_mentions_shell_escaped_pattern() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("escaped_bang_nomatch.txt");
+        fs::write(&file, "alpha beta\n").unwrap();
+
+        let err = run_replace(&file, "\\!=", "==", false, tp(OutputMode::Quiet)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("NO_MATCH"));
+        assert!(msg.contains("shell-escaped"));
+    }
+
+    #[test]
+    fn patch_no_match_hint_mentions_literal_newline_escape() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("literal_newline_nomatch.txt");
+        fs::write(&file, "line1\nline2\n").unwrap();
+
+        let err = run_patch(
+            &file,
+            "line1\\nlineX",
+            "line1\nlineX\n",
+            false,
+            tp(OutputMode::Quiet),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("NO_MATCH"));
+        assert!(msg.contains("literal '\\\\n'"));
+    }
+
+    #[test]
     fn set_json_nested_key() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("c.json");
@@ -1307,6 +1475,20 @@ mod tests {
         run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         assert_eq!(fs::read_to_string(&f1).unwrap(), "hello batch");
         assert_eq!(fs::read_to_string(&f2).unwrap(), "foo PATCHED baz");
+    }
+
+    #[test]
+    fn batch_replace_unescapes_shell_escaped_bang_as_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let f1 = tmp.path().join("batch_escaped_bang.txt");
+        fs::write(&f1, "x != y\n").unwrap();
+
+        let plan = serde_json::json!([
+            {"op":"replace","file": f1.to_str().unwrap(), "from":"\\!=", "to":"=="}
+        ]);
+
+        run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(fs::read_to_string(&f1).unwrap(), "x == y\n");
     }
 
     #[test]

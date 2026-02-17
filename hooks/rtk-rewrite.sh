@@ -114,7 +114,7 @@ if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   fi
 
 # --- GitHub CLI (added: api, release) ---
-elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release)([[:space:]]|$)'; then
+elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release|repo)([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')"
 

@@ -19,6 +19,7 @@ pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) 
         "run" => run_workflow(args, verbose, ultra_compact),
         "repo" => run_repo(args, verbose, ultra_compact),
         "api" => run_api(args, verbose),
+        "release" => run_passthrough("gh", "release", args), // explicit passthrough for release
         _ => {
             // Unknown subcommand, pass through
             run_passthrough("gh", subcommand, args)
@@ -1014,6 +1015,27 @@ fn pr_action(action: &str, args: &[String], _verbose: u8) -> Result<()> {
 fn run_api(args: &[String], _verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
+    // --jq / --template: user already filtering, passthrough with tracking
+    if has_jq_or_template(args) {
+        let mut cmd = Command::new("gh");
+        cmd.arg("api");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().context("Failed to run gh api --jq")?;
+        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            timer.track("gh api --jq", "rtk gh api --jq", &stderr, &stderr);
+            eprintln!("{}", stderr.trim());
+            std::process::exit(output.status.code().unwrap_or(1));
+        }
+        print!("{}", raw);
+        timer.track("gh api --jq", "rtk gh api --jq", &raw, &raw); // 0% savings, correct tracking
+        return Ok(());
+    }
+
+    // No --jq/--template: compact JSON preview
     let mut cmd = Command::new("gh");
     cmd.arg("api");
     for arg in args {
@@ -1030,26 +1052,9 @@ fn run_api(args: &[String], _verbose: u8) -> Result<()> {
         std::process::exit(output.status.code().unwrap_or(1));
     }
 
-    // Try to parse as JSON and filter
-    let filtered = match json_cmd::filter_json_string(&raw, 5) {
-        Ok(schema) => {
-            println!("{}", schema);
-            schema
-        }
-        Err(_) => {
-            // Not JSON, print truncated raw output
-            let mut result = String::new();
-            let lines: Vec<&str> = raw.lines().take(20).collect();
-            let joined = lines.join("\n");
-            result.push_str(&joined);
-            print!("{}", joined);
-            if raw.lines().count() > 20 {
-                result.push_str("\n... (truncated)");
-                println!("\n... (truncated)");
-            }
-            result
-        }
-    };
+    // Compact preview: truncate strings >200 chars, limit arrays >5 items
+    let filtered = compact_json_preview(&raw, 200);
+    println!("{}", filtered);
 
     timer.track("gh api", "rtk gh api", &raw, &filtered);
     Ok(())
@@ -1134,5 +1139,148 @@ mod tests {
     fn test_ok_confirmation_pr_edit() {
         let result = ok_confirmation("edited", "#42");
         assert_eq!(result, "ok edited #42");
+    }
+
+    // --- gh api filtering tests ---
+
+    #[test]
+    fn test_has_jq_or_template_with_jq() {
+        let args: Vec<String> = vec!["repos/o/r/pulls".into(), "--jq".into(), ".[].body".into()];
+        assert!(has_jq_or_template(&args));
+    }
+
+    #[test]
+    fn test_has_jq_or_template_with_template() {
+        let args: Vec<String> = vec![
+            "repos/o/r/pulls".into(),
+            "--template".into(),
+            "{{.body}}".into(),
+        ];
+        assert!(has_jq_or_template(&args));
+    }
+
+    #[test]
+    fn test_has_jq_or_template_without() {
+        let args: Vec<String> = vec!["repos/o/r/pulls".into(), "--paginate".into()];
+        assert!(!has_jq_or_template(&args));
+    }
+
+    #[test]
+    fn test_compact_json_preview_truncates_long_strings() {
+        let long_body = "a".repeat(300);
+        let input = serde_json::json!({"title": "short", "body": long_body});
+        let result = compact_json_preview(&input.to_string(), 200);
+        assert!(result.contains("short"), "should keep short values");
+        assert!(
+            !result.contains(&"a".repeat(300)),
+            "should truncate long strings"
+        );
+    }
+
+    #[test]
+    fn test_compact_json_preview_limits_arrays() {
+        let items: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"id": i, "title": format!("item-{}", i)}))
+            .collect();
+        let input = serde_json::Value::Array(items).to_string();
+        let result = compact_json_preview(&input, 200);
+        assert!(result.contains("item-0"), "should have first item");
+        assert!(result.contains("item-4"), "should have 5th item");
+        assert!(result.contains("...15 more"), "should show remaining count");
+        assert!(!result.contains("item-19"), "should not have last item");
+    }
+
+    #[test]
+    fn test_compact_json_preview_preserves_small_json() {
+        let input = serde_json::json!({"id": 1, "name": "test"}).to_string();
+        let result = compact_json_preview(&input, 200);
+        assert!(result.contains("1"));
+        assert!(result.contains("test"));
+    }
+
+    #[test]
+    fn test_compact_json_preview_invalid_json() {
+        let result = compact_json_preview("not json at all\nline two", 200);
+        assert!(result.contains("not json at all"));
+        assert!(result.contains("line two"));
+    }
+
+    #[test]
+    fn test_compact_json_preview_nested_truncation() {
+        let long_b = "b".repeat(500);
+        let input = serde_json::json!({
+            "comments": [
+                {"user": "alice", "body": long_b},
+                {"user": "bob", "body": "short"}
+            ]
+        });
+        let result = compact_json_preview(&input.to_string(), 200);
+        assert!(result.contains("alice"), "should keep short nested values");
+        assert!(result.contains("bob"));
+        assert!(result.contains("short"));
+        assert!(
+            !result.contains(&"b".repeat(500)),
+            "should truncate nested long strings"
+        );
+    }
+}
+
+// --- Pure functions for gh api filtering ---
+
+/// Check if args contain --jq or --template (user-side filtering)
+fn has_jq_or_template(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--jq" || a == "-q" || a == "--template" || a == "-t")
+}
+
+/// Compact JSON preview: truncate long strings, limit arrays, keep all keys.
+/// Falls back to raw text (no truncation) if input is not valid JSON.
+fn compact_json_preview(raw: &str, max_str_len: usize) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(val) => {
+            let compacted = compact_value(val, max_str_len);
+            serde_json::to_string_pretty(&compacted).unwrap_or_else(|_| raw.to_string())
+        }
+        Err(_) => raw.to_string(), // not JSON — return as-is
+    }
+}
+
+/// Recursively compact a JSON Value: truncate strings, limit arrays.
+fn compact_value(val: serde_json::Value, max_str_len: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) if s.len() > max_str_len => {
+            // truncate long string values
+            let truncated = format!("{}...", &s[..max_str_len.min(s.len())]);
+            Value::String(truncated)
+        }
+        Value::Array(arr) => {
+            let total = arr.len();
+            const MAX_ITEMS: usize = 5;
+            if total > MAX_ITEMS {
+                let mut kept: Vec<Value> = arr
+                    .into_iter()
+                    .take(MAX_ITEMS)
+                    .map(|v| compact_value(v, max_str_len))
+                    .collect();
+                let remaining = total - MAX_ITEMS;
+                kept.push(Value::String(format!("...{} more", remaining)));
+                Value::Array(kept)
+            } else {
+                Value::Array(
+                    arr.into_iter()
+                        .map(|v| compact_value(v, max_str_len))
+                        .collect(),
+                )
+            }
+        }
+        Value::Object(map) => {
+            let compacted = map
+                .into_iter()
+                .map(|(k, v)| (k, compact_value(v, max_str_len)))
+                .collect();
+            Value::Object(compacted)
+        }
+        other => other, // numbers, booleans, null — pass through
     }
 }

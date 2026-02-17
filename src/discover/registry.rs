@@ -50,7 +50,7 @@ pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
 // Patterns ordered to match RTK_RULES indices exactly.
 const PATTERNS: &[&str] = &[
     r"^git\s+(?:(?:-C|-c)\s+[^[:space:]]+\s+|--[a-z-]+(?:=[^[:space:]]+)?\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|cherry-pick|remote|merge-base|rev-parse|ls-files|merge|rebase|rm)(\s|$)",
-    r"^gh\s+(pr|issue|run|repo|api)",
+    r"^gh\s+(pr|issue|run|repo|api|release)",
     r"^(?:[^[:space:]]+/)?cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
     r"^(?:[^[:space:]]+/)?(grepai|rgai)\s+search(\s|$)",
     r"^(?:[^[:space:]]+/)?(rgai)\s+",
@@ -118,8 +118,14 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk gh",
         category: "GitHub",
         savings_pct: 82.0,
-        subcmd_savings: &[("pr", 87.0), ("run", 82.0), ("issue", 80.0)],
-        subcmd_status: &[],
+        subcmd_savings: &[
+            ("pr", 87.0),
+            ("run", 82.0),
+            ("issue", 80.0),
+            ("api", 33.0),
+            ("release", 82.0),
+        ],
+        subcmd_status: &[("release", super::report::RtkStatus::Passthrough)],
     },
     RtkRule {
         rtk_cmd: "rtk cargo",
@@ -1347,5 +1353,57 @@ mod tests {
     fn test_split_heredoc_no_split() {
         let cmd = "cat <<'EOF'\nhello && world\nEOF";
         assert_eq!(split_command_chain(cmd), vec![cmd]);
+    }
+
+    // --- gh subcommand classification tests ---
+
+    #[test]
+    fn test_classify_gh_release() {
+        assert_eq!(
+            classify_command("gh release list"),
+            Classification::Supported {
+                rtk_equivalent: "rtk gh",
+                category: "GitHub",
+                estimated_savings_pct: 82.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_gh_repo() {
+        assert_eq!(
+            classify_command("gh repo view"),
+            Classification::Supported {
+                rtk_equivalent: "rtk gh",
+                category: "GitHub",
+                estimated_savings_pct: 82.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_gh_api() {
+        assert_eq!(
+            classify_command("gh api repos/owner/repo/pulls"),
+            Classification::Supported {
+                rtk_equivalent: "rtk gh",
+                category: "GitHub",
+                estimated_savings_pct: 33.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_registry_covers_all_gh_subcommands() {
+        for subcmd in ["pr", "issue", "run", "repo", "api", "release"] {
+            let cmd = format!("gh {subcmd} list");
+            match classify_command(&cmd) {
+                Classification::Supported { .. } => {}
+                other => panic!("gh {subcmd} should be Supported, got {other:?}"),
+            }
+        }
     }
 }

@@ -1,3 +1,4 @@
+mod build_cmd;
 mod bun_cmd;
 mod cargo_cmd;
 mod cc_economics;
@@ -29,6 +30,7 @@ mod lint_cmd;
 mod local_llm;
 mod log_cmd;
 mod ls;
+mod memory_layer;
 mod next_cmd;
 mod npm_cmd;
 mod parser;
@@ -175,6 +177,12 @@ enum Commands {
         output: write_cmd::OutputMode,
         #[command(subcommand)]
         command: WriteCommands,
+    },
+
+    /// Build/install/verify rtk binaries (native replacement for rtk-build.sh)
+    Build {
+        #[command(subcommand)]
+        command: BuildCommands,
     },
 
     /// GitHub CLI (gh) commands with token-optimized output
@@ -555,6 +563,12 @@ enum Commands {
         format: String,
     },
 
+    /// Shared project memory, cache artifacts, and incremental deltas
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+
     /// Learn CLI corrections from Claude Code error history
     Learn {
         /// Filter by project path (substring match)
@@ -816,6 +830,40 @@ enum WriteCommands {
 }
 
 #[derive(Subcommand)]
+enum BuildCommands {
+    /// Full build pipeline compatible with legacy rtk-build.sh options
+    Sh {
+        /// Project root containing Cargo.toml
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Skip `cargo build`
+        #[arg(long)]
+        no_debug: bool,
+        /// Skip `cargo build --release`
+        #[arg(long)]
+        no_release: bool,
+        /// Skip install to ~/.cargo/bin/rtk
+        #[arg(long)]
+        skip_user: bool,
+        /// Skip install to /usr/local/bin/rtk
+        #[arg(long)]
+        skip_usr_local: bool,
+        /// Set /usr/local/bin/rtk -> ~/.cargo/bin/rtk symlink
+        #[arg(long)]
+        symlink_usr_local: bool,
+        /// Update package version in Cargo.toml before build
+        #[arg(long)]
+        set_version: Option<String>,
+        /// Skip post-build verification
+        #[arg(long)]
+        no_verify: bool,
+        /// Never invoke sudo
+        #[arg(long)]
+        no_sudo: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum PnpmCommands {
     /// List installed packages (ultra-dense)
     List {
@@ -1021,6 +1069,101 @@ enum GoCommands {
     /// Passthrough: runs any unsupported go subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Build/reuse project index and return context slice
+    Explore {
+        /// Project root to index
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Force full rehash and rebuild
+        #[arg(long)]
+        refresh: bool,
+        /// Response detail level
+        #[arg(long, value_enum, default_value = "compact")]
+        detail: memory_layer::DetailLevel,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Relevance filter: general, bugfix, feature, refactor, incident
+        #[arg(long, value_enum, default_value = "general")]
+        query_type: memory_layer::QueryType, // E2.3
+    },
+    /// Return only changed files/modules since last artifact
+    Delta {
+        /// Project root to inspect
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Response detail level
+        #[arg(long, value_enum, default_value = "compact")]
+        detail: memory_layer::DetailLevel,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Relevance filter: general, bugfix, feature, refactor, incident
+        #[arg(long, value_enum, default_value = "general")]
+        query_type: memory_layer::QueryType, // E2.3
+    },
+    /// Force artifact rebuild and persist fresh snapshot
+    Refresh {
+        /// Project root to refresh
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Response detail level
+        #[arg(long, value_enum, default_value = "compact")]
+        detail: memory_layer::DetailLevel,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Relevance filter: general, bugfix, feature, refactor, incident
+        #[arg(long, value_enum, default_value = "general")]
+        query_type: memory_layer::QueryType, // E2.3
+    },
+    /// Poll project and emit deltas continuously
+    Watch {
+        /// Project root to watch
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Poll interval in seconds
+        #[arg(long, default_value = "2")]
+        interval: u64,
+        /// Response detail level
+        #[arg(long, value_enum, default_value = "compact")]
+        detail: memory_layer::DetailLevel,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Relevance filter: general, bugfix, feature, refactor, incident
+        #[arg(long, value_enum, default_value = "general")]
+        query_type: memory_layer::QueryType, // E2.3
+    },
+
+    /// Show cache status (FRESH/STALE, files, bytes, age)
+    Status {
+        /// Project root to inspect (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// Remove cached artifacts for this project
+    Clear {
+        /// Project root to clear (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// Register rtk-mem-context.sh as PreToolUse:Task hook in ~/.claude/settings.json
+    #[command(name = "install-hook")]
+    InstallHook {
+        /// Uninstall instead of install
+        #[arg(long)]
+        uninstall: bool,
+        /// Show current hook status without changing anything
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 fn run_npx_passthrough(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
@@ -1319,6 +1462,37 @@ fn main() -> Result<()> {
                     concurrency,
                 };
                 write_cmd::run_batch(&plan, params)?;
+            }
+        },
+
+        Commands::Build { command } => match command {
+            BuildCommands::Sh {
+                root,
+                no_debug,
+                no_release,
+                skip_user,
+                skip_usr_local,
+                symlink_usr_local,
+                set_version,
+                no_verify,
+                no_sudo,
+            } => {
+                let use_sudo =
+                    !no_sudo && std::env::var("RTK_BUILD_NO_SUDO").ok().as_deref() != Some("1");
+                build_cmd::run_sh(
+                    build_cmd::BuildShOptions {
+                        root,
+                        build_debug: !no_debug,
+                        build_release: !no_release,
+                        install_user: !skip_user,
+                        install_usr_local: !skip_usr_local,
+                        verify: !no_verify,
+                        symlink_usr_local,
+                        use_sudo,
+                        set_version,
+                    },
+                    cli.verbose,
+                )?;
             }
         },
 
@@ -1697,6 +1871,66 @@ fn main() -> Result<()> {
         } => {
             discover::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
         }
+
+        Commands::Memory { command } => match command {
+            MemoryCommands::Explore {
+                project,
+                refresh,
+                detail,
+                format,
+                query_type, // E2.3
+            } => {
+                memory_layer::run_explore(
+                    &project,
+                    refresh,
+                    detail,
+                    &format,
+                    query_type,
+                    cli.verbose,
+                )?;
+            }
+            MemoryCommands::Delta {
+                project,
+                detail,
+                format,
+                query_type, // E2.3
+            } => {
+                memory_layer::run_delta(&project, detail, &format, query_type, cli.verbose)?;
+            }
+            MemoryCommands::Refresh {
+                project,
+                detail,
+                format,
+                query_type, // E2.3
+            } => {
+                memory_layer::run_refresh(&project, detail, &format, query_type, cli.verbose)?;
+            }
+            MemoryCommands::Watch {
+                project,
+                interval,
+                detail,
+                format,
+                query_type, // E2.3
+            } => {
+                memory_layer::run_watch(
+                    &project,
+                    interval,
+                    detail,
+                    &format,
+                    query_type,
+                    cli.verbose,
+                )?;
+            }
+            MemoryCommands::Status { project } => {
+                memory_layer::run_status(&project, cli.verbose)?;
+            }
+            MemoryCommands::Clear { project } => {
+                memory_layer::run_clear(&project, cli.verbose)?;
+            }
+            MemoryCommands::InstallHook { uninstall, status } => {
+                memory_layer::run_install_hook(uninstall, status, cli.verbose)?;
+            }
+        },
 
         Commands::Learn {
             project,

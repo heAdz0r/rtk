@@ -30,6 +30,7 @@ The upstream rtk is a solid token-reduction proxy. This fork takes the concept f
 |-------|-------------|-----------|
 | **Search** | `grep` with regex | `rgai` — semantic intent-aware search with multi-tier fallback |
 | **Read** | Basic filtering + line ranges | Modular pipeline: cache, digest, symbols, changed, outline modes |
+| **Memory** | None | Shared project artifacts + incremental deltas (`rtk memory`) |
 | **Write** | No write path | Atomic I/O with `write_core`, CAS, durability modes, `rtk write` command |
 | **Git** | Compact output | + Semantic parity for mutating commands (exit code + side-effect fidelity) |
 | **Hooks** | Auto-rewrite | + Audit logging, mutating command guardrails, classification system |
@@ -205,6 +206,11 @@ git clone https://github.com/heAdz0r/rtk.git
 cd rtk
 cargo install --path .
 
+# Native build pipeline (replacement for ./rtk-build.sh)
+rtk build sh --set-version 0.20.1-fork.7
+# or (from repo root, same behavior)
+./rtk-build.sh --set-version 0.20.1-fork.7
+
 # Verify
 rtk --version   # Should show 0.20.1-fork.4 or newer
 rtk gain         # Token savings stats
@@ -359,6 +365,11 @@ rtk discover                     # Find missed savings (current project)
 rtk discover --all               # All Claude Code projects
 rtk discover --format json       # Machine-readable
 
+rtk memory explore .             # Build/reuse shared context artifact
+rtk memory delta .               # Emit changed files/modules only
+rtk memory refresh .             # Force full reindex and persist
+rtk memory watch . --interval 2  # Continuous low-noise delta stream
+
 rtk json config.json             # Structure without values
 rtk deps                         # Dependencies summary
 rtk env -f AWS                   # Filtered env vars
@@ -465,6 +476,7 @@ database_path = "/path/to/custom.db"
 | [**FORK.md**](FORK.md) | Fork architectural deep-dive — all changes vs upstream |
 | [**ARCHITECTURE.md**](ARCHITECTURE.md) | Full system architecture and module map |
 | [**CHANGELOG.md**](CHANGELOG.md) | Version history |
+| [docs/rtk-memory-v0.1.md](docs/rtk-memory-v0.1.md) | Shared-memory/delta layer specification |
 | [docs/read-improvements.md](docs/read-improvements.md) | Read pipeline architecture plan |
 | [docs/write-improvements.md](docs/write-improvements.md) | Write infrastructure specification |
 | [docs/new-commands.md](docs/new-commands.md) | Guide for adding new commands |
