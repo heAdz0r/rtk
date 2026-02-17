@@ -1,6 +1,8 @@
 use crate::tracking;
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
     if args.is_empty() {
@@ -33,19 +35,19 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
         .status
         .code()
         .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let filtered = filter_bun_output(&raw);
+    let rendered = render_bun_output(args, &raw);
 
     if let Some(hint) = crate::tee::tee_and_hint(&raw, "bun", exit_code) {
-        println!("{}\n{}", filtered, hint);
+        println!("{}\n{}", rendered, hint);
     } else {
-        println!("{}", filtered);
+        println!("{}", rendered);
     }
 
     timer.track(
         &format!("bun {}", args.join(" ")),
         &format!("rtk bun {}", args.join(" ")),
         &raw,
-        &filtered,
+        &rendered,
     );
 
     if !output.status.success() {
@@ -53,6 +55,26 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_bun_output(args: &[String], output: &str) -> String {
+    // Version/short commands should stay as-is.
+    if matches!(args.first().map(|s| s.as_str()), Some("--version" | "-v")) {
+        return filter_bun_output(output);
+    }
+
+    let filtered = filter_bun_output(output);
+    let is_noisy = filtered.lines().count() > 80
+        || output.contains("Test Files")
+        || output.contains("vite v")
+        || output.contains("modules transformed")
+        || output.contains("vite-plugin-compression");
+
+    if is_noisy {
+        summarize_bun_output(args, output)
+    } else {
+        filtered
+    }
 }
 
 fn filter_bun_output(output: &str) -> String {
@@ -85,6 +107,93 @@ fn filter_bun_output(output: &str) -> String {
     }
 }
 
+fn summarize_bun_output(args: &[String], output: &str) -> String {
+    static TEST_FILES_RE: OnceLock<Regex> = OnceLock::new();
+    static TESTS_RE: OnceLock<Regex> = OnceLock::new();
+    static MODULES_RE: OnceLock<Regex> = OnceLock::new();
+    static BUILT_RE: OnceLock<Regex> = OnceLock::new();
+
+    let test_files_re = TEST_FILES_RE.get_or_init(|| {
+        Regex::new(r"^\s*Test Files\s+(\d+)\s+passed(?:\s+\((\d+)\))?")
+            .expect("invalid TEST_FILES_RE")
+    });
+    let tests_re = TESTS_RE.get_or_init(|| {
+        Regex::new(r"^\s*Tests\s+(\d+)\s+passed(?:\s+\((\d+)\))?").expect("invalid TESTS_RE")
+    });
+    let modules_re = MODULES_RE
+        .get_or_init(|| Regex::new(r"^\s*✓\s+(\d+)\s+modules transformed\.").expect("invalid"));
+    let built_re =
+        BUILT_RE.get_or_init(|| Regex::new(r"^\s*✓\s+built in ([0-9.]+s)").expect("invalid"));
+
+    let mut test_files: Option<(usize, usize)> = None;
+    let mut tests: Option<(usize, usize)> = None;
+    let mut modules: Option<usize> = None;
+    let mut build_duration: Option<String> = None;
+
+    for line in output.lines() {
+        if let Some(caps) = test_files_re.captures(line) {
+            let passed = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let total = caps
+                .get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(passed);
+            test_files = Some((passed, total));
+            continue;
+        }
+        if let Some(caps) = tests_re.captures(line) {
+            let passed = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let total = caps
+                .get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(passed);
+            tests = Some((passed, total));
+            continue;
+        }
+        if let Some(caps) = modules_re.captures(line) {
+            modules = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+            continue;
+        }
+        if let Some(caps) = built_re.captures(line) {
+            build_duration = caps.get(1).map(|m| m.as_str().to_string());
+            continue;
+        }
+    }
+
+    let mut parts = Vec::new();
+    if let Some((passed, total)) = tests {
+        parts.push(format!("tests: {passed}/{total}"));
+    }
+    if let Some((passed, total)) = test_files {
+        parts.push(format!("files: {passed}/{total}"));
+    }
+    if let Some(m) = modules {
+        parts.push(format!("modules: {m}"));
+    }
+    if let Some(d) = build_duration {
+        parts.push(format!("build: {d}"));
+    }
+
+    let headline = if parts.is_empty() {
+        format!("✓ bun {}", args.join(" "))
+    } else {
+        format!("✓ bun {} ({})", args.join(" "), parts.join(", "))
+    };
+
+    let diag = crate::diag_summary::analyze_output(output);
+    format!(
+        "{}\n{}\n{}",
+        headline,
+        diag.warnings_line(),
+        diag.errors_line()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +219,28 @@ Done in 0.27s
         let output = "1.2.0\n";
         let result = filter_bun_output(output);
         assert_eq!(result, "1.2.0");
+    }
+
+    #[test]
+    fn test_summarize_bun_build_compact() {
+        let output = r#"
+bun run v1.2.0
+$ vitest run && vite build
+Test Files  1 passed (1)
+Tests  10 passed (10)
+✓ 2748 modules transformed.
+✓ built in 4.88s
+dist/assets/index.js 147.72 kB
+"#;
+        let args = vec!["run".to_string(), "build".to_string()];
+        let result = summarize_bun_output(&args, output);
+        assert!(result.contains("✓ bun run build"));
+        assert!(result.contains("tests: 10/10"));
+        assert!(result.contains("files: 1/1"));
+        assert!(result.contains("modules: 2748"));
+        assert!(result.contains("build: 4.88s"));
+        assert!(result.contains("warnings: 0"));
+        assert!(result.contains("errors: 0"));
+        assert!(!result.contains("dist/assets/index.js"));
     }
 }

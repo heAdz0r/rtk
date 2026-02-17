@@ -711,6 +711,12 @@ impl AggregatedTestResult {
 
 /// Filter cargo test output - show failures + summary only
 fn filter_cargo_test(output: &str) -> String {
+    let diag = crate::diag_summary::analyze_output(output);
+
+    fn with_diag(base: String, diag: &crate::diag_summary::DiagnosticSummary) -> String {
+        format!("{}\n{}\n{}", base, diag.warnings_line(), diag.errors_line())
+    }
+
     let mut failures: Vec<String> = Vec::new();
     let mut summary_lines: Vec<String> = Vec::new();
     let mut in_failure_section = false;
@@ -785,7 +791,7 @@ fn filter_cargo_test(output: &str) -> String {
         if all_parsed {
             if let Some(agg) = aggregated {
                 if agg.suites > 0 {
-                    return agg.format_compact();
+                    return with_diag(agg.format_compact(), &diag);
                 }
             }
         }
@@ -794,7 +800,7 @@ fn filter_cargo_test(output: &str) -> String {
         for line in &summary_lines {
             result.push_str(&format!("✓ {}\n", line));
         }
-        return result.trim().to_string();
+        return with_diag(result.trim().to_string(), &diag);
     }
 
     if !failures.is_empty() {
@@ -824,7 +830,7 @@ fn filter_cargo_test(output: &str) -> String {
         }
     }
 
-    result.trim().to_string()
+    with_diag(result.trim().to_string(), &diag)
 }
 
 /// Filter cargo clippy output - group warnings by lint rule
@@ -999,8 +1005,31 @@ test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
             "Expected compact format, got: {}",
             result
         );
+        assert!(result.contains("warnings: 0"));
+        assert!(result.contains("errors: 0"));
         assert!(!result.contains("Compiling"));
         assert!(!result.contains("test utils"));
+    }
+
+    #[test]
+    fn test_filter_cargo_test_compact_warning_summary_with_files() {
+        let output = r#"warning: unused variable: `start`
+   --> src/init.rs:561:17
+warning: constant `BILLION` is never used
+  --> src/cc_economics.rs:17:7
+warning: `rtk` (bin "rtk" test) generated 17 warnings
+
+running 2 tests
+test foo::a ... ok
+test foo::b ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"#;
+        let result = filter_cargo_test(output);
+        assert!(result.contains("✓ cargo test: 2 passed (1 suite, 0.01s)"));
+        assert!(result.contains("warnings: 17"));
+        assert!(result.contains("src/init.rs"));
+        assert!(result.contains("src/cc_economics.rs"));
+        assert!(result.contains("errors: 0"));
     }
 
     #[test]

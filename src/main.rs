@@ -6,6 +6,7 @@ mod config;
 mod container;
 mod curl_cmd;
 mod deps;
+mod diag_summary;
 mod diff_cmd;
 mod discover;
 mod display_helpers;
