@@ -4,11 +4,14 @@ use crate::write_lock::FileLockGuard; // changed: import flock guard for concurr
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
+use memchr::memmem::Finder;
 use serde::Serialize;
 use serde_json::ser::{PrettyFormatter, Serializer};
 use serde_json::{Map, Value as JsonValue};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use toml::Value as TomlValue;
@@ -211,26 +214,30 @@ fn format_response_msg(resp: &WriteResponse, op: &str) -> String {
 enum WriteAttempt {
     /// Computed new content to write (updated_content, applied_count)
     Success(String, usize),
-    /// No match found — retryable if content was stale
-    NoMatch(String),
+    /// Retryable conflict (transient, can be retried with backoff)
+    #[allow(dead_code)]
+    RetryableConflict(String),
+    /// Deterministic terminal error that must not be retried
+    TerminalError { code: &'static str, hint: String },
     /// Content unchanged (no-op)
     Unchanged,
 }
 
 /// Core retry-with-lock function for concurrent write safety. // changed: new function
 /// Acquires flock, reads file, runs compute_fn, writes with optional CAS verification.
-/// Retries on NoMatch or CAS conflict with exponential backoff.
+/// Retries only retryable conflicts (CAS or explicit conflict) with exponential backoff.
 fn locked_write<F>(
     file: &Path,
     params: WriteParams,
     op_name: &str,
-    compute_fn: F,
+    mut compute_fn: F,
 ) -> Result<(WriteResponse, String)>
 where
-    F: Fn(&str) -> WriteAttempt,
+    F: FnMut(&str) -> WriteAttempt,
 {
     let max_retries = params.concurrency.max_retries;
     let use_cas = params.concurrency.cas || max_retries > 0; // auto-enable CAS when retries > 0
+    let strict_hash = params.concurrency.cas; // hash only for explicit strict CAS mode
 
     for attempt in 0..=max_retries {
         // Always acquire flock (transparent, ~0.1ms overhead)
@@ -239,9 +246,9 @@ where
         let content = fs::read_to_string(file)
             .with_context(|| format!("Failed to read {}", file.display()))?;
 
-        // Snapshot for CAS verification (before compute)
+        // Build CAS snapshot from in-memory content to avoid an extra file re-read.
         let snapshot = if use_cas {
-            crate::write_core::snapshot_file(file, true)?
+            crate::write_core::snapshot_from_content(file, content.as_bytes(), strict_hash)?
         } else {
             None
         };
@@ -296,14 +303,17 @@ where
                     }
                 }
             }
-            WriteAttempt::NoMatch(msg) => {
+            WriteAttempt::RetryableConflict(msg) => {
                 if attempt < max_retries {
                     drop(_guard); // release lock before sleeping
                     let backoff = Duration::from_millis(50 * 2u64.pow(attempt).min(8));
                     thread::sleep(backoff);
                     continue;
                 }
-                return Err(write_error("NO_MATCH", &msg, params.output));
+                return Err(write_error("CONFLICT", &msg, params.output));
+            }
+            WriteAttempt::TerminalError { code, hint } => {
+                return Err(write_error(code, &hint, params.output));
             }
             WriteAttempt::Unchanged => {
                 return Ok((WriteResponse::noop(op_name), content));
@@ -333,6 +343,17 @@ fn write_tracking_args<'a>(
     (file_content, rtk_msg, "rtk write")
 }
 
+fn write_tracking_enabled() -> bool {
+    static WRITE_TRACKING_ENABLED: OnceLock<bool> = OnceLock::new();
+    *WRITE_TRACKING_ENABLED.get_or_init(|| match std::env::var("RTK_WRITE_TRACKING") {
+        Ok(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => true,
+    })
+}
+
 pub fn run_replace(
     file: &Path,
     from: &str,
@@ -340,7 +361,7 @@ pub fn run_replace(
     all: bool,
     params: WriteParams,
 ) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
+    let timer = write_tracking_enabled().then(tracking::TimedExecution::start);
     if from.is_empty() {
         return Err(write_error(
             "EMPTY_PATTERN",
@@ -354,7 +375,10 @@ pub fn run_replace(
     let to_owned = to.to_string();
     let (resp, content) = locked_write(file, params, "replace", |content| {
         if !content.contains(from_owned.as_str()) {
-            return WriteAttempt::NoMatch("no matches for --from".to_string());
+            return WriteAttempt::TerminalError {
+                code: "NO_MATCH",
+                hint: "no matches for --from".to_string(),
+            };
         }
         let (updated, count) = if all {
             replace_all_counted(content, &from_owned, &to_owned)
@@ -369,13 +393,15 @@ pub fn run_replace(
 
     let msg = format_response_msg(&resp, "replace");
     resp.render(params.output, &msg);
-    let (ti, to_str, tc) = write_tracking_args("replace", &content, &msg);
-    timer.track(&format!("write replace {}", file.display()), tc, ti, to_str);
+    if let Some(timer) = timer.as_ref() {
+        let (ti, to_str, tc) = write_tracking_args("replace", &content, &msg);
+        timer.track(&format!("write replace {}", file.display()), tc, ti, to_str);
+    }
     Ok(())
 }
 
 pub fn run_patch(file: &Path, old: &str, new: &str, all: bool, params: WriteParams) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
+    let timer = write_tracking_enabled().then(tracking::TimedExecution::start);
     if old.is_empty() {
         return Err(write_error(
             "EMPTY_PATTERN",
@@ -389,7 +415,10 @@ pub fn run_patch(file: &Path, old: &str, new: &str, all: bool, params: WritePara
     let new_owned = new.to_string();
     let (resp, content) = locked_write(file, params, "patch", |content| {
         if !content.contains(old_owned.as_str()) {
-            return WriteAttempt::NoMatch("hunk not found".to_string());
+            return WriteAttempt::TerminalError {
+                code: "NO_MATCH",
+                hint: "hunk not found".to_string(),
+            };
         }
         let (updated, count) = if all {
             replace_all_counted(content, &old_owned, &new_owned)
@@ -404,8 +433,10 @@ pub fn run_patch(file: &Path, old: &str, new: &str, all: bool, params: WritePara
 
     let msg = format_response_msg(&resp, "patch");
     resp.render(params.output, &msg);
-    let (ti, to_str, tc) = write_tracking_args("patch", &content, &msg);
-    timer.track(&format!("write patch {}", file.display()), tc, ti, to_str);
+    if let Some(timer) = timer.as_ref() {
+        let (ti, to_str, tc) = write_tracking_args("patch", &content, &msg);
+        timer.track(&format!("write patch {}", file.display()), tc, ti, to_str);
+    }
     Ok(())
 }
 
@@ -417,7 +448,7 @@ pub fn run_set(
     format: ConfigFormat,
     params: WriteParams,
 ) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
+    let timer = write_tracking_enabled().then(tracking::TimedExecution::start);
     let format = resolve_format(file, format)?;
 
     // changed: delegate to locked_write for flock + CAS + retry
@@ -428,31 +459,62 @@ pub fn run_set(
             ConfigFormat::Json => {
                 let mut root: JsonValue = match serde_json::from_str(content) {
                     Ok(v) => v,
-                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid JSON: {}", e)),
+                    Err(e) => {
+                        return WriteAttempt::TerminalError {
+                            code: "INVALID_JSON",
+                            hint: format!("Invalid JSON: {}", e),
+                        };
+                    }
                 };
                 let parsed = match parse_json_value(&value_owned, value_type) {
                     Ok(v) => v,
-                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid value: {}", e)),
+                    Err(e) => {
+                        return WriteAttempt::TerminalError {
+                            code: "INVALID_VALUE",
+                            hint: format!("Invalid value: {}", e),
+                        };
+                    }
                 };
                 if let Err(e) = set_json_path(&mut root, &key_owned, parsed) {
-                    return WriteAttempt::NoMatch(e.to_string());
+                    return WriteAttempt::TerminalError {
+                        code: "INVALID_KEY_PATH",
+                        hint: e.to_string(),
+                    };
                 }
                 match serialize_json_preserving_style(&root, content) {
                     Ok(s) => s,
-                    Err(e) => return WriteAttempt::NoMatch(e.to_string()),
+                    Err(e) => {
+                        return WriteAttempt::TerminalError {
+                            code: "SERIALIZE_JSON",
+                            hint: e.to_string(),
+                        };
+                    }
                 }
             }
             ConfigFormat::Toml => {
                 let mut root: DocumentMut = match content.parse::<DocumentMut>() {
                     Ok(v) => v,
-                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid TOML: {}", e)),
+                    Err(e) => {
+                        return WriteAttempt::TerminalError {
+                            code: "INVALID_TOML",
+                            hint: format!("Invalid TOML: {}", e),
+                        };
+                    }
                 };
                 let parsed = match parse_toml_value(&value_owned, value_type) {
                     Ok(v) => v,
-                    Err(e) => return WriteAttempt::NoMatch(format!("Invalid value: {}", e)),
+                    Err(e) => {
+                        return WriteAttempt::TerminalError {
+                            code: "INVALID_VALUE",
+                            hint: format!("Invalid value: {}", e),
+                        };
+                    }
                 };
                 if let Err(e) = set_toml_path(&mut root, &key_owned, parsed) {
-                    return WriteAttempt::NoMatch(e.to_string());
+                    return WriteAttempt::TerminalError {
+                        code: "INVALID_KEY_PATH",
+                        hint: e.to_string(),
+                    };
                 }
                 root.to_string()
             }
@@ -466,8 +528,10 @@ pub fn run_set(
 
     let msg = format_response_msg(&resp, "set");
     resp.render(params.output, &msg);
-    let (ti, to_str, tc) = write_tracking_args("set", &content, &msg);
-    timer.track(&format!("write set {}", file.display()), tc, ti, to_str);
+    if let Some(timer) = timer.as_ref() {
+        let (ti, to_str, tc) = write_tracking_args("set", &content, &msg);
+        timer.track(&format!("write set {}", file.display()), tc, ti, to_str);
+    }
     Ok(())
 }
 
@@ -477,7 +541,7 @@ pub fn run_batch(
     plan_json: &str,
     params: WriteParams, // changed: bundled dry_run/fast/verbose/output into WriteParams
 ) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
+    let timer = write_tracking_enabled().then(tracking::TimedExecution::start);
 
     let ops: Vec<BatchOp> =
         serde_json::from_str(plan_json).context("Failed to parse batch plan JSON")?;
@@ -487,12 +551,23 @@ pub fn run_batch(
     }
 
     let total = ops.len();
+    let grouped_indices = group_batch_indices_by_file(&ops);
+    let mut outcomes: Vec<Option<Result<usize, String>>> = vec![None; total];
+
+    for indices in grouped_indices {
+        for (idx, result) in execute_batch_file_group(&ops, &indices, params) {
+            outcomes[idx] = Some(result);
+        }
+    }
+
     let mut applied = 0usize;
     let mut failed = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
-        let result = execute_batch_op(op, params.dry_run, params.fast);
+        let result = outcomes[i]
+            .take()
+            .unwrap_or_else(|| Err("batch internal error: missing operation outcome".to_string()));
         match result {
             Ok(count) => {
                 applied += count;
@@ -541,13 +616,15 @@ pub fn run_batch(
     };
     resp.render(params.output, &concise_msg);
 
-    let (_, _, tc) = write_tracking_args("batch", plan_json, &concise_msg); // changed: normalize cmd
-    timer.track(
-        &format!("write batch ({})", total),
-        tc,
-        plan_json,
-        &concise_msg,
-    );
+    if let Some(timer) = timer.as_ref() {
+        let (_, _, tc) = write_tracking_args("batch", plan_json, &concise_msg); // changed: normalize cmd
+        timer.track(
+            &format!("write batch ({})", total),
+            tc,
+            plan_json,
+            &concise_msg,
+        );
+    }
 
     if failed == total {
         bail!("All {} batch operations failed", total);
@@ -555,12 +632,84 @@ pub fn run_batch(
     Ok(())
 }
 
-/// Execute a single batch operation, return applied count.
-/// Uses flock for concurrent safety. // changed: added flock
-fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
-    // Acquire flock for each batch operation // changed: flock per-op
-    let _guard = FileLockGuard::acquire(&op.file)?;
+fn group_batch_indices_by_file(ops: &[BatchOp]) -> Vec<Vec<usize>> {
+    let mut by_file: HashMap<PathBuf, usize> = HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(group_idx) = by_file.get(&op.file) {
+            groups[*group_idx].push(idx);
+            continue;
+        }
+        let next_idx = groups.len();
+        by_file.insert(op.file.clone(), next_idx);
+        groups.push(vec![idx]);
+    }
+    groups
+}
 
+fn execute_batch_file_group(
+    ops: &[BatchOp],
+    indices: &[usize],
+    params: WriteParams,
+) -> Vec<(usize, Result<usize, String>)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let file = &ops[indices[0]].file;
+    let mut op_results: Vec<(usize, Result<usize, String>)> = Vec::new();
+    let mut write_params = params;
+    write_params.output = OutputMode::Quiet;
+
+    let write_result = locked_write(file, write_params, "batch", |content| {
+        let mut working = content.to_string();
+        let mut total_applied = 0usize;
+        let mut computed_results: Vec<(usize, Result<usize, String>)> =
+            Vec::with_capacity(indices.len());
+
+        for idx in indices {
+            let op = &ops[*idx];
+            match apply_batch_op_in_memory(op, &working) {
+                Ok(BatchApplyResult::Applied { updated, count }) => {
+                    working = updated;
+                    total_applied += count;
+                    computed_results.push((*idx, Ok(count)));
+                }
+                Ok(BatchApplyResult::Noop) => {
+                    computed_results.push((*idx, Ok(0)));
+                }
+                Err(err) => {
+                    computed_results.push((*idx, Err(err.to_string())));
+                }
+            }
+        }
+
+        op_results = computed_results;
+        if total_applied == 0 {
+            WriteAttempt::Unchanged
+        } else {
+            WriteAttempt::Success(working, total_applied)
+        }
+    });
+
+    match write_result {
+        Ok(_) => op_results,
+        Err(err) => {
+            let msg = err.to_string();
+            indices
+                .iter()
+                .map(|idx| (*idx, Err(msg.clone())))
+                .collect::<Vec<_>>()
+        }
+    }
+}
+
+enum BatchApplyResult {
+    Applied { updated: String, count: usize },
+    Noop,
+}
+
+fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyResult> {
     match op.op.as_str() {
         "replace" => {
             let from = op
@@ -574,9 +723,6 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             if from.is_empty() {
                 bail!("batch replace: 'from' must be non-empty");
             }
-
-            let content = fs::read_to_string(&op.file)
-                .with_context(|| format!("Failed to read {}", op.file.display()))?;
             if !content.contains(from) {
                 bail!("NO_MATCH");
             }
@@ -588,13 +734,9 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             };
 
             if updated == content {
-                return Ok(0);
+                return Ok(BatchApplyResult::Noop);
             }
-            if dry_run {
-                return Ok(count);
-            }
-            write_text(&op.file, &updated, fast)?;
-            Ok(count)
+            Ok(BatchApplyResult::Applied { updated, count })
         }
         "patch" => {
             let old = op
@@ -608,9 +750,6 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             if old.is_empty() {
                 bail!("batch patch: 'old' must be non-empty");
             }
-
-            let content = fs::read_to_string(&op.file)
-                .with_context(|| format!("Failed to read {}", op.file.display()))?;
             if !content.contains(old) {
                 bail!("NO_MATCH");
             }
@@ -622,13 +761,9 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             };
 
             if updated == content {
-                return Ok(0);
+                return Ok(BatchApplyResult::Noop);
             }
-            if dry_run {
-                return Ok(count);
-            }
-            write_text(&op.file, &updated, fast)?;
-            Ok(count)
+            Ok(BatchApplyResult::Applied { updated, count })
         }
         "set" => {
             let key = op
@@ -655,9 +790,6 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
             };
             let fmt = resolve_format(&op.file, fmt)?;
 
-            let content = fs::read_to_string(&op.file)
-                .with_context(|| format!("Failed to read {}", op.file.display()))?;
-
             let updated = match fmt {
                 ConfigFormat::Json => {
                     let mut root: JsonValue = serde_json::from_str(&content)
@@ -675,11 +807,10 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
                 ConfigFormat::Auto => unreachable!(),
             };
 
-            if dry_run {
-                return Ok(1);
+            if updated == content {
+                return Ok(BatchApplyResult::Noop);
             }
-            write_text(&op.file, &updated, fast)?;
-            Ok(1)
+            Ok(BatchApplyResult::Applied { updated, count: 1 })
         }
         other => bail!("Unknown batch operation: '{}'", other),
     }
@@ -687,10 +818,20 @@ fn execute_batch_op(op: &BatchOp, dry_run: bool, fast: bool) -> Result<usize> {
 
 /// P0-2: single-pass replace that returns (result, count) without pre-scanning
 fn replace_all_counted(content: &str, from: &str, to: &str) -> (String, usize) {
+    if from.is_empty() {
+        return (content.to_string(), 0);
+    }
+
+    let finder = Finder::new(from.as_bytes());
+    let mut starts = finder.find_iter(content.as_bytes());
+    let Some(first_start) = starts.next() else {
+        return (content.to_string(), 0);
+    };
+
     let mut result = String::with_capacity(content.len());
     let mut count = 0usize;
-    let mut last_end = 0;
-    for (start, _) in content.match_indices(from) {
+    let mut last_end = 0usize;
+    for start in std::iter::once(first_start).chain(starts) {
         result.push_str(&content[last_end..start]);
         result.push_str(to);
         count += 1;
@@ -712,18 +853,6 @@ fn resolve_format(file: &Path, format: ConfigFormat) -> Result<ConfigFormat> {
             file.display()
         ),
     }
-}
-
-fn write_text(file: &Path, updated: &str, fast: bool) -> Result<crate::write_core::WriteStats> {
-    // P0-1: caller already verified content differs — skip redundant is_unchanged re-read
-    let mut options = if fast {
-        WriteOptions::fast()
-    } else {
-        WriteOptions::durable()
-    };
-    options.idempotent_skip = false; // caller guarantees content changed
-    let writer = AtomicWriter::new(options);
-    writer.write_str(file, updated)
 }
 
 fn parse_json_value(raw: &str, value_type: ConfigValueType) -> Result<JsonValue> {
@@ -919,6 +1048,8 @@ fn detect_json_indent(original: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     /// Test-only helper: default WriteParams for concise, fast, quiet tests
@@ -1101,6 +1232,13 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_counted_unicode_safe() {
+        let (result, count) = replace_all_counted("привет мир привет", "привет", "hello");
+        assert_eq!(result, "hello мир hello");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn quiet_mode_produces_no_stdout() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("quiet.txt");
@@ -1214,6 +1352,22 @@ mod tests {
         run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap(); // changed: use WriteParams
         let v: JsonValue = serde_json::from_str(&fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(v["b"], JsonValue::from(2));
+    }
+
+    #[test]
+    fn batch_same_file_ops_are_applied_in_memory_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("batchsame.txt");
+        fs::write(&f, "a b c d").unwrap();
+
+        let plan = serde_json::json!([
+            {"op":"replace","file": f.to_str().unwrap(), "from":"b","to":"B"},
+            {"op":"replace","file": f.to_str().unwrap(), "from":"x","to":"X"},
+            {"op":"patch","file": f.to_str().unwrap(), "old":"c","new":"C"}
+        ]);
+
+        run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "a B C d");
     }
 
     #[test]
@@ -1331,7 +1485,10 @@ mod tests {
 
         let (resp, _content) = locked_write(&file, tp(OutputMode::Quiet), "replace", |content| {
             if !content.contains("hello") {
-                return WriteAttempt::NoMatch("no match".to_string());
+                return WriteAttempt::TerminalError {
+                    code: "NO_MATCH",
+                    hint: "no match".to_string(),
+                };
             }
             WriteAttempt::Success(content.replacen("hello", "hi", 1), 1)
         })
@@ -1344,20 +1501,33 @@ mod tests {
     }
 
     #[test]
-    fn locked_write_no_match_with_retry() {
+    fn locked_write_terminal_error_does_not_retry() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("lock_nomatch.txt");
         fs::write(&file, "hello world").unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
 
         let err = locked_write(
             &file,
-            tp_retry(OutputMode::Quiet, 1),
+            tp_retry(OutputMode::Quiet, 3),
             "replace",
-            |_content| WriteAttempt::NoMatch("pattern not found".to_string()),
+            move |_content| {
+                attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                WriteAttempt::TerminalError {
+                    code: "NO_MATCH",
+                    hint: "pattern not found".to_string(),
+                }
+            },
         )
         .unwrap_err();
 
         assert!(err.to_string().contains("NO_MATCH"));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "terminal errors must not trigger retry loop"
+        );
     }
 
     #[test]

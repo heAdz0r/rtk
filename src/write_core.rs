@@ -1,11 +1,10 @@
 use anyhow::{bail, Context, Result};
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File, Metadata};
-use std::hash::Hasher;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::NamedTempFile;
+use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -152,10 +151,12 @@ impl AtomicWriter {
             )
         })?;
 
-        let existing_meta = if path.exists() {
-            Some(fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?)
-        } else {
-            None
+        let existing_meta = match fs::metadata(path) {
+            Ok(meta) => Some(meta),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to stat {}", path.display()));
+            }
         };
 
         if let Some(cas) = &self.options.cas {
@@ -233,12 +234,11 @@ impl AtomicWriter {
 
 pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnapshot>> {
     // changed: removed dead_code — now used by locked_write
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let metadata =
-        fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("Failed to stat {}", path.display())),
+    };
     let modified = metadata.modified().ok();
     let hash = if include_hash {
         Some(hash_file(path)?)
@@ -250,6 +250,25 @@ pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnaps
         len: Some(metadata.len()),
         modified,
         hash,
+    }))
+}
+
+/// Build a CAS snapshot from already-read file content, avoiding a second file read.
+pub fn snapshot_from_content(
+    path: &Path,
+    content: &[u8],
+    include_hash: bool,
+) -> Result<Option<FileSnapshot>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("Failed to stat {}", path.display())),
+    };
+
+    Ok(Some(FileSnapshot {
+        len: Some(metadata.len()),
+        modified: metadata.modified().ok(),
+        hash: include_hash.then(|| hash_bytes(content)),
     }))
 }
 
@@ -341,16 +360,14 @@ fn file_equals_bytes(path: &Path, expected: &[u8]) -> Result<bool> {
 }
 
 fn hash_bytes(content: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(content);
-    hasher.finish()
+    xxh3_64(content)
 }
 
 pub fn hash_file(path: &Path) -> Result<u64> {
     // changed: pub for CAS snapshot verification in write_cmd
     let mut file = File::open(path)
         .with_context(|| format!("Failed to read existing file {}", path.display()))?;
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Xxh3::new();
     let mut buf = [0u8; 8192];
     loop {
         let n = file
@@ -359,9 +376,9 @@ pub fn hash_file(path: &Path) -> Result<u64> {
         if n == 0 {
             break;
         }
-        hasher.write(&buf[..n]);
+        hasher.update(&buf[..n]);
     }
-    Ok(hasher.finish())
+    Ok(hasher.digest())
 }
 
 #[cfg(unix)]
@@ -479,5 +496,20 @@ mod tests {
         let stats = writer.write_str(&path, "world").unwrap();
         assert!(!stats.skipped_unchanged);
         assert_eq!(fs::read_to_string(&path).unwrap(), "world");
+    }
+
+    #[test]
+    fn snapshot_from_content_hash_matches_file_hash() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hash.txt");
+        fs::write(&path, "hash me").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let snapshot = snapshot_from_content(&path, content.as_bytes(), true)
+            .unwrap()
+            .unwrap();
+        let file_hash = hash_file(&path).unwrap();
+
+        assert_eq!(snapshot.hash, Some(file_hash));
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 /// File-level lock guard using sidecar `.rtk-lock` files.
@@ -24,8 +24,12 @@ impl FileLockGuard {
                 .with_context(|| format!("Failed to create lock dir {}", parent.display()))?;
         }
 
-        let file = File::create(&lock_path)
-            .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
 
         // Blocking exclusive lock — waits if another process holds it
         file.lock_exclusive()
