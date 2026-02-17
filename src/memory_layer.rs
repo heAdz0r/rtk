@@ -435,10 +435,7 @@ pub fn run_watch(
             let response = build_response("watch", &state, detail, false, query_type);
             print_response(&response, format)?;
         } else if verbose > 0 {
-            eprintln!(
-                "memory.watch project={} clean",
-                project.to_string_lossy()
-            );
+            eprintln!("memory.watch project={} clean", project.to_string_lossy());
         }
     }
 }
@@ -2370,17 +2367,35 @@ dependencies = ["requests>=2.28", "flask==2.0.0", "numpy"]
     #[test]
     fn watch_path_ignores_excluded_dirs() {
         let project = Path::new("/home/user/myproject");
-        assert!(!should_watch_abs_path(project, Path::new("/home/user/myproject/target/debug/rtk")));
-        assert!(!should_watch_abs_path(project, Path::new("/home/user/myproject/node_modules/lodash/index.js")));
-        assert!(!should_watch_abs_path(project, Path::new("/home/user/myproject/.git/COMMIT_EDITMSG")));
-        assert!(should_watch_abs_path(project, Path::new("/home/user/myproject/src/main.rs")));
-        assert!(should_watch_abs_path(project, Path::new("/home/user/myproject/Cargo.toml")));
+        assert!(!should_watch_abs_path(
+            project,
+            Path::new("/home/user/myproject/target/debug/rtk")
+        ));
+        assert!(!should_watch_abs_path(
+            project,
+            Path::new("/home/user/myproject/node_modules/lodash/index.js")
+        ));
+        assert!(!should_watch_abs_path(
+            project,
+            Path::new("/home/user/myproject/.git/COMMIT_EDITMSG")
+        ));
+        assert!(should_watch_abs_path(
+            project,
+            Path::new("/home/user/myproject/src/main.rs")
+        ));
+        assert!(should_watch_abs_path(
+            project,
+            Path::new("/home/user/myproject/Cargo.toml")
+        ));
     }
 
     #[test]
     fn watch_path_ignores_outside_project() {
         let project = Path::new("/home/user/myproject");
-        assert!(!should_watch_abs_path(project, Path::new("/tmp/other_file.rs")));
+        assert!(!should_watch_abs_path(
+            project,
+            Path::new("/tmp/other_file.rs")
+        ));
     }
 
     #[test]
