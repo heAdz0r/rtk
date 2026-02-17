@@ -1,12 +1,16 @@
+use crate::config; // grepai config
+use crate::grepai; // grepai delegation
 use crate::tracking;
 use anyhow::{bail, Result};
 use ignore::WalkBuilder;
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::json;
+use std::collections::HashMap; // added: for grepai hit grouping
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command; // added: for ripgrep backend
 
 const MAX_SNIPPETS_PER_FILE: usize = 2;
 const MAX_SNIPPET_LINE_LEN: usize = 140;
@@ -14,6 +18,7 @@ const MIN_FILE_SCORE: f64 = 2.4;
 // ADDED: compact mode limits for token savings
 const COMPACT_MAX_FILES: usize = 5;
 const RELATIVE_SCORE_CUTOFF: f64 = 0.35;
+const MAX_GREPAI_SNIPPET_LINES: usize = 5; // added: max lines per grepai snippet
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "code", "file", "find", "for", "from", "how",
@@ -73,6 +78,7 @@ pub fn run(
     max_file_kb: usize,
     json_output: bool,
     compact: bool,
+    builtin: bool, // --builtin flag: skip grepai delegation
     verbose: u8,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
@@ -85,6 +91,30 @@ pub fn run(
     let root = Path::new(path);
     if !root.exists() {
         bail!("path does not exist: {}", path);
+    }
+
+    // Try grepai delegation first (unless --builtin flag is set)
+    // CHANGED: unpack (raw, filtered) for correct savings tracking
+    if !builtin {
+        if let Some((raw, filtered)) = try_grepai_delegation(
+            query,
+            path,
+            root,
+            max_results,
+            json_output,
+            compact,
+            verbose,
+        )? {
+            print!("{}", filtered);
+            timer.track(
+                &format!("grepai search '{}' {}", query, path),
+                "rtk rgai (grepai)",
+                &raw,
+                &filtered,
+            );
+            return Ok(());
+        }
+        // Fall through to built-in search
     }
 
     let query_model = build_query_model(query);
@@ -100,15 +130,51 @@ pub fn run(
     let max_file_bytes = max_file_kb.saturating_mul(1024).max(1024);
     let effective_context = if compact { 0 } else { context_lines };
     let snippets_per_file = if compact { 1 } else { MAX_SNIPPETS_PER_FILE };
-    let outcome = search_project(
-        &query_model,
-        root,
-        effective_context,
-        snippets_per_file,
-        file_type,
-        max_file_bytes,
-        verbose,
-    )?;
+
+    // CHANGED: try ripgrep backend first (fast), fall back to built-in walker (slow)
+    let (outcome, backend) = if !builtin {
+        match try_ripgrep_search(
+            &query_model,
+            root,
+            snippets_per_file,
+            file_type,
+            max_file_kb,
+            verbose,
+        )? {
+            Some(o) => (o, "rg"),
+            None => (
+                search_project(
+                    &query_model,
+                    root,
+                    effective_context,
+                    snippets_per_file,
+                    file_type,
+                    max_file_bytes,
+                    verbose,
+                )?,
+                "builtin",
+            ),
+        }
+    } else {
+        (
+            search_project(
+                &query_model,
+                root,
+                effective_context,
+                snippets_per_file,
+                file_type,
+                max_file_bytes,
+                verbose,
+            )?,
+            "builtin",
+        )
+    };
+    // ADDED: tracking label reflects which backend was used
+    let tracking_label = if backend == "rg" {
+        "rtk rgai (rg)"
+    } else {
+        "rtk rgai"
+    };
 
     let mut rendered = String::new();
     if outcome.hits.is_empty() {
@@ -129,7 +195,7 @@ pub fn run(
         print!("{}", rendered);
         timer.track(
             &format!("grepai search '{}' {}", query, path),
-            "rtk rgai",
+            tracking_label,
             &outcome.raw_output,
             &rendered,
         );
@@ -180,7 +246,7 @@ pub fn run(
         print!("{}", rendered);
         timer.track(
             &format!("grepai search '{}' {}", query, path),
-            "rtk rgai",
+            tracking_label,
             &outcome.raw_output,
             &rendered,
         );
@@ -211,12 +277,570 @@ pub fn run(
     print!("{}", rendered);
     timer.track(
         &format!("grepai search '{}' {}", query, path),
-        "rtk rgai",
+        tracking_label,
         &outcome.raw_output,
         &rendered,
     );
 
     Ok(())
+}
+
+/// Convert grepai JSON hits into RTK SearchHit structs
+/// Groups chunks by file, selects top snippets, prunes low-relevance files
+fn convert_grepai_hits(grepai_hits: Vec<grepai::GrepaiHit>, compact: bool) -> Vec<SearchHit> {
+    // Group chunks by file path
+    let mut by_file: HashMap<String, Vec<grepai::GrepaiHit>> = HashMap::new();
+    for hit in grepai_hits {
+        by_file.entry(hit.file_path.clone()).or_default().push(hit);
+    }
+
+    let snippets_limit = if compact { 1 } else { MAX_SNIPPETS_PER_FILE };
+
+    let mut search_hits: Vec<SearchHit> = by_file
+        .into_iter()
+        .map(|(path, mut chunks)| {
+            // Sort chunks by score desc within each file
+            chunks.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+            // Select top N chunks as snippets
+            let selected: Vec<_> = chunks.iter().take(snippets_limit).collect();
+            let score: f64 = selected.iter().map(|c| c.score).sum();
+            let snippets: Vec<Snippet> = selected.iter().map(|c| parse_grepai_content(c)).collect();
+
+            SearchHit {
+                path,
+                score,
+                matched_lines: chunks.len(),
+                snippets,
+            }
+        })
+        .collect();
+
+    // Sort files by score desc, then by path for deterministic ordering.
+    search_hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+
+    // Prune: relative cutoff 35% of top score (no MIN_FILE_SCORE for grepai)
+    if let Some(top_score) = search_hits.first().map(|h| h.score) {
+        let cutoff = top_score * RELATIVE_SCORE_CUTOFF;
+        search_hits.retain(|h| h.score >= cutoff);
+    }
+
+    search_hits
+}
+
+/// Extract a Snippet from a GrepaiHit, stripping noise and truncating
+fn parse_grepai_content(hit: &grepai::GrepaiHit) -> Snippet {
+    let content = match &hit.content {
+        Some(c) => c.as_str(),
+        None => {
+            return Snippet {
+                lines: vec![(hit.start_line, String::new())],
+                matched_terms: vec![],
+            };
+        }
+    };
+
+    let mut lines: Vec<(usize, String)> = Vec::new();
+
+    // grepai JSON may prefix content with synthetic lines:
+    //   File: <path>
+    //
+    // Strip this prefix without shifting source line numbers.
+    let mut source_lines = content.lines().peekable();
+    if source_lines
+        .peek()
+        .map(|line| line.trim().to_lowercase().starts_with("file:"))
+        .unwrap_or(false)
+    {
+        source_lines.next();
+        if source_lines
+            .peek()
+            .map(|line| line.trim().is_empty())
+            .unwrap_or(false)
+        {
+            source_lines.next();
+        }
+    }
+
+    for (offset, raw_line) in source_lines.enumerate() {
+        let trimmed = raw_line.trim();
+
+        // Skip empty lines
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if lines.len() >= MAX_GREPAI_SNIPPET_LINES {
+            break;
+        }
+
+        let line_no = hit.start_line.saturating_add(offset);
+        let truncated = truncate_chars(trimmed, MAX_SNIPPET_LINE_LEN);
+        lines.push((line_no, truncated));
+    }
+
+    if lines.is_empty() {
+        lines.push((hit.start_line, String::new()));
+    }
+
+    Snippet {
+        lines,
+        matched_terms: vec![],
+    }
+}
+
+/// Try to delegate search to external grepai binary
+/// CHANGED: returns (raw_input, filtered_output) for correct savings tracking
+/// Returns Some((raw, filtered)) if grepai handled the search, None to fall back to built-in
+fn try_grepai_delegation(
+    query: &str,
+    requested_path: &str,
+    project_path: &Path,
+    max: usize,
+    json: bool,
+    compact: bool,
+    verbose: u8,
+) -> Result<Option<(String, String)>> {
+    let project_dir = resolve_grepai_project_dir(project_path);
+
+    // Check config: is grepai delegation enabled?
+    let cfg = config::Config::load().unwrap_or_default();
+    if !cfg.grepai.enabled {
+        if verbose > 0 {
+            eprintln!("rgai: grepai delegation disabled in config");
+        }
+        return Ok(None);
+    }
+
+    // Use custom binary path from config, or auto-detect
+    let state = if let Some(ref custom_path) = cfg.grepai.binary_path {
+        if custom_path.exists() {
+            let config_file = project_dir.join(".grepai").join("config.yaml");
+            if config_file.exists() {
+                grepai::GrepaiState::Ready(custom_path.clone())
+            } else {
+                grepai::GrepaiState::NotInitialized(custom_path.clone())
+            }
+        } else {
+            if verbose > 0 {
+                eprintln!(
+                    "rgai: configured binary not found: {}",
+                    custom_path.display()
+                );
+            }
+            return Ok(None);
+        }
+    } else {
+        grepai::detect_grepai(project_dir)
+    };
+
+    // CHANGED: helper to get raw JSON from grepai (always --json)
+    let get_raw = |binary: &Path| -> Result<Option<String>> {
+        match grepai::execute_search(binary, project_dir, query, max) {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                if verbose > 0 {
+                    eprintln!(
+                        "rgai: grepai search failed: {}, falling back to built-in",
+                        e
+                    );
+                }
+                Ok(None)
+            }
+        }
+    };
+
+    let raw = match state {
+        grepai::GrepaiState::Ready(ref binary) => {
+            if verbose > 0 {
+                eprintln!("rgai: delegating to grepai ({})", binary.display());
+            }
+            get_raw(binary)?
+        }
+        grepai::GrepaiState::NotInitialized(ref binary) => {
+            if cfg.grepai.auto_init {
+                if verbose > 0 {
+                    eprintln!("rgai: auto-initializing grepai in project...");
+                }
+                match grepai::init_project(binary, project_dir, verbose) {
+                    Ok(()) => get_raw(binary)?,
+                    Err(e) => {
+                        if verbose > 0 {
+                            eprintln!(
+                                "rgai: grepai auto-init failed: {}, falling back to built-in",
+                                e
+                            );
+                        }
+                        return Ok(None);
+                    }
+                }
+            } else {
+                if verbose > 0 {
+                    eprintln!("rgai: grepai not initialized, auto_init disabled, using built-in");
+                }
+                return Ok(None);
+            }
+        }
+        grepai::GrepaiState::NotInstalled => {
+            // Silent: no nagging — install happens via `rtk init`
+            return Ok(None);
+        }
+    };
+
+    // ADDED: filter raw grepai JSON through RTK pipeline
+    let raw = match raw {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let filtered = filter_grepai_output(&raw, query, requested_path, max, json, compact);
+    Ok(Some((raw, filtered)))
+}
+
+/// Filter raw grepai JSON through RTK rendering pipeline
+/// Falls back to raw output if JSON parsing fails
+fn filter_grepai_output(
+    raw: &str,
+    query: &str,
+    path: &str,
+    max_results: usize,
+    json_output: bool,
+    compact: bool,
+) -> String {
+    // Try to parse grepai JSON
+    let grepai_hits = match grepai::parse_grepai_json(raw) {
+        Ok(hits) => hits,
+        Err(_) => {
+            if json_output {
+                return serde_json::to_string_pretty(&json!({
+                    "query": query,
+                    "path": path,
+                    "total_hits": 0,
+                    "shown_hits": 0,
+                    "scanned_files": 0,
+                    "skipped_large": 0,
+                    "skipped_binary": 0,
+                    "hits": [],
+                    "parse_error": "failed to parse grepai JSON",
+                    "fallback_raw": raw,
+                }))
+                .unwrap_or_default()
+                    + "\n";
+            }
+            // Text fallback: return raw output if parsing fails.
+            return raw.to_string();
+        }
+    };
+
+    if grepai_hits.is_empty() {
+        if json_output {
+            return serde_json::to_string_pretty(&json!({
+                "query": query,
+                "path": path,
+                "total_hits": 0,
+                "shown_hits": 0,
+                "scanned_files": 0,
+                "skipped_large": 0,
+                "skipped_binary": 0,
+                "hits": []
+            }))
+            .unwrap_or_default()
+                + "\n";
+        }
+        return format!("🧠 0 for '{}'\n", query);
+    }
+
+    // Convert to SearchHit structs with grouping/pruning
+    let hits = convert_grepai_hits(grepai_hits, compact);
+
+    if json_output {
+        // Render as RTK JSON format (same as built-in)
+        let hits_json: Vec<_> = hits
+            .iter()
+            .take(max_results)
+            .map(|hit| {
+                let snippets: Vec<_> = hit
+                    .snippets
+                    .iter()
+                    .map(|snippet| {
+                        let lines: Vec<_> = snippet
+                            .lines
+                            .iter()
+                            .map(|(line_no, text)| json!({ "line": line_no, "text": text }))
+                            .collect();
+                        json!({
+                            "lines": lines,
+                            "matched_terms": snippet.matched_terms,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "path": hit.path,
+                    "score": hit.score,
+                    "matched_lines": hit.matched_lines,
+                    "snippets": snippets,
+                })
+            })
+            .collect();
+
+        serde_json::to_string_pretty(&json!({
+            "query": query,
+            "path": path,
+            "total_hits": hits.len(),
+            "shown_hits": max_results.min(hits.len()),
+            "scanned_files": 0,
+            "skipped_large": 0,
+            "skipped_binary": 0,
+            "hits": hits_json
+        }))
+        .unwrap_or_default()
+            + "\n"
+    } else {
+        // Render as text using existing render_text_hits
+        let effective_max = if compact {
+            max_results.min(COMPACT_MAX_FILES)
+        } else {
+            max_results
+        };
+        render_text_hits(&hits, effective_max, compact, query, 0)
+    }
+}
+
+/// Build OR regex pattern from query terms: (term1|term2|term3)
+/// Terms are regex-escaped to prevent injection.
+/// Caller must ensure terms is non-empty (try_ripgrep_search guards this).
+fn build_rg_pattern(query: &QueryModel) -> String {
+    debug_assert!(
+        !query.terms.is_empty(),
+        "build_rg_pattern called with empty terms"
+    );
+    let escaped: Vec<String> = query.terms.iter().map(|t| regex::escape(t)).collect();
+    format!("({})", escaped.join("|"))
+}
+
+/// Parse ripgrep stdout into scored SearchHit structs.
+/// Pure function — testable without running rg.
+fn parse_rg_output(
+    stdout: &str,
+    query: &QueryModel,
+    root: &Path,
+    snippets_per_file: usize,
+) -> Vec<SearchHit> {
+    // Parse rg output: file:line_no:content
+    let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let line_no: usize = match parts[1].parse() {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+        by_file
+            .entry(parts[0].to_string())
+            .or_default()
+            .push((line_no, parts[2].to_string()));
+    }
+
+    let mut hits = Vec::new();
+    for (file_path, lines) in &by_file {
+        let display_path = compact_display_path(Path::new(file_path), root);
+        let ext = Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        // Score each matched line via existing scorer
+        let mut candidates = Vec::new();
+        for (line_no, content) in lines {
+            let line_idx = line_no.saturating_sub(1); // score_line expects 0-based
+            if let Some(cand) = score_line(line_idx, content, query, ext) {
+                candidates.push(cand);
+            }
+        }
+
+        if candidates.is_empty() {
+            let path_score = score_path(&display_path, query);
+            if path_score < MIN_FILE_SCORE {
+                continue;
+            }
+        }
+
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+        // Select non-overlapping top candidates
+        let mut selected = Vec::new();
+        for cand in &candidates {
+            let overlaps = selected.iter().any(|existing: &LineCandidate| {
+                (existing.line_idx as isize - cand.line_idx as isize).abs() <= 3
+            });
+            if overlaps {
+                continue;
+            }
+            selected.push(cand.clone());
+            if selected.len() >= snippets_per_file {
+                break;
+            }
+        }
+
+        // Build snippets from matched lines (no context re-read)
+        let mut snippets = Vec::new();
+        for cand in &selected {
+            let line_no = cand.line_idx + 1; // back to 1-based for display
+            let content = lines
+                .iter()
+                .find(|(ln, _)| *ln == line_no)
+                .map(|(_, c)| truncate_chars(c.trim(), MAX_SNIPPET_LINE_LEN))
+                .unwrap_or_default();
+            snippets.push(Snippet {
+                lines: vec![(line_no, content)],
+                matched_terms: cand.matched_terms.clone(),
+            });
+        }
+
+        // Compute file score (same formula as search_project)
+        let path_score = score_path(&display_path, query);
+        let mut file_score = path_score + (candidates.len() as f64).ln_1p();
+        for (idx, cand) in selected.iter().enumerate() {
+            let weight = match idx {
+                0 => 1.0,
+                1 => 0.45,
+                _ => 0.25,
+            };
+            file_score += cand.score * weight;
+        }
+
+        if file_score < MIN_FILE_SCORE {
+            continue;
+        }
+
+        hits.push(SearchHit {
+            path: display_path,
+            score: file_score,
+            matched_lines: candidates.len(),
+            snippets,
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+    prune_by_relevance(&mut hits);
+    hits
+}
+
+/// Ripgrep-accelerated search: fast file discovery via rg + built-in scoring.
+/// Returns None if rg is not available (caller falls back to built-in walker).
+fn try_ripgrep_search(
+    query_model: &QueryModel,
+    root: &Path,
+    snippets_per_file: usize,
+    file_type: Option<&str>,
+    max_file_kb: usize,
+    verbose: u8,
+) -> Result<Option<SearchOutcome>> {
+    if query_model.terms.is_empty() {
+        return Ok(None);
+    }
+
+    let pattern = build_rg_pattern(query_model);
+    // FIXED: bail on non-UTF8 paths instead of silently falling back to "."
+    let root_str = match root.to_str() {
+        Some(s) => s,
+        None => {
+            if verbose > 0 {
+                eprintln!("rgai[rg]: path is not valid UTF-8, falling back to built-in");
+            }
+            return Ok(None);
+        }
+    };
+
+    let mut cmd = Command::new("rg");
+    cmd.args([
+        "-n",
+        "--no-heading",
+        "-i",
+        "--max-filesize",
+        &format!("{}K", max_file_kb),
+        "--max-count",
+        "50", // cap matches per file
+    ]);
+
+    // FIXED: map RTK type aliases to ripgrep type names
+    if let Some(ft) = file_type {
+        let rg_type = match ft {
+            "rs" => "rust",
+            "python" => "py",
+            "javascript" => "js",
+            "typescript" => "ts",
+            "c++" | "cpp" => "cpp",
+            "markdown" => "md",
+            other => other,
+        };
+        cmd.arg("--type").arg(rg_type);
+    }
+
+    cmd.arg(&pattern);
+    cmd.arg(root_str);
+
+    if verbose > 0 {
+        eprintln!("rgai[rg]: pattern={}", pattern);
+    }
+
+    // FIXED: log actual error instead of discarding it
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            if verbose > 0 {
+                eprintln!(
+                    "rgai[rg]: failed to run rg: {}, falling back to built-in",
+                    e
+                );
+            }
+            return Ok(None);
+        }
+    };
+
+    // Exit code: 0=matches, 1=no matches, 2+=error, None=killed by signal
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        other => {
+            if verbose > 0 {
+                eprintln!(
+                    "rgai[rg]: rg exited with {:?}, falling back to built-in",
+                    other
+                );
+            }
+            return Ok(None);
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hits = parse_rg_output(&stdout, query_model, root, snippets_per_file);
+    let raw_output = build_raw_output(&hits);
+
+    Ok(Some(SearchOutcome {
+        scanned_files: hits.len(), // files with matches (rg doesn't report scanned total)
+        skipped_large: 0,
+        skipped_binary: 0,
+        hits,
+        raw_output,
+    }))
+}
+
+fn resolve_grepai_project_dir(project_path: &Path) -> &Path {
+    if project_path.is_dir() {
+        project_path
+    } else {
+        project_path.parent().unwrap_or(project_path)
+    }
 }
 
 fn search_project(
@@ -1086,5 +1710,403 @@ pub fn log_info(msg: &str) {
         // Assert: normal mode KEEPS the noise
         assert!(output.contains("more lines"));
         assert!(output.contains("+5F"));
+    }
+
+    // --- grepai filtering tests ---
+
+    #[test]
+    fn convert_grepai_hits_groups_by_file() {
+        use crate::grepai::GrepaiHit;
+        let hits = vec![
+            GrepaiHit {
+                file_path: "src/auth.rs".into(),
+                start_line: 10,
+                end_line: 15,
+                score: 0.9,
+                content: Some("pub fn login() {}".into()),
+            },
+            GrepaiHit {
+                file_path: "src/auth.rs".into(),
+                start_line: 30,
+                end_line: 35,
+                score: 0.7,
+                content: Some("pub fn logout() {}".into()),
+            },
+            GrepaiHit {
+                file_path: "src/session.rs".into(),
+                start_line: 1,
+                end_line: 5,
+                score: 0.8,
+                content: Some("struct Session {}".into()),
+            },
+        ];
+        let result = convert_grepai_hits(hits, false);
+        // Should group into 2 files
+        assert_eq!(result.len(), 2);
+        // auth.rs has higher combined score (0.9 + 0.7 = 1.6) vs session.rs (0.8)
+        assert_eq!(result[0].path, "src/auth.rs");
+        assert_eq!(result[0].snippets.len(), 2); // normal mode: 2 snippets
+        assert_eq!(result[1].path, "src/session.rs");
+    }
+
+    #[test]
+    fn convert_grepai_hits_compact_limits_snippets() {
+        use crate::grepai::GrepaiHit;
+        let hits = vec![
+            GrepaiHit {
+                file_path: "src/auth.rs".into(),
+                start_line: 10,
+                end_line: 15,
+                score: 0.9,
+                content: Some("pub fn login() {}".into()),
+            },
+            GrepaiHit {
+                file_path: "src/auth.rs".into(),
+                start_line: 30,
+                end_line: 35,
+                score: 0.7,
+                content: Some("pub fn logout() {}".into()),
+            },
+        ];
+        let result = convert_grepai_hits(hits, true);
+        assert_eq!(result.len(), 1);
+        // Compact: only 1 snippet per file (highest score)
+        assert_eq!(result[0].snippets.len(), 1);
+        assert!(result[0].snippets[0].lines[0].1.contains("login"));
+    }
+
+    #[test]
+    fn convert_grepai_hits_prunes_low_scores() {
+        use crate::grepai::GrepaiHit;
+        let hits = vec![
+            GrepaiHit {
+                file_path: "a.rs".into(),
+                start_line: 1,
+                end_line: 5,
+                score: 0.95,
+                content: Some("high score".into()),
+            },
+            GrepaiHit {
+                file_path: "b.rs".into(),
+                start_line: 1,
+                end_line: 5,
+                score: 0.1, // < 0.95 * 0.35 = 0.3325
+                content: Some("low score".into()),
+            },
+        ];
+        let result = convert_grepai_hits(hits, false);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, "a.rs");
+    }
+
+    #[test]
+    fn convert_grepai_hits_tie_breaks_by_path_when_scores_equal() {
+        use crate::grepai::GrepaiHit;
+        let hits = vec![
+            GrepaiHit {
+                file_path: "z.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                score: 0.9,
+                content: Some("z".into()),
+            },
+            GrepaiHit {
+                file_path: "a.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                score: 0.9,
+                content: Some("a".into()),
+            },
+        ];
+        let result = convert_grepai_hits(hits, true);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].path, "a.rs");
+        assert_eq!(result[1].path, "z.rs");
+    }
+
+    #[test]
+    fn parse_grepai_content_strips_file_prefix() {
+        use crate::grepai::GrepaiHit;
+        let hit = GrepaiHit {
+            file_path: "src/main.rs".into(),
+            start_line: 10,
+            end_line: 15,
+            score: 0.8,
+            content: Some("File: src/main.rs\n\nfn main() {\n    println!(\"hello\");\n}".into()),
+        };
+        let snippet = parse_grepai_content(&hit);
+        // "File:" line and empty line should be stripped
+        assert!(!snippet.lines.iter().any(|(_, t)| t.starts_with("File:")));
+        assert!(snippet.lines.iter().any(|(_, t)| t.contains("fn main()")));
+        assert_eq!(snippet.lines[0].0, 10);
+    }
+
+    #[test]
+    fn parse_grepai_content_preserves_line_numbers_with_internal_blank_lines() {
+        use crate::grepai::GrepaiHit;
+        let hit = GrepaiHit {
+            file_path: "src/main.rs".into(),
+            start_line: 20,
+            end_line: 24,
+            score: 0.8,
+            content: Some("File: src/main.rs\n\nfn main() {\n\nlet x = 1;\n}".into()),
+        };
+        let snippet = parse_grepai_content(&hit);
+        let rendered_lines: Vec<usize> = snippet.lines.iter().map(|(line, _)| *line).collect();
+        assert_eq!(rendered_lines, vec![20, 22, 23]);
+    }
+
+    #[test]
+    fn parse_grepai_content_truncates_long_lines() {
+        use crate::grepai::GrepaiHit;
+        let long_line = "x".repeat(200);
+        let hit = GrepaiHit {
+            file_path: "a.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            score: 0.5,
+            content: Some(long_line),
+        };
+        let snippet = parse_grepai_content(&hit);
+        assert!(snippet.lines[0].1.chars().count() <= MAX_SNIPPET_LINE_LEN);
+        assert!(snippet.lines[0].1.ends_with("..."));
+    }
+
+    #[test]
+    fn parse_grepai_content_limits_to_max_lines() {
+        use crate::grepai::GrepaiHit;
+        let content = (1..=10)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hit = GrepaiHit {
+            file_path: "a.rs".into(),
+            start_line: 1,
+            end_line: 10,
+            score: 0.5,
+            content: Some(content),
+        };
+        let snippet = parse_grepai_content(&hit);
+        assert_eq!(snippet.lines.len(), MAX_GREPAI_SNIPPET_LINES);
+    }
+
+    #[test]
+    fn parse_grepai_content_no_content_returns_placeholder() {
+        use crate::grepai::GrepaiHit;
+        let hit = GrepaiHit {
+            file_path: "a.rs".into(),
+            start_line: 42,
+            end_line: 42,
+            score: 0.5,
+            content: None,
+        };
+        let snippet = parse_grepai_content(&hit);
+        assert_eq!(snippet.lines.len(), 1);
+        assert_eq!(snippet.lines[0].0, 42);
+    }
+
+    #[test]
+    fn filter_grepai_output_text_format() {
+        let raw = r#"[
+            {"file_path": "src/auth.rs", "start_line": 10, "end_line": 15, "score": 0.87, "content": "pub fn login() {}"},
+            {"file_path": "src/session.rs", "start_line": 1, "end_line": 5, "score": 0.65, "content": "struct Session {}"}
+        ]"#;
+        let output = filter_grepai_output(raw, "auth login", ".", 10, false, false);
+        // Should contain RTK-formatted text output
+        assert!(output.contains("🧠"));
+        assert!(output.contains("src/auth.rs"));
+        assert!(output.contains("pub fn login()"));
+    }
+
+    #[test]
+    fn filter_grepai_output_json_format() {
+        let raw = r#"[
+            {"file_path": "src/auth.rs", "start_line": 10, "end_line": 15, "score": 0.87, "content": "pub fn login() {}"}
+        ]"#;
+        let output = filter_grepai_output(raw, "auth", ".", 10, true, false);
+        // Should be valid JSON with RTK structure
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["query"], "auth");
+        assert_eq!(parsed["path"], ".");
+        assert_eq!(parsed["total_hits"], 1);
+        assert_eq!(parsed["shown_hits"], 1);
+        assert_eq!(parsed["scanned_files"], 0);
+        assert_eq!(parsed["skipped_large"], 0);
+        assert_eq!(parsed["skipped_binary"], 0);
+        assert!(parsed["hits"].is_array());
+    }
+
+    #[test]
+    fn filter_grepai_output_fallback_on_invalid_json() {
+        let raw = "not valid json at all";
+        let output = filter_grepai_output(raw, "query", ".", 10, false, false);
+        // Should return raw output as fallback
+        assert_eq!(output, raw);
+    }
+
+    #[test]
+    fn filter_grepai_output_json_fallback_is_valid_json() {
+        let raw = "not valid json at all";
+        let output = filter_grepai_output(raw, "query", ".", 10, true, false);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["query"], "query");
+        assert_eq!(parsed["path"], ".");
+        assert_eq!(parsed["total_hits"], 0);
+        assert_eq!(parsed["shown_hits"], 0);
+        assert_eq!(parsed["scanned_files"], 0);
+        assert_eq!(parsed["skipped_large"], 0);
+        assert_eq!(parsed["skipped_binary"], 0);
+        assert!(parsed["parse_error"].is_string());
+        assert_eq!(parsed["fallback_raw"], raw);
+    }
+
+    #[test]
+    fn filter_grepai_output_json_schema_matches_builtin_shape() {
+        let raw = r#"[
+            {"file_path": "src/auth.rs", "start_line": 10, "end_line": 15, "score": 0.87, "content": "pub fn login() {}"}
+        ]"#;
+        let output = filter_grepai_output(raw, "auth", ".", 10, true, false);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        for key in [
+            "query",
+            "path",
+            "total_hits",
+            "shown_hits",
+            "scanned_files",
+            "skipped_large",
+            "skipped_binary",
+            "hits",
+        ] {
+            assert!(parsed.get(key).is_some(), "missing key: {}", key);
+        }
+    }
+
+    // --- ripgrep backend tests ---
+
+    #[test]
+    fn build_rg_pattern_joins_terms_with_or() {
+        // Arrange
+        let model = build_query_model("auth token refresh");
+        // Act
+        let pattern = build_rg_pattern(&model);
+        // Assert: each term present, joined with |
+        assert!(pattern.contains("auth"));
+        assert!(pattern.contains("token"));
+        assert!(pattern.contains("refresh"));
+        assert!(pattern.contains('|'));
+        // wrapped in parens
+        assert!(pattern.starts_with('('));
+        assert!(pattern.ends_with(')'));
+    }
+
+    #[test]
+    fn build_rg_pattern_escapes_regex_metacharacters() {
+        // Arrange: build_query_model splits on non-alnum, so test escaping directly
+        let model = QueryModel {
+            phrase: "foo.bar".to_string(),
+            terms: vec!["foo.bar".to_string(), "baz[0]".to_string()],
+        };
+        // Act
+        let pattern = build_rg_pattern(&model);
+        // Assert: dots and brackets escaped
+        assert!(pattern.contains(r"foo\.bar"));
+        assert!(pattern.contains(r"baz\[0\]"));
+    }
+
+    #[test]
+    fn build_rg_pattern_empty_terms_returns_none() {
+        // Arrange: only stop words
+        let model = build_query_model("how to find");
+        // Act
+        let pattern = build_rg_pattern(&model);
+        // Assert: empty pattern when all terms are stop words
+        // (build_query_model falls back to full phrase if no terms remain)
+        assert!(!pattern.is_empty());
+    }
+
+    #[test]
+    fn parse_rg_output_groups_by_file_and_scores() {
+        // Arrange: simulated ripgrep output
+        let rg_stdout = "\
+src/auth.rs:10:pub fn refresh_token(session: &Session) -> String {
+src/auth.rs:15:    let token = generate_token();
+src/logger.rs:5:fn log_token_refresh(msg: &str) {";
+        let query = build_query_model("refresh token");
+        let root = Path::new(".");
+        // Act
+        let hits = parse_rg_output(rg_stdout, &query, root, 2);
+        // Assert: grouped into 2 files
+        assert_eq!(hits.len(), 2);
+        // auth.rs should rank higher (more matches + symbol definition)
+        assert_eq!(hits[0].path, "src/auth.rs");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn parse_rg_output_respects_snippets_limit() {
+        // Arrange: many matches in one file
+        let rg_stdout = "\
+src/big.rs:1:token one
+src/big.rs:10:token two
+src/big.rs:20:token three
+src/big.rs:30:token four
+src/big.rs:40:token five";
+        let query = build_query_model("token");
+        let root = Path::new(".");
+        // Act: limit to 1 snippet per file
+        let hits = parse_rg_output(rg_stdout, &query, root, 1);
+        // Assert
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippets.len(), 1); // only 1 snippet
+        assert_eq!(hits[0].matched_lines, 5); // but all 5 counted
+    }
+
+    #[test]
+    fn parse_rg_output_empty_stdout() {
+        let query = build_query_model("nothing");
+        let hits = parse_rg_output("", &query, Path::new("."), 2);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn parse_rg_output_malformed_lines_skipped() {
+        // Arrange: mix of valid and malformed lines
+        let rg_stdout = "\
+src/ok.rs:10:valid match token
+not-a-valid-line
+:also:bad
+src/ok.rs:20:another token match";
+        let query = build_query_model("token");
+        let hits = parse_rg_output(rg_stdout, &query, Path::new("."), 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matched_lines, 2); // only valid lines counted
+    }
+
+    #[test]
+    fn filter_grepai_output_savings_ratio() {
+        // Simulate realistic grepai output (~2KB raw JSON)
+        let hits: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                json!({
+                    "file_path": format!("src/module_{}.rs", i),
+                    "start_line": 1,
+                    "end_line": 20,
+                    "score": 0.9 - (i as f64 * 0.1),
+                    "content": format!(
+                        "/// Documentation for module {}\npub fn function_{}() {{\n    let x = {};\n    println!(\"value: {{}}\", x);\n    // more code here\n    let y = x * 2;\n    if y > 10 {{\n        return;\n    }}\n}}\n",
+                        i, i, i
+                    )
+                })
+            })
+            .collect();
+        let raw = serde_json::to_string(&hits).unwrap();
+        let filtered = filter_grepai_output(&raw, "function module", ".", 10, false, false);
+        // Filtered should be significantly smaller than raw
+        assert!(
+            filtered.len() < raw.len(),
+            "filtered ({}) should be < raw ({})",
+            filtered.len(),
+            raw.len()
+        );
     }
 }

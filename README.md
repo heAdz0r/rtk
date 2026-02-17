@@ -22,7 +22,7 @@ rtk filters and compresses command outputs before they reach your LLM context, s
 
 **How to verify you have the correct rtk:**
 ```bash
-rtk --version   # Should show "rtk X.Y.Z"
+rtk --version   # Should show "rtk 0.18.0" (or newer)
 rtk gain        # Should show token savings stats
 ```
 
@@ -43,8 +43,11 @@ With rtk: **~45,000 tokens** → **70% reduction**
 | `git log` | 5× | 2,500 | 500 | -80% |
 | `git add/commit/push` | 8× | 1,600 | 120 | -92% |
 | `npm test` / `cargo test` | 5× | 25,000 | 2,500 | -90% |
+| `ruff check` | 3× | 3,000 | 600 | -80% |
+| `pytest` | 4× | 8,000 | 800 | -90% |
+| `go test` | 3× | 6,000 | 600 | -90% |
 | `docker ps` | 3× | 900 | 180 | -80% |
-| **Total** | | **~101,000** | **~22,000** | **-78%** |
+| **Total** | | **~118,000** | **~23,900** | **-80%** |
 
 > Estimates based on medium-sized TypeScript/Rust projects. Actual savings vary by project size.
 
@@ -166,6 +169,11 @@ rtk gh issue list                # Compact issue listing
 rtk gh run list                  # Workflow run status
 rtk wget https://example.com    # Download, strip progress bars
 rtk config                       # Show config (--create to generate)
+rtk ruff check                   # Python linting (JSON, 80% reduction)
+rtk pytest                       # Python tests (failures only, 90% reduction)
+rtk pip list                     # Python packages (auto-detect uv)
+rtk go test                      # Go tests (NDJSON parser)
+rtk golangci-lint run            # Go linting (grouped JSON)
 ```
 
 ### Data & Analytics
@@ -524,6 +532,11 @@ Search rewrite order is strict and deterministic: `rgai > rg > grep`.
 | `prettier` | `rtk prettier` |
 | `playwright` | `rtk playwright` |
 | `prisma` | `rtk prisma` |
+| `ruff check/format` | `rtk ruff ...` |
+| `pytest` | `rtk pytest` |
+| `pip list/install/outdated/show` | `rtk pip ...` |
+| `go test/build/vet` | `rtk go ...` |
+| `golangci-lint run` | `rtk golangci-lint run` |
 | `docker ps/images/logs` | `rtk docker ...` |
 | `kubectl get/logs` | `rtk kubectl ...` |
 | `curl` | `rtk curl` |

@@ -18,6 +18,8 @@ mod git;
 mod go_cmd;
 mod golangci_cmd;
 mod grep_cmd;
+mod grepai;
+mod hook_audit_cmd; // upstream sync: hook rewrite audit metrics // grepai external semantic search integration
 mod init;
 mod json_cmd;
 mod learn;
@@ -39,6 +41,7 @@ mod rgai_cmd; // semantic search command (grepai-style intent matching)
 mod ruff_cmd;
 mod runner;
 mod summary;
+mod tee; // upstream sync: tee raw output to file for LLM re-read
 mod tracking;
 mod tree;
 mod tsc_cmd;
@@ -54,7 +57,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "rtk",
-    version,
+    version = "0.20.0-fork.1",
     about = "Rust Token Killer - Minimize LLM token consumption",
     long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
@@ -280,6 +283,9 @@ enum Commands {
         /// Compact output (fewer lines per hit)
         #[arg(long)]
         compact: bool,
+        /// Force built-in keyword search (skip grepai delegation)
+        #[arg(long)]
+        builtin: bool,
     },
 
     /// Initialize rtk instructions in CLAUDE.md
@@ -550,6 +556,14 @@ enum Commands {
         /// golangci-lint arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Show hook rewrite audit metrics (requires RTK_HOOK_AUDIT=1) // upstream sync
+    #[command(name = "hook-audit")]
+    HookAudit {
+        /// Show entries from last N days (0 = all time)
+        #[arg(short, long, default_value = "7")]
+        since: u64,
     },
 }
 
@@ -1087,6 +1101,7 @@ fn main() -> Result<()> {
             max_file_kb,
             json,
             compact,
+            builtin, // --builtin flag: skip grepai delegation
         } => {
             // Backward-compat: rtk rgai "query words" ./src -> path="./src"
             let (query, path) = normalize_rgai_args(query, path);
@@ -1099,6 +1114,7 @@ fn main() -> Result<()> {
                 max_file_kb,
                 json,
                 compact,
+                builtin, // pass --builtin flag
                 cli.verbose,
             )?;
         }
@@ -1419,6 +1435,10 @@ fn main() -> Result<()> {
 
         Commands::GolangciLint { args } => {
             golangci_cmd::run(&args, cli.verbose)?;
+        }
+
+        Commands::HookAudit { since } => { // upstream sync: hook audit command
+            hook_audit_cmd::run(since, cli.verbose)?;
         }
 
         Commands::Proxy { args } => {
