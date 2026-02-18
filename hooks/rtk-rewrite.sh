@@ -61,6 +61,18 @@ fi
 REWRITTEN=""
 ALLOW_MUTATING="${RTK_REWRITE_MUTATING:-0}"
 
+# Fix: strip leading comment/blank lines so comment-prefixed commands are still rewritten.
+# e.g. "# explain\ncat file" -> MATCH_CMD="cat file", enables pattern matching.
+if echo "$MATCH_CMD" | head -1 | grep -qE '^[[:space:]]*#'; then
+  MATCH_CMD=$(echo "$MATCH_CMD" | awk '!/^[[:space:]]*($|#)/{found=1} found{print}')
+  CMD_BODY=$(echo "$CMD_BODY" | awk '!/^[[:space:]]*($|#)/{found=1} found{print}')
+  FIRST_TOKEN=$(echo "$MATCH_CMD" | awk '{print $1}')
+  # Re-check: if already rtk after stripping comments, pass through
+  case "$FIRST_TOKEN" in
+    rtk|*/rtk) _rtk_audit_log "skip:already_rtk" "$CMD" "-" "$CMD_CLASS"; exit 0 ;;
+  esac
+fi
+
 # --- Git commands ---
 if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
   GIT_SUBCMD=$(echo "$MATCH_CMD" | sed -E \
@@ -118,6 +130,24 @@ elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release|repo
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')"
 
+# --- cargo install --path <rtk-root>: full install to ALL binary locations (no desync) ---
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?cargo[[:space:]]+install[[:space:]].*--path[[:space:]]'; then
+  _RTK_INSTALL_ARG=$(echo "$MATCH_CMD" | grep -oE '\-\-path[[:space:]]+[^[:space:]]+' | head -1 | sed 's/--path[[:space:]]*//')
+  if [ -z "$_RTK_INSTALL_ARG" ] || [ "$_RTK_INSTALL_ARG" = "." ]; then
+    _RTK_RESOLVED="$PWD"
+  else
+    _RTK_RESOLVED="$(cd "$_RTK_INSTALL_ARG" 2>/dev/null && pwd || echo "$_RTK_INSTALL_ARG")"
+  fi
+  if [ -f "$_RTK_RESOLVED/Cargo.toml" ] && grep -q 'name = "rtk"' "$_RTK_RESOLVED/Cargo.toml" 2>/dev/null; then
+    # RTK project: full install to ~/.cargo/bin + /usr/local/bin (eliminates desync)
+    CMD_CLASS="mutating"
+    REWRITTEN="rtk build sh --root $_RTK_RESOLVED --no-debug --no-verify"
+  else
+    # Other project: normal cargo install passthrough
+    CMD_CLASS="mutating"
+    REWRITTEN="${ENV_PREFIX}rtk $(echo "$CMD_BODY" | sed -E 's|^([^[:space:]]*/)?cargo[[:space:]]+|cargo |')"
+  fi
+
 # --- Cargo ---
 elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?cargo[[:space:]]'; then
   CMD_CLASS="read_only"
@@ -142,7 +172,11 @@ elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?rgai[[:space:]]+'; then
 # --- File operations ---
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
+  CAT_ARGS=$(echo "$MATCH_CMD" | sed -E 's/^cat[[:space:]]*//')
+  # Only rewrite simple `cat <single-file>` without flags or multiple files
+  if ! echo "$CAT_ARGS" | grep -qE '^-' && ! echo "$CAT_ARGS" | grep -qE ' '; then
+    REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
+  fi
 elif echo "$MATCH_CMD" | grep -qE '^(rg|grep)[[:space:]]+'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(rg|grep) /rtk grep /')"

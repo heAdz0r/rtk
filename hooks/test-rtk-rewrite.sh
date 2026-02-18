@@ -158,6 +158,18 @@ test_rewrite "cat package.json" \
   "cat package.json" \
   "rtk read package.json"
 
+test_rewrite "cat with flag -e (no rewrite, unsafe)" \
+  "cat -e src/main.rs" \
+  ""
+
+test_rewrite "cat multiple files (no rewrite, multi-file)" \
+  "cat src/a.rs src/b.rs" \
+  ""
+
+test_rewrite "cat -n file (no rewrite, has flag)" \
+  "cat -n src/main.rs" \
+  ""
+
 test_rewrite "head -20 package.json" \
   "head -20 package.json" \
   "rtk read package.json --max-lines 20"
@@ -288,6 +300,26 @@ test_rewrite "env + npm run" \
 test_rewrite "env + docker compose" \
   "COMPOSE_PROJECT_NAME=test docker compose up -d" \
   "COMPOSE_PROJECT_NAME=test rtk docker compose up -d"
+
+echo ""
+
+# ---- SECTION 2.5: Comment-prefix stripping ----
+echo "--- Comment-prefix stripping (bug fix) ---"
+test_rewrite "# comment then cat" \
+  $'# explain what we do\ncat src/main.rs' \
+  "rtk read src/main.rs"
+
+test_rewrite "# comment then git status" \
+  $'# checking status\ngit status' \
+  "rtk git status"
+
+test_rewrite "# comment then cargo test" \
+  $'# run tests\ncargo test' \
+  "rtk cargo test"
+
+test_rewrite "# already rtk after comments (no double rewrite)" \
+  $'# already good\nrtk cargo test' \
+  ""
 
 echo ""
 

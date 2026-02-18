@@ -1,10 +1,11 @@
 #!/bin/bash
 # RTK hook for Claude Code PreToolUse:Read
-# Default behavior: allow native Read, but emit guidance to prefer `rtk read`.
-# Set RTK_BLOCK_NATIVE_READ=1 to enforce strict blocking.
+# Default behavior: hard deny native Read and route to `rtk read`.
+# Set RTK_ALLOW_NATIVE_READ=1 (or legacy RTK_BLOCK_NATIVE_READ=0) to allow native Read.
 # Set RTK_NOTIFY_NATIVE_READ=0 to suppress allow-mode notifications.
 
-if [ "${RTK_BLOCK_NATIVE_READ:-0}" != "1" ]; then
+# Explicit allow override (policy default is deny)
+if [ "${RTK_ALLOW_NATIVE_READ:-0}" = "1" ] || [ "${RTK_BLOCK_NATIVE_READ:-1}" = "0" ]; then
   if [ "${RTK_NOTIFY_NATIVE_READ:-1}" = "0" ]; then
     exit 0
   fi
@@ -14,7 +15,7 @@ if [ "${RTK_BLOCK_NATIVE_READ:-0}" != "1" ]; then
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "allow",
-    "permissionDecisionReason": "Native Read used. Prefer `rtk read <file> [--level none] [--from N --to M]` via Bash for compact token-aware reads, read-cache reuse, and deterministic exact slices with `--level none`."
+    "permissionDecisionReason": "Native Read explicitly allowed by policy override. Prefer `rtk read <file> [--level none] [--from N --to M]` via Bash for compact token-aware reads, read-cache reuse, and deterministic exact slices with `--level none`."
   }
 }
 EOF
@@ -26,7 +27,7 @@ cat <<'EOF'
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Native Read tool is disabled (RTK_BLOCK_NATIVE_READ=1). Use `rtk read <file> [--level none] [--from N --to M]` via Bash instead. Filtered reads are cached; use --level none for exact content."
+    "permissionDecisionReason": "Native Read tool is disabled by RTK policy (default hard deny). Use `rtk read <file> [--level none] [--from N --to M]` via Bash instead. Override: RTK_ALLOW_NATIVE_READ=1 (legacy: RTK_BLOCK_NATIVE_READ=0)."
   }
 }
 EOF

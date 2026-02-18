@@ -350,13 +350,41 @@ fn build_api_surface(
         return from_paths;
     }
 
-    // Fallback: top-N files with most public symbols (best API overview)
+    // Fallback: top-N files with most public symbols, primary language first.
+    // Detect the project's primary language by file count to avoid showing
+    // benchmark/test helper files from secondary languages (e.g. Python benchmarks
+    // in a Rust project) ahead of the core source.
+    let primary_lang: Option<&str> = {
+        let mut lang_counts: HashMap<&str, usize> = HashMap::new();
+        for fa in &artifact.files {
+            if let Some(lang) = fa.language.as_deref() {
+                if !fa.pub_symbols.is_empty() {
+                    *lang_counts.entry(lang).or_insert(0) += 1;
+                }
+            }
+        }
+        lang_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(lang, _)| lang)
+    };
+
     let mut ranked: Vec<&FileArtifact> = artifact
         .files
         .iter()
         .filter(|fa| !fa.pub_symbols.is_empty())
         .collect();
-    ranked.sort_by(|a, b| b.pub_symbols.len().cmp(&a.pub_symbols.len()));
+
+    // Sort: primary-language files first, then by symbol count within each group. // This prevents secondary-language helpers (benchmarks, scripts) from
+    // outranking core source files in mixed-language projects.
+    ranked.sort_by(|a, b| {
+        let a_primary = a.language.as_deref() == primary_lang;
+        let b_primary = b.language.as_deref() == primary_lang;
+        b_primary
+            .cmp(&a_primary)
+            .then_with(|| b.pub_symbols.len().cmp(&a.pub_symbols.len()))
+    });
+
     ranked.into_iter().take(max_files).map(to_surface).collect()
 }
 

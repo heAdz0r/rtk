@@ -9,6 +9,7 @@ const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
 const BLOCK_GREP_HOOK: &str = include_str!("../hooks/rtk-block-native-grep.sh"); // prefer rtk over native Grep
 const BLOCK_READ_HOOK: &str = include_str!("../hooks/rtk-block-native-read.sh"); // prefer rtk over native Read
 const BLOCK_WRITE_HOOK: &str = include_str!("../hooks/rtk-block-native-write.sh"); // prefer rtk over native Edit/Write
+const BLOCK_EXPLORE_HOOK: &str = include_str!("../hooks/rtk-block-native-explore.sh"); // prefer rtk memory over native Task/Explore
 
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
@@ -54,7 +55,7 @@ rtk git add . && rtk git commit -m "msg" && rtk git push
 - Use `rtk rgai` first for semantic/intention-based discovery.
 - Use `rtk grep` for exact/regex matching.
 - `rtk grep` internally follows `rg -> grep` backend fallback automatically.
-- Native Grep/Read tools are allowed by default but hook-notified; use `rtk grep` / `rtk read` via Bash.
+- Native Grep/Read tools are blocked by default (hard deny policy); use `rtk grep` / `rtk read` via Bash.
 
 ## Precise File Reads
 
@@ -73,7 +74,7 @@ Use `rtk write` for atomicity and idempotency, not primarily for token savings (
 | 2+ files in one task | `rtk write batch` — single call, groups I/O |
 | Retry-safe / idempotent | `rtk write patch/replace` — noop if already applied |
 | Structured config | `rtk write set` — type-safe JSON/TOML key update |
-| Single trivial edit | Native Edit tool — acceptable |
+| Single trivial edit | `rtk write patch/replace` |
 
 ```bash
 rtk write batch --plan '[{"op":"patch","file":"a.rs","old":"x","new":"y"},...]'  # multi-file
@@ -235,8 +236,8 @@ pub fn run(
     }
 }
 
-/// Prepare hook directory and return paths (hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path)
-fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
+/// Prepare hook directory and return paths (hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path, block_explore_path)
+fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
     let claude_dir = resolve_claude_dir()?;
     let hook_dir = claude_dir.join("hooks");
     fs::create_dir_all(&hook_dir)
@@ -245,12 +246,14 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)>
     let block_grep_path = hook_dir.join("rtk-block-native-grep.sh"); // Grep guidance/optional block hook
     let block_read_path = hook_dir.join("rtk-block-native-read.sh"); // Read guidance/optional block hook
     let block_write_path = hook_dir.join("rtk-block-native-write.sh"); // Edit/Write guidance/optional block hook
+    let block_explore_path = hook_dir.join("rtk-block-native-explore.sh"); // Task/Explore guidance/optional block hook
     Ok((
         hook_dir,
         rewrite_path,
         block_grep_path,
         block_read_path,
         block_write_path,
+        block_explore_path,
     ))
 }
 
@@ -291,20 +294,22 @@ fn install_single_hook(hook_path: &Path, content: &str, verbose: u8) -> Result<b
     Ok(changed)
 }
 
-/// Install all hook files (rewrite + grep/read/write guidance hooks), return true if any changed
+/// Install all hook files (rewrite + grep/read/write/explore policy hooks), return true if any changed
 #[cfg(unix)]
 fn ensure_hooks_installed(
     rewrite_path: &Path,
     block_grep_path: &Path,
     block_read_path: &Path,
     block_write_path: &Path,
+    block_explore_path: &Path,
     verbose: u8,
 ) -> Result<bool> {
     let r1 = install_single_hook(rewrite_path, REWRITE_HOOK, verbose)?;
     let r2 = install_single_hook(block_grep_path, BLOCK_GREP_HOOK, verbose)?;
     let r3 = install_single_hook(block_read_path, BLOCK_READ_HOOK, verbose)?; // Read guidance hook
     let r4 = install_single_hook(block_write_path, BLOCK_WRITE_HOOK, verbose)?; // Edit/Write guidance hook
-    Ok(r1 || r2 || r3 || r4)
+    let r5 = install_single_hook(block_explore_path, BLOCK_EXPLORE_HOOK, verbose)?; // Task/Explore guidance hook
+    Ok(r1 || r2 || r3 || r4 || r5)
 }
 
 /// Idempotent file write: create or update if content differs
@@ -371,6 +376,7 @@ fn print_manual_instructions(
     block_grep_path: &Path,
     block_read_path: &Path,
     block_write_path: &Path,
+    block_explore_path: &Path,
 ) {
     println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
     println!("  {{");
@@ -409,6 +415,13 @@ fn print_manual_instructions(
         "        \"hooks\": [{{ \"type\": \"command\", \"command\": \"{}\", \"timeout\": 5 }}]",
         block_write_path.display()
     );
+    println!("      }},");
+    println!("      {{");
+    println!("        \"matcher\": \"Task\",");
+    println!(
+        "        \"hooks\": [{{ \"type\": \"command\", \"command\": \"{}\", \"timeout\": 10 }}]",
+        block_explore_path.display()
+    );
     println!("      }}");
     println!("    ]}}");
     println!("  }}");
@@ -428,7 +441,7 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
         None => return false,
     };
 
-    // Find and remove all RTK entries (rewrite + block-grep + block-read + block-write)
+    // Find and remove all RTK entries (rewrite + block-grep + block-read + block-write + block-explore)
     let original_len = pre_tool_use_array.len();
     pre_tool_use_array.retain(|entry| {
         if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
@@ -438,6 +451,7 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
                         || command.contains("rtk-block-native-grep.sh")
                         || command.contains("rtk-block-native-read.sh")
                         || command.contains("rtk-block-native-write.sh")
+                        || command.contains("rtk-block-native-explore.sh")
                     {
                         return false; // Remove this RTK entry
                     }
@@ -503,12 +517,13 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     let claude_dir = resolve_claude_dir()?;
     let mut removed = Vec::new();
 
-    // 1. Remove hook files (rewrite + block-grep + block-read + block-write)
+    // 1. Remove hook files (rewrite + block-grep + block-read + block-write + block-explore)
     for hook_name in &[
         "rtk-rewrite.sh",
         "rtk-block-native-grep.sh",
         "rtk-block-native-read.sh",
         "rtk-block-native-write.sh",
+        "rtk-block-native-explore.sh",
     ] {
         let hook_path = claude_dir.join("hooks").join(hook_name);
         if hook_path.exists() {
@@ -568,13 +583,14 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Orchestrator: patch settings.json with RTK hooks (rewrite + grep/read/write guidance hooks)
+/// Orchestrator: patch settings.json with RTK hooks (rewrite + grep/read/write/explore policy hooks)
 /// Handles reading, checking, prompting, merging, backing up, and atomic writing
 fn patch_settings_json(
     rewrite_path: &Path,
     block_grep_path: &Path,
     block_read_path: &Path,
     block_write_path: &Path,
+    block_explore_path: &Path,
     mode: PatchMode,
     verbose: u8,
 ) -> Result<PatchResult> {
@@ -592,6 +608,9 @@ fn patch_settings_json(
     let block_write_command = block_write_path
         .to_str()
         .context("Block-write hook path contains invalid UTF-8")?;
+    let block_explore_command = block_explore_path
+        .to_str()
+        .context("Block-explore hook path contains invalid UTF-8")?;
 
     // Read or create settings.json
     let mut root = if settings_path.exists() {
@@ -615,6 +634,7 @@ fn patch_settings_json(
         block_grep_command,
         block_read_command,
         block_write_command,
+        block_explore_command,
     ) {
         if verbose > 0 {
             eprintln!("settings.json: all hooks already present");
@@ -630,6 +650,7 @@ fn patch_settings_json(
                 block_grep_path,
                 block_read_path,
                 block_write_path,
+                block_explore_path,
             );
             return Ok(PatchResult::Skipped);
         }
@@ -640,6 +661,7 @@ fn patch_settings_json(
                     block_grep_path,
                     block_read_path,
                     block_write_path,
+                    block_explore_path,
                 );
                 return Ok(PatchResult::Declined);
             }
@@ -652,13 +674,14 @@ fn patch_settings_json(
     // Remove any existing RTK entries first (clean slate for idempotent re-insert)
     remove_hook_from_json(&mut root);
 
-    // Deep-merge all hooks (rewrite + grep/read/write guidance hooks)
+    // Deep-merge all hooks (rewrite + grep/read/write/explore policy hooks)
     insert_hook_entry(
         &mut root,
         rewrite_command,
         block_grep_command,
         block_read_command,
         block_write_command,
+        block_explore_command,
     );
 
     // Backup original
@@ -676,7 +699,7 @@ fn patch_settings_json(
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
     atomic_write(&settings_path, &serialized)?;
 
-    println!("\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write guidance)");
+    println!("\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write/Task policy)");
     if settings_path.with_extension("json.bak").exists() {
         println!(
             "  Backup: {}",
@@ -722,13 +745,14 @@ fn clean_double_blanks(content: &str) -> String {
 
 /// Deep-merge RTK hook entries into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
-/// Adds Bash (rewrite), Grep (block), Read (block), Edit (block), Write (block) entries
+/// Adds Bash (rewrite), Grep (block), Read (block), Edit (block), Write (block), Task/Explore (block) entries
 fn insert_hook_entry(
     root: &mut serde_json::Value,
     rewrite_command: &str,
     block_grep_command: &str,
     block_read_command: &str,
     block_write_command: &str,
+    block_explore_command: &str,
 ) {
     // Ensure root is an object
     let root_obj = match root.as_object_mut() {
@@ -763,7 +787,7 @@ fn insert_hook_entry(
         }]
     }));
 
-    // Append Grep hook entry (defaults to allow+hint, strict deny optional)
+    // Append Grep hook entry (defaults to hard deny; explicit allow override)
     pre_tool_use.push(serde_json::json!({
         "matcher": "Grep",
         "hooks": [{
@@ -773,7 +797,7 @@ fn insert_hook_entry(
         }]
     }));
 
-    // Append Read hook entry (defaults to allow+hint, strict deny optional)
+    // Append Read hook entry (defaults to hard deny; explicit allow override)
     pre_tool_use.push(serde_json::json!({
         "matcher": "Read",
         "hooks": [{
@@ -783,7 +807,7 @@ fn insert_hook_entry(
         }]
     }));
 
-    // Append Edit hook entry (defaults to allow+hint, strict deny optional)
+    // Append Edit hook entry (defaults to hard deny; explicit allow override)
     pre_tool_use.push(serde_json::json!({
         "matcher": "Edit",
         "hooks": [{
@@ -793,7 +817,7 @@ fn insert_hook_entry(
         }]
     }));
 
-    // Append Write hook entry (defaults to allow+hint, strict deny optional)
+    // Append Write hook entry (defaults to hard deny; explicit allow override)
     pre_tool_use.push(serde_json::json!({
         "matcher": "Write",
         "hooks": [{
@@ -802,16 +826,27 @@ fn insert_hook_entry(
             "timeout": 5
         }]
     }));
+
+    // Append Task/Explore hook entry (defaults to hard deny, explicit allow override)
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "Task",
+        "hooks": [{
+            "type": "command",
+            "command": block_explore_command,
+            "timeout": 10
+        }]
+    }));
 }
 
 /// Check if RTK hooks are already present in settings.json
-/// Returns true only if all 5 hooks are present: rewrite + grep/read/write guidance hooks
+/// Returns true only if all 6 hooks are present: rewrite + grep/read/write + task/explore policy hooks
 fn hooks_already_present(
     root: &serde_json::Value,
     rewrite_command: &str,
     block_grep_command: &str,
     block_read_command: &str,
     block_write_command: &str,
+    block_explore_command: &str,
 ) -> bool {
     let pre_tool_use_array = match root
         .get("hooks")
@@ -859,19 +894,29 @@ fn hooks_already_present(
             && entry_has_command(entry, block_write_command, "rtk-block-native-write.sh")
     });
 
-    has_rewrite && has_block_grep && has_block_read && has_block_edit && has_block_write
+    let has_block_explore = pre_tool_use_array.iter().any(|entry| {
+        entry.get("matcher").and_then(|m| m.as_str()) == Some("Task")
+            && entry_has_command(entry, block_explore_command, "rtk-block-native-explore.sh")
+    });
+
+    has_rewrite
+        && has_block_grep
+        && has_block_read
+        && has_block_edit
+        && has_block_write
+        && has_block_explore
 }
 
 /// Check if any RTK hook is present (for diagnostics / show_config)
-/// Returns (rewrite, block_grep, block_read, block_edit, block_write)
-fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bool) {
+/// Returns (rewrite, block_grep, block_read, block_edit, block_write, block_explore)
+fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bool, bool) {
     let pre_tool_use_array = match root
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|p| p.as_array())
     {
         Some(arr) => arr,
-        None => return (false, false, false, false, false),
+        None => return (false, false, false, false, false, false),
     };
 
     fn has_matcher_with_file(
@@ -900,6 +945,8 @@ fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bo
         has_matcher_with_file(pre_tool_use_array, "Edit", "rtk-block-native-write.sh");
     let has_block_write =
         has_matcher_with_file(pre_tool_use_array, "Write", "rtk-block-native-write.sh");
+    let has_block_explore =
+        has_matcher_with_file(pre_tool_use_array, "Task", "rtk-block-native-explore.sh");
 
     (
         has_rewrite,
@@ -907,6 +954,7 @@ fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bo
         has_block_read,
         has_block_edit,
         has_block_write,
+        has_block_explore,
     )
 }
 
@@ -931,13 +979,20 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
     let claude_md_path = claude_dir.join("CLAUDE.md");
 
     // 1. Prepare hook directory and install hooks
-    let (_hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path) =
-        prepare_hook_paths()?;
+    let (
+        _hook_dir,
+        rewrite_path,
+        block_grep_path,
+        block_read_path,
+        block_write_path,
+        block_explore_path,
+    ) = prepare_hook_paths()?;
     ensure_hooks_installed(
         &rewrite_path,
         &block_grep_path,
         &block_read_path,
         &block_write_path,
+        &block_explore_path,
         verbose,
     )?;
 
@@ -956,6 +1011,10 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         "  Edit Hook:  {} (Edit + Write)",
         block_write_path.display()
     );
+    println!(
+        "  Task Hook:  {} (Task/Explore)",
+        block_explore_path.display()
+    );
     println!("  RTK.md:     {} (10 lines)", rtk_md_path.display());
     println!("  CLAUDE.md:  @RTK.md reference added");
 
@@ -964,12 +1023,13 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         println!("            replaced with @RTK.md (10 lines)");
     }
 
-    // 5. Patch settings.json (Bash rewrite + Grep/Read/Edit/Write hook entries)
+    // 5. Patch settings.json (Bash rewrite + Grep/Read/Edit/Write/Task hook entries)
     let patch_result = patch_settings_json(
         &rewrite_path,
         &block_grep_path,
         &block_read_path,
         &block_write_path,
+        &block_explore_path,
         patch_mode,
         verbose,
     )?;
@@ -1103,13 +1163,20 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
     }
 
     // Prepare and install hooks
-    let (_hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path) =
-        prepare_hook_paths()?;
+    let (
+        _hook_dir,
+        rewrite_path,
+        block_grep_path,
+        block_read_path,
+        block_write_path,
+        block_explore_path,
+    ) = prepare_hook_paths()?;
     ensure_hooks_installed(
         &rewrite_path,
         &block_grep_path,
         &block_read_path,
         &block_write_path,
+        &block_explore_path,
         verbose,
     )?;
 
@@ -1122,6 +1189,10 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         block_write_path.display()
     );
     println!(
+        "  Task Hook:  {} (Task/Explore)",
+        block_explore_path.display()
+    );
+    println!(
         "  Note: No RTK.md created. Claude won't know about meta commands (gain, discover, proxy)."
     );
 
@@ -1131,6 +1202,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         &block_grep_path,
         &block_read_path,
         &block_write_path,
+        &block_explore_path,
         patch_mode,
         verbose,
     )?;
@@ -1407,6 +1479,7 @@ fn cleanup_project_local_hooks(verbose: u8) -> Result<bool> {
             "rtk-block-native-grep.sh",
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
+            "rtk-block-native-explore.sh",
         ] {
             let local_hook = local_hooks_dir.join(hook_name);
             if local_hook.exists() {
@@ -1469,6 +1542,8 @@ pub fn show_config() -> Result<()> {
     let rewrite_path = claude_dir.join("hooks").join("rtk-rewrite.sh");
     let block_grep_path = claude_dir.join("hooks").join("rtk-block-native-grep.sh");
     let block_read_path = claude_dir.join("hooks").join("rtk-block-native-read.sh");
+    let block_write_path = claude_dir.join("hooks").join("rtk-block-native-write.sh");
+    let block_explore_path = claude_dir.join("hooks").join("rtk-block-native-explore.sh");
     let rtk_md_path = claude_dir.join("RTK.md");
     let global_claude_md = claude_dir.join("CLAUDE.md");
     let local_claude_md = PathBuf::from("CLAUDE.md");
@@ -1528,6 +1603,20 @@ pub fn show_config() -> Result<()> {
         println!("  [!]  Read hook: not found (run: rtk init -g to install)");
     }
 
+    // Check write guidance hook (Edit/Write matcher)
+    if block_write_path.exists() {
+        println!("  [ok] Edit/Write hook: {}", block_write_path.display());
+    } else {
+        println!("  [!]  Edit/Write hook: not found (run: rtk init -g to install)");
+    }
+
+    // Check explore policy hook (Task matcher)
+    if block_explore_path.exists() {
+        println!("  [ok] Task/Explore hook: {}", block_explore_path.display());
+    } else {
+        println!("  [!]  Task/Explore hook: not found (run: rtk init -g to install)");
+    }
+
     // Check RTK.md
     if rtk_md_path.exists() {
         println!("  [ok] RTK.md: {} (slim mode)", rtk_md_path.display());
@@ -1569,13 +1658,20 @@ pub fn show_config() -> Result<()> {
         let content = fs::read_to_string(&settings_path)?;
         if !content.trim().is_empty() {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
-                let (has_rewrite, has_block_grep, has_block_read, has_block_edit, has_block_write) =
-                    any_rtk_hook_present(&root);
+                let (
+                    has_rewrite,
+                    has_block_grep,
+                    has_block_read,
+                    has_block_edit,
+                    has_block_write,
+                    has_block_explore,
+                ) = any_rtk_hook_present(&root);
                 if has_rewrite
                     && has_block_grep
                     && has_block_read
                     && has_block_edit
                     && has_block_write
+                    && has_block_explore
                 {
                     println!("  [ok] settings.json: all RTK hooks configured");
                 } else {
@@ -1594,6 +1690,9 @@ pub fn show_config() -> Result<()> {
                     }
                     if !has_block_write {
                         println!("       Missing: write hook (Write matcher)");
+                    }
+                    if !has_block_explore {
+                        println!("       Missing: Task/Explore hook (Task matcher)");
                     }
                     println!("       Run: rtk init -g --auto-patch");
                 }
@@ -1617,6 +1716,7 @@ pub fn show_config() -> Result<()> {
             "rtk-block-native-grep.sh",
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
+            "rtk-block-native-explore.sh",
         ] {
             if local_hooks_dir.join(hook_name).exists() {
                 local_dupes.push(*hook_name);
@@ -1710,11 +1810,12 @@ mod tests {
 
     #[test]
     fn test_block_grep_hook_has_correct_schema() {
-        // Verify grep hook defaults to allow+hint and supports strict deny mode.
+        // Verify grep hook defaults to hard deny with explicit allow override.
         assert!(BLOCK_GREP_HOOK.contains("\"permissionDecision\": \"allow\""));
         assert!(BLOCK_GREP_HOOK.contains("\"permissionDecision\": \"deny\""));
         assert!(BLOCK_GREP_HOOK.contains("\"hookEventName\": \"PreToolUse\"")); // canonical PreToolUse schema
-        assert!(BLOCK_GREP_HOOK.contains("RTK_BLOCK_NATIVE_GREP=1"));
+        assert!(BLOCK_GREP_HOOK.contains("RTK_ALLOW_NATIVE_GREP=1"));
+        assert!(BLOCK_GREP_HOOK.contains("RTK_BLOCK_NATIVE_GREP=0"));
         assert!(BLOCK_GREP_HOOK.contains("rtk grep"));
         assert!(BLOCK_GREP_HOOK.contains("rtk rgai"));
         // Read is now in its own separate hook
@@ -1726,11 +1827,12 @@ mod tests {
 
     #[test]
     fn test_block_read_hook_has_correct_schema() {
-        // Verify read hook defaults to allow+hint and supports strict deny mode.
+        // Verify read hook defaults to hard deny with explicit allow override.
         assert!(BLOCK_READ_HOOK.contains("\"permissionDecision\": \"allow\""));
         assert!(BLOCK_READ_HOOK.contains("\"permissionDecision\": \"deny\""));
         assert!(BLOCK_READ_HOOK.contains("\"hookEventName\": \"PreToolUse\"")); // canonical PreToolUse schema
-        assert!(BLOCK_READ_HOOK.contains("RTK_BLOCK_NATIVE_READ=1"));
+        assert!(BLOCK_READ_HOOK.contains("RTK_ALLOW_NATIVE_READ=1"));
+        assert!(BLOCK_READ_HOOK.contains("RTK_BLOCK_NATIVE_READ=0"));
         assert!(BLOCK_READ_HOOK.contains("rtk read"));
         // Read hook must not mention grep
         assert!(
@@ -1741,12 +1843,24 @@ mod tests {
 
     #[test]
     fn test_block_write_hook_has_correct_schema() {
-        // Verify write hook defaults to allow+hint and supports strict deny mode.
+        // Verify write hook defaults to hard deny with explicit allow override.
         assert!(BLOCK_WRITE_HOOK.contains("\"permissionDecision\": \"allow\""));
         assert!(BLOCK_WRITE_HOOK.contains("\"permissionDecision\": \"deny\""));
         assert!(BLOCK_WRITE_HOOK.contains("\"hookEventName\": \"PreToolUse\""));
-        assert!(BLOCK_WRITE_HOOK.contains("RTK_BLOCK_NATIVE_WRITE=1"));
+        assert!(BLOCK_WRITE_HOOK.contains("RTK_ALLOW_NATIVE_WRITE=1"));
+        assert!(BLOCK_WRITE_HOOK.contains("RTK_BLOCK_NATIVE_WRITE=0"));
         assert!(BLOCK_WRITE_HOOK.contains("rtk write"));
+    }
+
+    #[test]
+    fn test_block_explore_hook_has_correct_schema() {
+        assert!(BLOCK_EXPLORE_HOOK.contains("\"permissionDecision\": \"allow\""));
+        assert!(BLOCK_EXPLORE_HOOK.contains("\"permissionDecision\": \"deny\""));
+        assert!(BLOCK_EXPLORE_HOOK.contains("\"hookEventName\": \"PreToolUse\""));
+        assert!(BLOCK_EXPLORE_HOOK.contains("RTK_ALLOW_NATIVE_EXPLORE=1"));
+        assert!(BLOCK_EXPLORE_HOOK.contains("RTK_BLOCK_NATIVE_EXPLORE=0"));
+        assert!(BLOCK_EXPLORE_HOOK.contains("subagent_type"));
+        assert!(BLOCK_EXPLORE_HOOK.contains("rtk memory explore"));
     }
 
     #[test]
@@ -1782,6 +1896,7 @@ More content"#;
         let block_grep_path = temp.path().join("rtk-block-native-grep.sh");
         let block_read_path = temp.path().join("rtk-block-native-read.sh");
         let block_write_path = temp.path().join("rtk-block-native-write.sh");
+        let block_explore_path = temp.path().join("rtk-block-native-explore.sh");
         let rtk_md_path = temp.path().join("RTK.md");
 
         // Simulate install_single_hook behavior
@@ -1789,6 +1904,7 @@ More content"#;
         fs::write(&block_grep_path, BLOCK_GREP_HOOK).unwrap();
         fs::write(&block_read_path, BLOCK_READ_HOOK).unwrap();
         fs::write(&block_write_path, BLOCK_WRITE_HOOK).unwrap();
+        fs::write(&block_explore_path, BLOCK_EXPLORE_HOOK).unwrap();
         fs::write(&rtk_md_path, RTK_SLIM).unwrap();
 
         use std::os::unix::fs::PermissionsExt;
@@ -1796,11 +1912,13 @@ More content"#;
         fs::set_permissions(&block_grep_path, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&block_read_path, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&block_write_path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&block_explore_path, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(rewrite_path.exists());
         assert!(block_grep_path.exists());
         assert!(block_read_path.exists());
         assert!(block_write_path.exists());
+        assert!(block_explore_path.exists());
         assert!(rtk_md_path.exists());
 
         let metadata = fs::metadata(&rewrite_path).unwrap();
@@ -1808,6 +1926,8 @@ More content"#;
         let metadata = fs::metadata(&block_grep_path).unwrap();
         assert!(metadata.permissions().mode() & 0o111 != 0);
         let metadata = fs::metadata(&block_read_path).unwrap();
+        assert!(metadata.permissions().mode() & 0o111 != 0);
+        let metadata = fs::metadata(&block_explore_path).unwrap();
         assert!(metadata.permissions().mode() & 0o111 != 0);
     }
 
@@ -1912,14 +2032,14 @@ More notes
 
     #[test]
     fn test_templates_explain_native_tool_policy() {
-        let policy = "allowed by default but hook-notified";
+        let policy = "blocked by default (hard deny policy)";
         assert!(
             RTK_INSTRUCTIONS.contains(policy),
-            "RTK_INSTRUCTIONS must describe allow+hint native tool behavior"
+            "RTK_INSTRUCTIONS must describe hard-deny native tool behavior"
         );
         assert!(
             RTK_SLIM.contains(policy),
-            "RTK_SLIM must describe allow+hint native tool behavior"
+            "RTK_SLIM must describe hard-deny native tool behavior"
         );
     }
 
@@ -1972,6 +2092,10 @@ More notes
                     {
                         "matcher": "Write",
                         "hooks": [{"type": "command", "command": "/Users/test/.claude/hooks/rtk-block-native-write.sh"}]
+                    },
+                    {
+                        "matcher": "Task",
+                        "hooks": [{"type": "command", "command": "/Users/test/.claude/hooks/rtk-block-native-explore.sh"}]
                     }
                 ]
             }
@@ -1983,6 +2107,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
+            "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
         ));
     }
 
@@ -2004,6 +2129,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
+            "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
         ));
     }
 
@@ -2017,7 +2143,8 @@ More notes
                     {"matcher": "Grep", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-grep.sh"}]},
                     {"matcher": "Read", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-read.sh"}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-write.sh"}]},
-                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-write.sh"}]}
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-write.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-explore.sh"}]}
                 ]
             }
         });
@@ -2028,6 +2155,7 @@ More notes
             "~/.claude/hooks/rtk-block-native-grep.sh",
             "~/.claude/hooks/rtk-block-native-read.sh",
             "~/.claude/hooks/rtk-block-native-write.sh",
+            "~/.claude/hooks/rtk-block-native-explore.sh",
         ));
     }
 
@@ -2040,6 +2168,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
+            "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
         ));
     }
 
@@ -2060,6 +2189,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
+            "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
         ));
     }
 
@@ -2073,13 +2203,14 @@ More notes
                     {"matcher": "Grep", "hooks": [{"type": "command", "command": "/x/rtk-block-native-grep.sh"}]},
                     {"matcher": "Read", "hooks": [{"type": "command", "command": "/x/rtk-block-native-read.sh"}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
-                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]}
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/x/rtk-block-native-explore.sh"}]}
                 ]
             }
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, true, true, true, true)
+            (true, true, true, true, true, true)
         );
     }
 
@@ -2094,7 +2225,7 @@ More notes
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, false, false, false, false)
+            (true, false, false, false, false, false)
         );
     }
 
@@ -2103,7 +2234,7 @@ More notes
         let json_content = serde_json::json!({});
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (false, false, false, false, false)
+            (false, false, false, false, false, false)
         );
     }
 
@@ -2115,6 +2246,7 @@ More notes
         let block_grep = "/Users/test/.claude/hooks/rtk-block-native-grep.sh";
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
+        let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
 
         insert_hook_entry(
             &mut json_content,
@@ -2122,11 +2254,12 @@ More notes
             block_grep,
             block_read,
             block_write,
+            block_explore,
         );
 
         // Should create full structure with all entries
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 5); // Bash rewrite + Grep block + Read block + Edit block + Write block
+        assert_eq!(pre_tool_use.len(), 6); // Bash rewrite + Grep block + Read block + Edit block + Write block + Task block
 
         // First: Bash rewrite
         assert_eq!(pre_tool_use[0]["matcher"], "Bash");
@@ -2167,6 +2300,14 @@ More notes
             block_write
         );
         assert_eq!(pre_tool_use[4]["hooks"][0]["timeout"], 5);
+
+        // Sixth: Task block (Explore policy)
+        assert_eq!(pre_tool_use[5]["matcher"], "Task");
+        assert_eq!(
+            pre_tool_use[5]["hooks"][0]["command"].as_str().unwrap(),
+            block_explore
+        );
+        assert_eq!(pre_tool_use[5]["hooks"][0]["timeout"], 10);
     }
 
     #[test]
@@ -2184,16 +2325,18 @@ More notes
         let block_grep = "/Users/test/.claude/hooks/rtk-block-native-grep.sh";
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
+        let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
         insert_hook_entry(
             &mut json_content,
             rewrite,
             block_grep,
             block_read,
             block_write,
+            block_explore,
         );
 
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 6); // existing + rewrite + grep + read + edit + write
+        assert_eq!(pre_tool_use.len(), 7); // existing + rewrite + grep + read + edit + write + task
 
         // Check first hook is preserved
         assert_eq!(
@@ -2226,6 +2369,11 @@ More notes
             pre_tool_use[5]["hooks"][0]["command"].as_str().unwrap(),
             block_write
         );
+        assert_eq!(pre_tool_use[6]["matcher"], "Task");
+        assert_eq!(
+            pre_tool_use[6]["hooks"][0]["command"].as_str().unwrap(),
+            block_explore
+        );
     }
 
     #[test]
@@ -2240,12 +2388,14 @@ More notes
         let block_grep = "/Users/test/.claude/hooks/rtk-block-native-grep.sh";
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
+        let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
         insert_hook_entry(
             &mut json_content,
             rewrite,
             block_grep,
             block_read,
             block_write,
+            block_explore,
         );
 
         // Should preserve all other keys
@@ -2329,7 +2479,8 @@ More notes
                     {"matcher": "Grep", "hooks": [{"type": "command", "command": "/x/rtk-block-native-grep.sh"}]},
                     {"matcher": "Read", "hooks": [{"type": "command", "command": "/x/rtk-block-native-read.sh"}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
-                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]}
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/x/rtk-block-native-explore.sh"}]}
                 ]
             }
         });
@@ -2404,6 +2555,7 @@ More notes
             "rtk-block-native-grep.sh",
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
+            "rtk-block-native-explore.sh",
         ] {
             let path = local_hooks.join(hook_name);
             if path.exists() {
@@ -2423,6 +2575,7 @@ More notes
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": ".claude/hooks/rtk-rewrite.sh"}]},
                     {"matcher": "Grep", "hooks": [{"type": "command", "command": ".claude/hooks/rtk-block-native-grep.sh"}]},
                     {"matcher": "Read", "hooks": [{"type": "command", "command": ".claude/hooks/rtk-block-native-read.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": ".claude/hooks/rtk-block-native-explore.sh"}]},
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/project-hook.sh"}]}
                 ]
             }

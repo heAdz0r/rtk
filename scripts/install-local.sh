@@ -27,6 +27,18 @@ install -m 755 "$BINARY_PATH" "$INSTALL_PATH"
 echo "installed: $INSTALL_PATH"
 echo "version: $("$INSTALL_PATH" --version)"
 
+# Also sync /usr/local/bin/rtk if it exists and is writable (no rdesync on PATH-priority conflict)
+USR_LOCAL="/usr/local/bin/rtk"
+if [ -f "$USR_LOCAL" ] && [ -w "$USR_LOCAL" ]; then
+    install -m 755 "$BINARY_PATH" "$USR_LOCAL"
+    echo "synced:    $USR_LOCAL"
+elif [ -w "/usr/local/bin" ]; then
+    install -m 755 "$BINARY_PATH" "$USR_LOCAL"
+    echo "installed: $USR_LOCAL"
+else
+    echo "note: cannot write $USR_LOCAL (run with sudo or use rtk build sh)"
+fi
+
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) echo

@@ -14,6 +14,9 @@ use super::renderer::{build_response, render_text};
 use super::{indexer, DetailLevel, QueryType, ARTIFACT_VERSION};
 use super::{record_cache_event, store_artifact, store_import_edges};
 
+// Keep poll sleep small to avoid adding ~50ms queueing delay to localhost requests.
+const ACCEPT_POLL_SLEEP: Duration = Duration::from_millis(5);
+
 // ── Request / response structs ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -353,7 +356,7 @@ pub(super) fn serve(port: u16, idle_secs: u64, verbose: u8) -> Result<()> {
                     eprintln!("memory.serve: idle timeout ({idle_secs}s), stopping");
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(ACCEPT_POLL_SLEEP);
             }
             Err(e) => {
                 eprintln!("memory.serve: accept error: {e}");
