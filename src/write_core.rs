@@ -150,6 +150,13 @@ impl AtomicWriter {
                 path.display()
             )
         })?;
+        // Fix: relative paths like "Cargo.toml" yield parent="" which breaks File::open;
+        // normalize empty parent to "." (current directory).
+        let parent: &Path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
 
         let existing_meta = match fs::metadata(path) {
             Ok(meta) => Some(meta),
@@ -177,6 +184,13 @@ impl AtomicWriter {
         }
 
         let mut fsync_count = 0u32;
+
+        // changed: create parent dirs when writing a new file (existing_meta is None if file does not exist)
+        if existing_meta.is_none() && !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", path.display())
+            })?;
+        }
 
         let mut temp_file = NamedTempFile::new_in(parent)
             .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
@@ -511,5 +525,22 @@ mod tests {
         let file_hash = hash_file(&path).unwrap();
 
         assert_eq!(snapshot.hash, Some(file_hash));
+    }
+
+    // Regression: relative paths like "Cargo.toml" produce parent="" which must be
+    // normalized to "." before File::open in fsync_parent_dir — otherwise ENOENT.
+    #[test]
+    fn relative_path_without_dir_component_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let writer = AtomicWriter::new(WriteOptions::default());
+        let result = writer.write_str(Path::new("rel_test.txt"), "hello relative");
+        std::env::set_current_dir(orig).unwrap();
+
+        assert!(result.is_ok(), "relative path failed: {:?}", result.err());
+        let written = fs::read_to_string(tmp.path().join("rel_test.txt")).unwrap();
+        assert_eq!(written, "hello relative");
     }
 }

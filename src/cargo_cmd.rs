@@ -587,6 +587,13 @@ fn filter_cargo_build(output: &str) -> String {
         errors.push(current_error.join("\n"));
     }
 
+    // Normalize: trim trailing blank lines/whitespace before dedup.
+    // Blocks may differ in trailing \n depending on how they were flushed
+    // (blank-line flush vs. next-error flush), causing identical errors to
+    // not match in the HashSet. Trim_end makes dedup reliable.
+    for block in &mut errors {
+        *block = block.trim_end().to_string();
+    }
     // Dedup: cargo reports same error for each target (lib/bin), remove exact duplicates
     let mut seen_blocks = std::collections::HashSet::new();
     errors.retain(|e| seen_blocks.insert(e.clone()));
@@ -1723,6 +1730,31 @@ error: test run failed
         assert!(
             result.contains("2 errors"),
             "header should reflect 2 errors: {}",
+            result
+        );
+    }
+
+    // Regression: short error blocks (≤3 lines) include the trailing blank line
+    // in their content (because the "> 3" flush condition is not met). This caused
+    // one block to end with "\n" and the other not to, making HashSet dedup fail.
+    // The trim_end normalization before dedup fixes this.
+    #[test]
+    fn test_filter_cargo_build_dedup_short_block_with_trailing_blank() {
+        // 2-line error: exactly the pattern "error: unknown start of token: \"
+        // that cargo emits for backslash-escape issues. With lib+bin targets,
+        // cargo emits this twice; the first flush includes the blank separator.
+        let short_err = "error: unknown start of token: \\\n --> src/main.rs:10:5";
+        let output = format!("{}\n\n{}", short_err, short_err);
+        let result = filter_cargo_build(&output);
+        assert_eq!(
+            result.matches("unknown start of token").count(),
+            1,
+            "short duplicate error must be deduped even with trailing blank: {}",
+            result
+        );
+        assert!(
+            result.contains("1 errors"),
+            "header must reflect 1 unique error: {}",
             result
         );
     }
