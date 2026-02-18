@@ -916,7 +916,32 @@ enum DockerCommands {
     Images,
     /// Show container logs (deduplicated)
     Logs { container: String },
+    /// Docker Compose commands with compact output
+    Compose {
+        #[command(subcommand)]
+        command: ComposeCommands,
+    },
     /// Passthrough: runs any unsupported docker subcommand directly
+    #[command(external_subcommand)]
+    Other(Vec<OsString>),
+}
+
+// upstream sync 0.21.0: docker compose support
+#[derive(Subcommand)]
+enum ComposeCommands {
+    /// List compose services (compact)
+    Ps,
+    /// Show compose logs (deduplicated)
+    Logs {
+        /// Optional service name
+        service: Option<String>,
+    },
+    /// Build compose services (summary)
+    Build {
+        /// Optional service name
+        service: Option<String>,
+    },
+    /// Passthrough: runs any unsupported compose subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
 }
@@ -1084,6 +1109,9 @@ enum MemoryCommands {
         /// Force full rehash and rebuild
         #[arg(long)]
         refresh: bool,
+        /// P1: Strict dirty-blocking: exit with error if artifact is STALE or DIRTY (no auto-rebuild)
+        #[arg(long)]
+        strict: bool,
         /// Response detail level
         #[arg(long, value_enum, default_value = "compact")]
         detail: memory_layer::DetailLevel,
@@ -1099,6 +1127,9 @@ enum MemoryCommands {
         /// Project root to inspect
         #[arg(default_value = ".")]
         project: PathBuf,
+        /// Git base revision for delta (e.g. HEAD~5, origin/main)
+        #[arg(long)]
+        since: Option<String>,
         /// Response detail level
         #[arg(long, value_enum, default_value = "compact")]
         detail: memory_layer::DetailLevel,
@@ -1143,7 +1174,7 @@ enum MemoryCommands {
         query_type: memory_layer::QueryType, // E2.3
     },
 
-    /// Show cache status (FRESH/STALE, files, bytes, age)
+    /// Show cache status (FRESH/STALE/DIRTY, files, bytes, age)
     Status {
         /// Project root to inspect (default: current directory)
         #[arg(default_value = ".")]
@@ -1173,6 +1204,16 @@ enum MemoryCommands {
         /// Project root to measure (default: current directory)
         #[arg(default_value = ".")]
         project: PathBuf,
+    },
+
+    /// E4.1: Start localhost HTTP API server (GET /v1/health, POST /v1/{explore,delta,refresh,context})
+    Serve {
+        /// TCP port to listen on
+        #[arg(long, default_value = "7700")]
+        port: u16,
+        /// Stop after N seconds with no requests (0 = run forever)
+        #[arg(long, default_value = "300")]
+        idle_secs: u64,
     },
 }
 
@@ -1598,6 +1639,21 @@ fn main() -> Result<()> {
             DockerCommands::Logs { container: c } => {
                 container::run(container::ContainerCmd::DockerLogs, &[c], cli.verbose)?;
             }
+            // upstream sync 0.21.0: docker compose routing
+            DockerCommands::Compose { command: compose } => match compose {
+                ComposeCommands::Ps => {
+                    container::run_compose_ps(cli.verbose)?;
+                }
+                ComposeCommands::Logs { service } => {
+                    container::run_compose_logs(service.as_deref(), cli.verbose)?;
+                }
+                ComposeCommands::Build { service } => {
+                    container::run_compose_build(service.as_deref(), cli.verbose)?;
+                }
+                ComposeCommands::Other(args) => {
+                    container::run_compose_passthrough(&args, cli.verbose)?;
+                }
+            },
             DockerCommands::Other(args) => {
                 container::run_docker_passthrough(&args, cli.verbose)?;
             }
@@ -1888,6 +1944,7 @@ fn main() -> Result<()> {
             MemoryCommands::Explore {
                 project,
                 refresh,
+                strict, // P1: strict dirty-blocking
                 detail,
                 format,
                 query_type, // E2.3
@@ -1895,6 +1952,7 @@ fn main() -> Result<()> {
                 memory_layer::run_explore(
                     &project,
                     refresh,
+                    strict,
                     detail,
                     &format,
                     query_type,
@@ -1903,11 +1961,19 @@ fn main() -> Result<()> {
             }
             MemoryCommands::Delta {
                 project,
+                since,
                 detail,
                 format,
                 query_type, // E2.3
             } => {
-                memory_layer::run_delta(&project, detail, &format, query_type, cli.verbose)?;
+                memory_layer::run_delta(
+                    &project,
+                    since.as_deref(),
+                    detail,
+                    &format,
+                    query_type,
+                    cli.verbose,
+                )?;
             }
             MemoryCommands::Refresh {
                 project,
@@ -1942,8 +2008,13 @@ fn main() -> Result<()> {
             MemoryCommands::InstallHook { uninstall, status } => {
                 memory_layer::run_install_hook(uninstall, status, cli.verbose)?;
             }
-            MemoryCommands::Gain { project } => { // E6.3
+            MemoryCommands::Gain { project } => {
+                // E6.3
                 memory_layer::run_gain(&project, cli.verbose)?;
+            }
+            MemoryCommands::Serve { port, idle_secs } => {
+                // E4.1: HTTP API daemon
+                memory_layer::run_serve(port, idle_secs, cli.verbose)?;
             }
         },
 

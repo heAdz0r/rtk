@@ -529,8 +529,6 @@ fn filter_cargo_nextest(output: &str) -> String {
 /// Filter cargo build/check output - strip "Compiling"/"Checking" lines, keep errors + summary
 fn filter_cargo_build(output: &str) -> String {
     let mut errors: Vec<String> = Vec::new();
-    let mut warnings = 0;
-    let mut error_count = 0;
     let mut compiled = 0;
     let mut in_error = false;
     let mut current_error = Vec::new();
@@ -559,7 +557,6 @@ fn filter_cargo_build(output: &str) -> String {
                 errors.push(current_error.join("\n"));
                 current_error.clear();
             }
-            error_count += 1;
             in_error = true;
             current_error.push(line.to_string());
         } else if line.starts_with("warning:")
@@ -573,7 +570,6 @@ fn filter_cargo_build(output: &str) -> String {
                 errors.push(current_error.join("\n"));
                 current_error.clear();
             }
-            warnings += 1;
             in_error = true;
             current_error.push(line.to_string());
         } else if in_error {
@@ -590,6 +586,13 @@ fn filter_cargo_build(output: &str) -> String {
     if !current_error.is_empty() {
         errors.push(current_error.join("\n"));
     }
+
+    // Dedup: cargo reports same error for each target (lib/bin), remove exact duplicates
+    let mut seen_blocks = std::collections::HashSet::new();
+    errors.retain(|e| seen_blocks.insert(e.clone()));
+    // Count from deduplicated blocks (not from the parse loop, which may double-count)
+    let error_count = errors.iter().filter(|e| e.starts_with("error")).count();
+    let warnings = errors.iter().filter(|e| e.starts_with("warning")).count();
 
     if error_count == 0 && warnings == 0 {
         return format!("✓ cargo build ({} crates compiled)", compiled);
@@ -836,13 +839,13 @@ fn filter_cargo_test_verbose(output: &str) -> String {
 
 /// Filter cargo clippy output - group warnings by lint rule
 fn filter_cargo_clippy(output: &str) -> String {
-    let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
-    let mut error_count = 0;
-    let mut warning_count = 0;
+    // (is_error, locations): track type per rule for accurate deduped counts
+    let mut by_rule: HashMap<String, (bool, Vec<String>)> = HashMap::new();
 
     // Parse clippy output lines
     // Format: "warning: description\n  --> file:line:col\n  |\n  | code\n"
     let mut current_rule = String::new();
+    let mut current_is_error = false;
 
     for line in output.lines() {
         // Skip compilation lines
@@ -868,12 +871,7 @@ fn filter_cargo_clippy(output: &str) -> String {
                 continue;
             }
 
-            let is_error = line.starts_with("error");
-            if is_error {
-                error_count += 1;
-            } else {
-                warning_count += 1;
-            }
+            current_is_error = line.starts_with("error");
 
             // Extract rule name from brackets
             current_rule = if let Some(bracket_start) = line.rfind('[') {
@@ -884,19 +882,38 @@ fn filter_cargo_clippy(output: &str) -> String {
                 }
             } else {
                 // No bracket: use the message itself as the rule
-                let prefix = if is_error { "error: " } else { "warning: " };
+                let prefix = if current_is_error {
+                    "error: "
+                } else {
+                    "warning: "
+                };
                 line.strip_prefix(prefix).unwrap_or(line).to_string()
             };
         } else if line.trim_start().starts_with("--> ") {
             let location = line.trim_start().trim_start_matches("--> ").to_string();
             if !current_rule.is_empty() {
-                by_rule
+                let entry = by_rule
                     .entry(current_rule.clone())
-                    .or_default()
-                    .push(location);
+                    .or_insert((current_is_error, Vec::new()));
+                // Dedup: same location may appear for each target (lib/bin)
+                if !entry.1.contains(&location) {
+                    entry.1.push(location);
+                }
             }
         }
     }
+
+    // Recount from deduplicated by_rule (cargo may double-count for lib+bin targets)
+    let error_count: usize = by_rule
+        .values()
+        .filter(|(is_err, _)| *is_err)
+        .map(|(_, locs)| locs.len())
+        .sum();
+    let warning_count: usize = by_rule
+        .values()
+        .filter(|(is_err, _)| !*is_err)
+        .map(|(_, locs)| locs.len())
+        .sum();
 
     if error_count == 0 && warning_count == 0 {
         return "✓ cargo clippy: No issues found".to_string();
@@ -905,15 +922,15 @@ fn filter_cargo_clippy(output: &str) -> String {
     let mut result = String::new();
     result.push_str(&format!(
         "cargo clippy: {} errors, {} warnings\n",
-        error_count, warning_count
+        error_count, warning_count,
     ));
     result.push_str("═══════════════════════════════════════\n");
 
-    // Sort rules by frequency
+    // Sort rules by frequency (by_rule value is (is_error, locations))
     let mut rule_counts: Vec<_> = by_rule.iter().collect();
-    rule_counts.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    rule_counts.sort_by(|a, b| b.1 .1.len().cmp(&a.1 .1.len()));
 
-    for (rule, locations) in rule_counts.iter().take(15) {
+    for (rule, (_is_error, locations)) in rule_counts.iter().take(15) {
         result.push_str(&format!("  {} ({}x)\n", rule, locations.len()));
         for loc in locations.iter().take(3) {
             result.push_str(&format!("    {}\n", loc));
@@ -1665,6 +1682,90 @@ error: test run failed
         assert!(
             result.contains("Summary MALFORMED"),
             "should fall back to raw summary: {}",
+            result
+        );
+    }
+
+    // --- filter_cargo_build dedup tests ---
+
+    #[test]
+    fn test_filter_cargo_build_dedup_exact_duplicate_errors() {
+        // Simulates cargo reporting the same error for lib + bin targets
+        let dup_error = "error[E0277]: the trait bound `DetailLevel: Default` is not satisfied\n  --> src/config.rs:45:23\n  |\n  | ...";
+        let output = format!("{}\n\n{}", dup_error, dup_error);
+        let result = filter_cargo_build(&output);
+        // Should appear exactly once after dedup
+        assert_eq!(
+            result.matches("error[E0277]").count(),
+            1,
+            "duplicate error must be deduped: {}",
+            result
+        );
+        assert!(
+            result.contains("1 errors"),
+            "header should reflect 1 unique error: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_build_distinct_errors_preserved() {
+        let error_a = "error[E0277]: trait bound not satisfied\n  --> src/config.rs:10:5";
+        let error_b = "error[E0308]: mismatched types\n  --> src/main.rs:20:9";
+        let output = format!("{}\n\n{}", error_a, error_b);
+        let result = filter_cargo_build(&output);
+        assert_eq!(
+            result.matches("error[E").count(),
+            2,
+            "distinct errors must both appear: {}",
+            result
+        );
+        assert!(
+            result.contains("2 errors"),
+            "header should reflect 2 errors: {}",
+            result
+        );
+    }
+
+    // --- filter_cargo_clippy dedup tests ---
+
+    #[test]
+    fn test_filter_cargo_clippy_dedup_duplicate_locations() {
+        // Simulates same warning reported for lib + bin targets (same file:line)
+        let output = "\
+warning: unused variable: `x` [unused_variables]\n  --> src/lib.rs:10:9\n  |\n10 |     let x = 1;\n\
+warning: unused variable: `x` [unused_variables]\n  --> src/lib.rs:10:9\n  |\n10 |     let x = 1;\n\
+";
+        let result = filter_cargo_clippy(output);
+        assert_eq!(
+            result.matches("src/lib.rs:10:9").count(),
+            1,
+            "duplicate location must be deduped: {}",
+            result
+        );
+        assert!(
+            result.contains("1 warnings"),
+            "header should reflect 1 unique warning: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_clippy_distinct_locations_preserved() {
+        let output = "\
+warning: unused variable: `x` [unused_variables]\n  --> src/lib.rs:10:9\n\
+warning: unused variable: `y` [unused_variables]\n  --> src/lib.rs:20:9\n\
+";
+        let result = filter_cargo_clippy(output);
+        assert_eq!(
+            result.matches("src/lib.rs").count(),
+            2,
+            "distinct locations must both appear: {}",
+            result
+        );
+        assert!(
+            result.contains("2 warnings"),
+            "header should reflect 2 warnings: {}",
             result
         );
     }

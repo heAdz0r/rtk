@@ -66,9 +66,17 @@ rtk read <file> --level none --from <N> --to <M>
 
 ## Safe File Writes
 
-For deterministic edits, prefer `rtk write` primitives over ad-hoc inline editors:
+Use `rtk write` for atomicity and idempotency, not primarily for token savings (write token delta is negligible).
+
+| Scenario | Tool |
+|----------|------|
+| 2+ files in one task | `rtk write batch` — single call, groups I/O |
+| Retry-safe / idempotent | `rtk write patch/replace` — noop if already applied |
+| Structured config | `rtk write set` — type-safe JSON/TOML key update |
+| Single trivial edit | Native Edit tool — acceptable |
 
 ```bash
+rtk write batch --plan '[{"op":"patch","file":"a.rs","old":"x","new":"y"},...]'  # multi-file
 rtk write replace <file> --from <old> --to <new> [--all]
 rtk write patch <file> --old "<block>" --new "<block>" [--all]
 rtk write set <file.{json|toml}> --key a.b --value <value>
@@ -148,8 +156,9 @@ rtk prisma              # Prisma without ASCII art (88%)
 rtk ls <path>           # Tree format, compact (65%)
 rtk read <file>         # Code/text read with filtering; CSV/TSV -> compact digest
 rtk read <file> --level none --from <N> --to <M>  # Exact line-range read (no filtering)
+rtk write batch --plan '[...]'  # Multi-file atomic batch (prefer for 2+ files)
 rtk write replace <file> --from old --to new [--all]  # Atomic text replace
-rtk write patch <file> --old "<block>" --new "<block>" [--all]  # Atomic block patch
+rtk write patch <file> --old "<block>" --new "<block>" [--all]  # Atomic block patch (idempotent)
 rtk write set <file> --key a.b --value v --format json|toml  # Atomic structured update
 rtk rgai <query>        # Semantic search ranked by relevance (85%)
 rtk grep <pattern>      # Exact/regex search (internal rg -> grep fallback)

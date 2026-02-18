@@ -9,6 +9,7 @@ on:
       - ".claude/hooks/*.sh"
       - "hooks/*.sh"
       - "scripts/validate-docs.sh"
+      - "scripts/sync-architecture-modules.sh"
   push:
     branches:
       - master

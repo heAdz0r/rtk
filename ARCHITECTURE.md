@@ -176,7 +176,7 @@ Database: ~/.local/share/rtk/history.db
 
 ## Module Organization
 
-### Complete Module Map (63 Modules)
+### Complete Module Map (67 Modules)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -237,7 +237,8 @@ PYTHON            ruff_cmd.rs       ruff check/format      80%+       ✓
 GO                go_cmd.rs         go test/build/vet      80-90%     ✓
                   golangci_cmd.rs   golangci-lint          85%        ✓
 
-CONTAINERS        container.rs      podman, docker         60-80%     ✓
+CONTAINERS        container.rs      podman, docker,        60-80%     ✓
+                                    docker compose
 
 VCS               gh_cmd.rs         gh                     26-87%     ✓
 
@@ -269,7 +270,7 @@ SHARED            utils.rs          Helpers                N/A        ✓
                   rgai_arg_tests    (test-only)            N/A        ✓
 ```
 
-**Total: 63 modules** (36 command modules + 27 infrastructure/internal modules)
+**Total: 67 modules** (auto-synced from src/main.rs)
 
 ### Module Count Breakdown
 
