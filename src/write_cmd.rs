@@ -5,6 +5,7 @@ use crate::write_lock::FileLockGuard; // changed: import flock guard for concurr
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use memchr::memmem::Finder;
+use regex::Regex;
 use serde::Serialize;
 use serde_json::ser::{PrettyFormatter, Serializer};
 use serde_json::{Map, Value as JsonValue};
@@ -487,11 +488,46 @@ fn smart_no_match_hint(base: &str, flag: &str, pattern: &str) -> String {
         ));
     }
 
+    if pattern.contains('\n') {
+        hints.push(format!(
+            // changed: hint for real embedded newlines (from multiline bash args)
+            "pattern for {} contains an embedded newline (multiline bash arg); flex-whitespace fallback is tried automatically, or use @file syntax",
+            flag
+        ));
+    }
+
     if hints.is_empty() {
         base.to_string()
     } else {
         format!("{}; {}", base, hints.join("; "))
     }
+}
+
+/// Try to match a pattern that contains embedded newlines (e.g. from a multiline bash arg)
+/// by treating each line-boundary as flexible whitespace (`\s+`) in the actual file content.
+/// Returns the exact original content span that matches, so it can be used as the replacement target.
+fn try_multiline_flex_match(content: &str, pattern: &str) -> Option<String> {
+    // changed: new flex-whitespace fallback for embedded-newline patterns
+    if !pattern.contains('\n') {
+        return None;
+    }
+    // Keep leading whitespace of the first part (preserves indentation for the match anchor),
+    // but trim both ends of continuation parts (bash multiline args add arbitrary indentation).
+    let parts: Vec<&str> = pattern
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| if i == 0 { line.trim_end() } else { line.trim() })
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // Build a regex where parts are literal and line boundaries match any whitespace run
+    let escaped: Vec<String> = parts.iter().map(|p| regex::escape(p)).collect();
+    let re_str = escaped.join(r"\s+");
+    let re = Regex::new(&re_str).ok()?;
+    let m = re.find(content)?;
+    Some(content[m.start()..m.end()].to_string())
 }
 
 /// Resolve exact or shell-unescaped match pair.
@@ -509,6 +545,11 @@ fn resolve_match_pair<'a>(
             let replacement_candidate = apply_shell_unescape_steps(replacement, steps);
             return Some((Cow::Owned(candidate), replacement_candidate));
         }
+    }
+
+    // changed: flex-whitespace fallback for patterns with embedded newlines (multiline bash args)
+    if let Some(actual_match) = try_multiline_flex_match(content, pattern) {
+        return Some((Cow::Owned(actual_match), Cow::Borrowed(replacement)));
     }
 
     None
@@ -815,7 +856,7 @@ pub fn run_batch(
             Ok(count) => {
                 applied += count;
                 if params.verbose > 0 && params.output == OutputMode::Concise {
-                    eprintln!("[{}/{}] OK {} {}", i + 1, total, op.op, op.file.display());
+                    println!("[{}/{}] OK {} {}", i + 1, total, op.op, op.file.display()); // changed: stdout to avoid stderr/stdout split duplication
                 }
             }
             Err(e) => {
@@ -830,7 +871,7 @@ pub fn run_batch(
                 );
                 errors.push(msg.clone());
                 if params.output == OutputMode::Concise {
-                    eprintln!("{}", msg);
+                    println!("{}", msg); // changed: stdout to avoid stderr/stdout split duplication
                 }
             }
         }
@@ -870,7 +911,9 @@ pub fn run_batch(
     }
 
     if failed == total {
-        bail!("All {} batch operations failed", total);
+        // changed: print to stdout (not bail! which adds "Error:" to stderr, causing duplicate display in Bash tool)
+        println!("Error: All {} batch operations failed", total);
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -974,7 +1017,7 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
             };
 
             let (updated, count) = if op.all {
-                replace_all_counted(&content, from_match.as_ref(), to_match.as_ref())
+                replace_all_counted(content, from_match.as_ref(), to_match.as_ref())
             } else {
                 (
                     content.replacen(from_match.as_ref(), to_match.as_ref(), 1),
@@ -997,7 +1040,14 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
                 .as_deref()
                 .with_context(|| "batch patch: missing 'new' field")?;
             if old.is_empty() {
-                bail!("batch patch: 'old' must be non-empty");
+                // changed: allow empty 'old' when file is also empty (new file creation via patch)
+                if content.is_empty() {
+                    return Ok(BatchApplyResult::Applied {
+                        updated: new.to_string(),
+                        count: 1,
+                    });
+                }
+                bail!("batch patch: 'old' must be non-empty (file has content; use 'create' op for new files, 'replace' to overwrite existing content)");
             }
             let Some((old_match, new_match)) = resolve_match_pair(content, old, new) else {
                 bail!(
@@ -1007,7 +1057,7 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
             };
 
             let (updated, count) = if op.all {
-                replace_all_counted(&content, old_match.as_ref(), new_match.as_ref())
+                replace_all_counted(content, old_match.as_ref(), new_match.as_ref())
             } else {
                 (
                     content.replacen(old_match.as_ref(), new_match.as_ref(), 1),
@@ -1047,10 +1097,10 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
 
             let updated = match fmt {
                 ConfigFormat::Json => {
-                    let mut root: JsonValue = serde_json::from_str(&content)
+                    let mut root: JsonValue = serde_json::from_str(content)
                         .with_context(|| format!("Invalid JSON: {}", op.file.display()))?;
                     set_json_path(&mut root, key, parse_json_value(value, vt)?)?;
-                    serialize_json_preserving_style(&root, &content)?
+                    serialize_json_preserving_style(&root, content)?
                 }
                 ConfigFormat::Toml => {
                     let mut root: DocumentMut = content
@@ -1069,7 +1119,8 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
         }
         // changed: new create op — writes content to a new file (idempotent, fails if file exists with different content)
         "create" => {
-            let content_str = op.content.as_deref().unwrap_or("");
+            // Accept 'content' or 'new' field (new is more intuitive when converting from patch ops)
+            let content_str = op.content.as_deref().or(op.new.as_deref()).unwrap_or(""); // changed: 'new' as alias
             // Idempotent: file already has exactly the desired content
             if content == content_str {
                 return Ok(BatchApplyResult::Noop);
@@ -1478,6 +1529,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("NO_MATCH"));
         assert!(msg.contains("literal '\\\\n'"));
+    }
+
+    #[test]
+    fn patch_multiline_bash_arg_flex_match() {
+        // changed: test that embedded newlines from multiline bash args are handled via flex match
+        // Simulates: --old 'BRE -> PCRE: \| -> |\n      strip escapes like \!'
+        // while the file has it all on one line.
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("flex_match.rs");
+        fs::write(
+            &file,
+            "    // Translate BRE -> PCRE: \\| -> | (alternation), strip shell-injected escapes like \\!\n",
+        )
+        .unwrap();
+
+        // Pattern as if passed from a multiline bash single-quoted arg
+        let old = "    // Translate BRE -> PCRE: \\| -> | (alternation), strip\n      shell-injected escapes like \\!";
+        run_patch(&file, old, "    // REPLACED", false, tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "    // REPLACED\n");
+    }
+
+    #[test]
+    fn patch_multiline_bash_arg_hints_embedded_newline() {
+        // changed: NO_MATCH hint should mention embedded newline when flex also fails
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("flex_hint.rs");
+        fs::write(&file, "completely different content\n").unwrap();
+
+        let err = run_patch(
+            &file,
+            "first line\n    second line",
+            "replacement",
+            false,
+            tp(OutputMode::Quiet),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("NO_MATCH"));
+        assert!(
+            msg.contains("embedded newline"),
+            "hint should mention embedded newline: {msg}"
+        );
+    }
+
+    #[test]
+    fn replace_multiline_bash_arg_flex_match() {
+        // changed: replace also uses flex match for embedded-newline --from args
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("flex_replace.rs");
+        fs::write(&file, "fn foo() -> bool { true }\n").unwrap();
+
+        let old = "fn foo() -> bool\n    { true }";
+        run_replace(
+            &file,
+            old,
+            "fn foo() -> bool { false }",
+            false,
+            tp(OutputMode::Quiet),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "fn foo() -> bool { false }\n"
+        );
     }
 
     #[test]
