@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Fork of rtk-ai/rtk](https://img.shields.io/badge/fork%20of-rtk--ai%2Frtk-blue)](https://github.com/rtk-ai/rtk)
-[![Version](https://img.shields.io/badge/version-0.20.1--fork.4-green)](https://github.com/heAdz0r/rtk)
+[![Version](https://img.shields.io/badge/version-0.21.1--fork.12-green)](https://github.com/heAdz0r/rtk)
 
 **High-performance CLI proxy that minimizes LLM token consumption —<br>from file reads to git operations to semantic code search.**
 
@@ -245,8 +245,9 @@ rtk gain
 
 # 2. Initialize for Claude Code (hook-first mode, recommended)
 rtk init --global
-# → Installs hook + creates slim RTK.md (10 lines)
-# → Follow printed instructions for ~/.claude/settings.json
+# → Installs rewrite hook + Grep/Read/Write/Task policy hooks
+# → Installs memory context hook (rtk-mem-context.sh, fires on ALL Task subagents)
+# → Creates slim RTK.md (10 lines) + patches settings.json (with prompt)
 
 # 3. Test
 rtk git status       # Compact output
@@ -358,17 +359,22 @@ rtk gh run list                  # Workflow run status
 rtk gain                         # Token savings summary
 rtk gain --graph                 # ASCII graph (30 days)
 rtk gain --history               # Recent command history
+rtk gain -p                      # Per-project scope + memory hook row in table
 rtk gain --daily                 # Day-by-day breakdown
 rtk gain --quota --tier 20x      # Monthly quota analysis
 
-rtk discover                     # Find missed savings (current project)
+rtk discover                     # Find missed savings + memory context misses
 rtk discover --all               # All Claude Code projects
-rtk discover --format json       # Machine-readable
+rtk discover --format json       # Machine-readable (memory miss count in JSON)
 
 rtk memory explore .             # Build/reuse shared context artifact
 rtk memory delta .               # Emit changed files/modules only
 rtk memory refresh .             # Force full reindex and persist
 rtk memory watch . --interval 2  # Continuous low-noise delta stream
+rtk memory doctor                # Diagnose hooks + cache health (exit 0/1/2)
+rtk memory setup --auto-patch    # Idempotent installer: hooks + cache + doctor
+rtk memory gain                  # Token savings: raw source → compact context
+rtk memory devenv                # Launch tmux session: watchers + health loop
 
 rtk json config.json             # Structure without values
 rtk deps                         # Dependencies summary

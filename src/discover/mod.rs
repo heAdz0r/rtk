@@ -5,7 +5,7 @@ mod report;
 use anyhow::Result;
 use std::collections::HashMap;
 
-use provider::{ClaudeProvider, SessionProvider};
+use provider::{ClaudeProvider, SessionProvider, TaskEvent};
 use registry::{category_avg_tokens, classify_command, split_command_chain, Classification};
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
 
@@ -64,7 +64,14 @@ pub fn run(
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
 
+    let mut task_events: Vec<TaskEvent> = Vec::new(); // T4: memory miss tracking
+
     for session_path in &sessions {
+        // T4: collect Task events for memory miss detection
+        if let Ok(events) = provider.extract_task_events(session_path) {
+            task_events.extend(events);
+        }
+
         let extracted = match provider.extract_commands(session_path) {
             Ok(cmds) => cmds,
             Err(e) => {
@@ -205,11 +212,62 @@ pub fn run(
         supported,
         unsupported,
         parse_errors,
+        memory_total_tasks: 0, // filled below after task_events scan // [P1] fix
+        memory_miss_count: 0,  // filled below after task_events scan // [P1] fix
+    };
+
+    // T4: compute memory miss stats and embed in report before serialisation // [P1] fix
+    let mem_total_task = task_events.len();
+    let mem_miss_count = task_events.iter().filter(|e| !e.has_memory_context).count();
+
+    let report = report::DiscoverReport {
+        memory_total_tasks: mem_total_task,
+        memory_miss_count: mem_miss_count,
+        ..report
     };
 
     match format {
         "json" => println!("{}", report::format_json(&report)),
-        _ => print!("{}", report::format_text(&report, limit, verbose > 0)),
+        _ => {
+            print!("{}", report::format_text(&report, limit, verbose > 0));
+
+            // T4: Memory Context Misses section (text only) // [P1] fix: guard for JSON
+            if mem_total_task > 0 {
+                if mem_miss_count == 0 {
+                    println!(
+                        "[ok] Memory context: all Task calls had RTK memory injected ({}/{})",
+                        mem_total_task, mem_total_task
+                    );
+                } else {
+                    let misses: Vec<&TaskEvent> = task_events
+                        .iter()
+                        .filter(|e| !e.has_memory_context)
+                        .collect();
+                    println!();
+                    println!(
+                        "Memory Context Misses ({}/{})",
+                        mem_miss_count, mem_total_task
+                    );
+                    println!("{}", "-".repeat(60));
+                    for e in misses.iter().take(limit) {
+                        let agent = e.subagent_type.as_deref().unwrap_or("unknown");
+                        let prefix = if e.prompt_prefix.is_empty() {
+                            "(no prompt)"
+                        } else {
+                            &e.prompt_prefix
+                        };
+                        println!(
+                            "  [{}] {}: {}...",
+                            &e.session_id[..8.min(e.session_id.len())],
+                            agent,
+                            prefix
+                        );
+                    }
+                    println!();
+                    println!("Fix: rtk memory doctor");
+                }
+            }
+        }
     }
 
     Ok(())

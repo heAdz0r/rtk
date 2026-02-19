@@ -732,10 +732,10 @@ enum WriteCommands {
     Replace {
         /// Target file
         file: PathBuf,
-        /// Text to find (exact match)
+        /// Text to find (exact match). Use @/path/file to read from a file (avoids single-quote shell conflicts).
         #[arg(long, allow_hyphen_values = true)]
         from: String,
-        /// Replacement text
+        /// Replacement text. Use @/path/file to read from a file (avoids single-quote shell conflicts).
         #[arg(long, allow_hyphen_values = true)]
         to: String,
         /// Replace all matches
@@ -758,10 +758,10 @@ enum WriteCommands {
     Patch {
         /// Target file
         file: PathBuf,
-        /// Old block to replace (exact match)
+        /// Old block to replace (exact match). Use @/path/file to read from a file (avoids single-quote shell conflicts).
         #[arg(long, allow_hyphen_values = true)]
         old: String,
-        /// New block
+        /// New block. Use @/path/file to read from a file (avoids single-quote shell conflicts).
         #[arg(long = "new", allow_hyphen_values = true)]
         new_text: String,
         /// Replace all matching hunks
@@ -1243,6 +1243,39 @@ enum MemoryCommands {
         /// Output format: json (default), text
         #[arg(short, long, default_value = "json")]
         format: String,
+    },
+
+    /// Diagnose memory layer setup: hooks, cache, gain, rtk binary // T1
+    Doctor {
+        /// Project root to inspect (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// Idempotent installer: hooks + cache + doctor // T2
+    Setup {
+        /// Patch settings.json without interactive prompt
+        #[arg(long)]
+        auto_patch: bool,
+        /// Skip starting file watchers
+        #[arg(long)]
+        no_watch: bool,
+        /// Project root (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// Launch tmux dev environment: grepai watch + rtk memory watch + health loop // T5
+    Devenv {
+        /// Project root (default: current directory)
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Debounce interval for rtk memory watch (seconds)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+        /// tmux session name
+        #[arg(long, default_value = "rtk")] // [P2] fix: spec says "rtk" not "rtk-mem"
+        session_name: String,
     },
 }
 
@@ -2076,6 +2109,26 @@ fn main() -> Result<()> {
             } => {
                 // Plan-context: ranked candidates under token budget
                 memory_layer::run_plan(&project, &task, token_budget, &format, cli.verbose)?;
+            }
+            MemoryCommands::Doctor { project } => {
+                // T1
+                memory_layer::run_doctor(&project, cli.verbose)?;
+            }
+            MemoryCommands::Setup {
+                auto_patch,
+                no_watch,
+                project,
+            } => {
+                // T2
+                memory_layer::run_setup(&project, auto_patch, no_watch, cli.verbose)?;
+            }
+            MemoryCommands::Devenv {
+                project,
+                interval,
+                session_name,
+            } => {
+                // T5
+                memory_layer::run_devenv(&project, interval, &session_name, cli.verbose)?;
             }
         },
 

@@ -156,7 +156,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_episodes_project
              ON episodes(project_id, started_at);
          CREATE INDEX IF NOT EXISTS idx_episode_events_session
-             ON episode_events(session_id);",
+             ON episode_events(session_id);
+         CREATE TABLE IF NOT EXISTS task_file_affinity (
+            project_id     TEXT    NOT NULL,
+            file_path      TEXT    NOT NULL,
+            affinity_score REAL    NOT NULL DEFAULT 0.0,
+            updated_at     INTEGER NOT NULL,
+            PRIMARY KEY (project_id, file_path)
+         );
+         CREATE TABLE IF NOT EXISTS model_registry (
+            model_id      TEXT    PRIMARY KEY,
+            model_name    TEXT    NOT NULL,
+            model_type    TEXT    NOT NULL,
+            created_at    INTEGER NOT NULL,
+            metadata_json TEXT
+         );",
     )
     .context("Failed to initialise mem.db schema")?;
     Ok(())
@@ -339,6 +353,72 @@ pub(super) fn query_cache_stats(project_id: &str) -> Result<Vec<(String, i64)>> 
 }
 
 // ── E3.2: artifact_edges for cascade invalidation ───────────────────────────
+
+/// Memory gain statistics derived from cache_stats events and the stored artifact. // T3
+#[derive(Debug, Default)]
+pub struct MemoryGainStats {
+    /// Number of hook-triggered explore/plan/hit/miss events for this project
+    pub hook_fires: u64,
+    /// Raw source bytes from artifact (sum of all indexed file sizes)
+    pub raw_bytes: u64,
+    /// Compact context bytes (rendered at DetailLevel::Compact)
+    pub context_bytes: u64,
+    /// Savings percentage: (raw - context) / raw * 100
+    pub savings_pct: f64,
+}
+
+/// Query memory gain stats for a project: event count + artifact byte sizes. // T3
+pub fn get_memory_gain_stats(project_id: &str) -> Result<Option<MemoryGainStats>> {
+    let conn = open_mem_db()?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cache_stats WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if count == 0 {
+        return Ok(None);
+    }
+
+    // Load artifact for byte sizes
+    let artifact_json: Option<String> = conn
+        .query_row(
+            "SELECT content_json FROM artifacts WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to query artifact")?;
+
+    // Use artifact total_bytes as raw; estimate compact context via file count heuristic
+    let (raw_bytes, context_bytes): (u64, u64) = if let Some(json) = artifact_json {
+        if let Ok(artifact) = serde_json::from_str::<super::ProjectArtifact>(&json) {
+            let raw = artifact.total_bytes;
+            // Compact context: roughly 30 bytes per file entry (path + summary line)
+            let compact: u64 = artifact.file_count as u64 * 80;
+            (raw, compact.min(raw))
+        } else {
+            (0u64, 0u64)
+        }
+    } else {
+        (0u64, 0u64)
+    };
+
+    let savings_pct = if raw_bytes > 0 {
+        raw_bytes.saturating_sub(context_bytes) as f64 / raw_bytes as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Some(MemoryGainStats {
+        hook_fires: count as u64,
+        raw_bytes,
+        context_bytes,
+        savings_pct,
+    }))
+}
 
 /// Store import edges for a project: from_id = importing file, to_id = imported module.
 /// Clears previous edges for the project before inserting new ones.

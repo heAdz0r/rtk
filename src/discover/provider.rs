@@ -21,6 +21,15 @@ pub struct ExtractedCommand {
     pub sequence_index: usize,
 }
 
+/// A Task tool-use event extracted from a session file. // T4
+#[derive(Debug)]
+pub struct TaskEvent {
+    pub session_id: String,
+    pub subagent_type: Option<String>,
+    pub has_memory_context: bool,
+    pub prompt_prefix: String, // first 60 chars of prompt
+}
+
 /// Trait for session providers (Claude Code, future: Cursor, Windsurf).
 pub trait SessionProvider {
     fn discover_sessions(
@@ -231,6 +240,81 @@ impl SessionProvider for ClaudeProvider {
         }
 
         Ok(commands)
+    }
+}
+
+impl ClaudeProvider {
+    /// Extract Task tool-use events from a session JSONL file. // T4
+    pub fn extract_task_events(&self, path: &Path) -> Result<Vec<TaskEvent>> {
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut events = Vec::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            // Only care about assistant messages containing Task tool_use
+            if !line.contains("\"Task\"") || !line.contains("\"assistant\"") {
+                continue;
+            }
+
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                continue;
+            }
+
+            let content_blocks = match entry.pointer("/message/content").and_then(|c| c.as_array())
+            {
+                Some(b) => b,
+                None => continue,
+            };
+
+            for block in content_blocks {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                if block.get("name").and_then(|n| n.as_str()) != Some("Task") {
+                    continue;
+                }
+
+                let prompt = block
+                    .pointer("/input/prompt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                let subagent_type = block
+                    .pointer("/input/subagent_type")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+
+                let has_memory_context = prompt.contains("RTK Project Memory Context");
+                let prompt_prefix: String = prompt.chars().take(60).collect();
+
+                events.push(TaskEvent {
+                    session_id: session_id.clone(),
+                    subagent_type,
+                    has_memory_context,
+                    prompt_prefix,
+                });
+            }
+        }
+
+        Ok(events)
     }
 }
 

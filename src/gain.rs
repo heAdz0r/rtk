@@ -1,4 +1,5 @@
 use crate::display_helpers::{format_duration, print_period_table};
+use crate::memory_layer::get_memory_gain_stats; // T3
 use crate::tracking::{DayStats, MonthStats, Tracker, WeekStats};
 use crate::utils::format_tokens;
 use anyhow::{Context, Result};
@@ -48,9 +49,32 @@ pub fn run(
         _ => {} // Continue with text format
     }
 
-    let summary = tracker
+    let mut summary = tracker // T3: mut for memory hook row injection // [P1] fix
         .get_summary_filtered(project_scope.as_deref()) // changed: use filtered variant
         .context("Failed to load token savings summary from database")?;
+
+    // T3: inject rtk memory (hook) row into by_command table // [P1] fix: row not block
+    if let Some(ref scope) = project_scope {
+        let project_root = PathBuf::from(scope);
+        let project_id = format!(
+            "{:016x}",
+            xxhash_rust::xxh3::xxh3_64(project_root.to_string_lossy().as_bytes())
+        );
+        if let Ok(Some(mem)) = get_memory_gain_stats(&project_id) {
+            if mem.hook_fires > 0 {
+                let saved = mem.raw_bytes.saturating_sub(mem.context_bytes) as usize;
+                summary.by_command.push((
+                    "rtk memory (hook)".to_string(),
+                    mem.hook_fires as usize,
+                    saved,
+                    mem.savings_pct,
+                    0u64,
+                ));
+                // re-sort by saved tokens descending
+                summary.by_command.sort_by(|a, b| b.2.cmp(&a.2));
+            }
+        }
+    }
 
     if summary.total_commands == 0 {
         println!("No tracking data yet.");

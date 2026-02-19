@@ -51,6 +51,14 @@ pub struct DiscoverReport {
     pub supported: Vec<SupportedEntry>,
     pub unsupported: Vec<UnsupportedEntry>,
     pub parse_errors: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub memory_total_tasks: usize, // T4: total Task calls scanned // [P1] fix
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub memory_miss_count: usize, // T4: Task calls without RTK memory context // [P1] fix
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 impl DiscoverReport {

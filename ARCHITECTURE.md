@@ -257,6 +257,12 @@ ANALYTICS         cc_economics.rs   cc-economics           N/A        ✓
                   learn/            (error learning)       N/A        ✓
                   hook_audit_cmd.rs hook-audit             N/A        ✓
 
+PROJECT MEMORY    memory_layer/     memory explore/delta/  89%+       ✓
+                  mod.rs            refresh/watch/status
+                                    gain/serve/clear
+                                    install-hook/plan
+                                    doctor/setup/devenv
+
 SYSTEM            init.rs           init                   N/A        ✓
                   gain.rs           gain                   N/A        ✓
                   config.rs         (internal)             N/A        ✓
@@ -1161,7 +1167,26 @@ When implementing a new command, consider:
 
 - **README.md**: User guide, installation, examples
 - **CLAUDE.md**: Developer documentation, module details, PR history
+- **MEMORY_LAYER.md**: Memory layer deep-dive — architecture, benchmarks, CLI reference
 - **Cargo.toml**: Dependencies, build profiles, package metadata
+
+---
+
+## Fork Changelog
+
+| Version | Changes |
+|---|---|
+| fork.12 | Memory observability: `rtk memory doctor/setup/devenv`, `rtk gain -p` memory row, `rtk discover` memory miss detection, 18 named tests (T1–T5) |
+| fork.11 | Memory layer full pipeline + write shell-escape fixes |
+| fork.10 | Memory layer initial: explore/delta/refresh/watch/status/gain/serve/install-hook/plan |
+| fork.8 | grep silent errors, BRE escaping, write @file refs |
+| fork.7 | Memory layer full pipeline + write shell-escape fixes |
+| fork.6 | Fix relative-path write, build dedup normalization |
+| fork.5 | Write atomic replace/patch/set/batch (write_cmd.rs, write_core.rs) |
+| fork.4 | Bun wrapper + compact-by-default summaries |
+| fork.3 | Python (ruff, pytest, pip/uv) + Go support |
+| fork.2 | Modern JS/TS tooling: vitest, prisma, playwright, lint, tsc, next, prettier |
+| fork.1 | pnpm support, git argument parsing fix (PR #5) |
 - **src/**: Source code organized by module
 - **.github/workflows/**: CI/CD automation (multi-platform builds, releases)
 
