@@ -5,28 +5,21 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock}; // P1: OnceLock for CG_CACHE
+use std::sync::atomic::{AtomicUsize, Ordering}; // T2.2: bounded thread pool
+use std::sync::{Arc, Mutex}; // Fix 1: OnceLock removed (CG_CACHE gone)
 use std::time::{Duration, Instant};
 
 use super::cache::record_event;
 use super::indexer::build_git_delta;
 use super::renderer::{build_response, render_text};
-use super::{budget, git_churn, intent, ranker}; // plan-context pipeline
+// Fix 1: budget/git_churn/intent/ranker used only via super::plan_context_graph_first
 use super::{indexer, DetailLevel, QueryType, ARTIFACT_VERSION};
 use super::{record_cache_event, store_artifact, store_import_edges};
 
 // Keep poll sleep small to avoid adding ~50ms queueing delay to localhost requests.
 const ACCEPT_POLL_SLEEP: Duration = Duration::from_millis(5);
-
-// P1: in-process call graph cache: project_id → Arc<CallGraph>.
-// Invalidated when the artifact is rebuilt (!state.cache_hit).
-static CG_CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<super::call_graph::CallGraph>>>> =
-    OnceLock::new();
-
-fn cg_cache_global(
-) -> &'static Mutex<std::collections::HashMap<String, Arc<super::call_graph::CallGraph>>> {
-    CG_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
+const MAX_BODY_SIZE: usize = 1_048_576; // T2.1: 1 MB — OOM protection
+const MAX_CONCURRENT_CONNECTIONS: usize = 32; // T2.2: bounded thread pool
 
 // ── Request / response structs ────────────────────────────────────────────────
 
@@ -56,23 +49,18 @@ struct PlanRequest {
     /// Task description (e.g. "fix jwt token refresh bug")
     #[serde(default)]
     task: String,
-    /// Max tokens to include. 0 = use default (4000).
+    /// Max tokens to include. 0 = use default (12000).
     #[serde(default)]
     token_budget: u32,
     /// Output format: "json" or "text"
     #[serde(default = "default_format")]
     format: String,
-    /// Enable Ollama Stage-2 rerank: "off" (default) or "full"
+    /// PRD: force legacy pipeline (default: false)
     #[serde(default)]
-    ml_mode: MlMode,
-}
-
-#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum MlMode {
-    #[default]
-    Off,
-    Full,
+    legacy: bool, // ADDED: PRD additive field
+    /// PRD: include pipeline trace in response (default: false)
+    #[serde(default)]
+    trace: bool,  // ADDED: PRD additive field
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +145,14 @@ fn parse_request(stream: &TcpStream) -> Result<Request> {
     }
 
     // Read body
+    if content_length > MAX_BODY_SIZE {
+        // T2.1: OOM protection
+        bail!(
+            "Request body too large: {} bytes (max {})",
+            content_length,
+            MAX_BODY_SIZE
+        );
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         use std::io::Read;
@@ -311,138 +307,8 @@ fn handle_plan_context(body: &[u8]) -> Result<String> {
     let req: PlanRequest =
         serde_json::from_slice(body).context("Invalid JSON in plan-context request")?;
     let project = std::path::PathBuf::from(&req.project_root);
-    let token_budget = if req.token_budget == 0 {
-        4000
-    } else {
-        req.token_budget
-    };
-    let cfg = super::mem_config();
-
-    // 1. Build/reuse artifact
-    let state = indexer::build_state(&project, false, cfg.features.cascade_invalidation, 0)?;
-    if !state.cache_hit {
-        store_artifact(&state.artifact)?;
-        store_import_edges(&state.artifact);
-    }
-
-    // 2. Load git churn (cached by HEAD sha)
-    let churn =
-        git_churn::load_churn(&state.project_root).unwrap_or_else(|_| git_churn::ChurnCache {
-            head_sha: "unknown".to_string(),
-            freq_map: std::collections::HashMap::new(),
-            max_count: 0,
-        });
-
-    // 3. Parse intent for weight tuning
-    let parsed_intent = intent::parse_intent(&req.task, &state.project_id);
-
-    // 4. Collect recent-change paths for f_recency_score
-    let recent_paths: std::collections::HashSet<String> =
-        state.delta.changes.iter().map(|d| d.path.clone()).collect();
-
-    // 5a. Build call graph from artifact pub fn symbols
-    let all_symbols: Vec<(String, Vec<String>)> = state
-        .artifact
-        .files
-        .iter()
-        .map(|fa| {
-            let syms: Vec<String> = fa
-                .pub_symbols
-                .iter()
-                .filter(|s| s.kind == "fn")
-                .map(|s| s.name.clone())
-                .collect();
-            (fa.rel_path.clone(), syms)
-        })
-        .collect();
-    // P1: retrieve cached graph when artifact unchanged; rebuild + store otherwise
-    let cached_cg: Option<Arc<super::call_graph::CallGraph>> = if state.cache_hit {
-        cg_cache_global()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&state.project_id)
-            .cloned()
-    } else {
-        None
-    };
-    let cg_arc = match cached_cg {
-        Some(cg) => cg,
-        None => {
-            let built =
-                Arc::new(super::call_graph::CallGraph::build(&all_symbols, &state.project_root));
-            cg_cache_global()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(state.project_id.clone(), Arc::clone(&built));
-            built
-        }
-    };
-    let query_tags = parsed_intent.extracted_tags.clone();
-
-    // 5b. Build candidates from artifact file list
-    let candidates: Vec<ranker::Candidate> = state
-        .artifact
-        .files
-        .iter()
-        .map(|fa| {
-            let mut c = ranker::Candidate::new(&fa.rel_path);
-
-            // f_structural_relevance: files with public symbols score higher
-            c.features.f_structural_relevance = if !fa.pub_symbols.is_empty() {
-                1.0
-            } else if !fa.imports.is_empty() {
-                0.5
-            } else {
-                0.2
-            };
-
-            // f_churn_score: objective git history signal
-            c.features.f_churn_score = git_churn::churn_score(&churn, &fa.rel_path);
-
-            // f_recency_score: file in current delta
-            c.features.f_recency_score = if recent_paths.contains(&fa.rel_path) {
-                1.0
-            } else {
-                0.0
-            };
-
-            // f_risk_score: auth/payment/admin path keywords
-            c.features.f_risk_score = ranker::path_risk_score(&fa.rel_path);
-
-            // f_test_proximity: is this a test file?
-            c.features.f_test_proximity = if ranker::is_test_file(&fa.rel_path) {
-                0.8
-            } else {
-                0.0
-            };
-
-            // f_call_graph_score: callers of query-relevant symbols
-            c.features.f_call_graph_score = cg_arc.caller_score(&fa.rel_path, &query_tags); // P1: use cached Arc
-
-            // f_token_cost: normalized estimated cost
-            let raw_cost = budget::estimate_tokens_for_path(&fa.rel_path);
-            c.estimated_tokens = raw_cost;
-            c.features.f_token_cost = (raw_cost as f32 / 1000.0).min(1.0);
-
-            c.sources.push("artifact".to_string());
-            c
-        })
-        .collect();
-
-    // 6. Stage-1: deterministic ranking
-    let ranked = ranker::rank_stage1(candidates, &parsed_intent);
-
-    // 7. Stage-2: Ollama rerank (only if explicitly requested)
-    let ranked = if req.ml_mode == MlMode::Full {
-        // Ollama rerank skipped in this path — add when ollama.rs is wired
-        ranked
-    } else {
-        ranked
-    };
-
-    // 8. Budget-aware assembly (greedy knapsack)
-    let result = budget::assemble(ranked, token_budget);
-
+    // CHANGED: pass legacy flag from request; trace not yet exposed in JSON response
+    let result = super::plan_context_graph_first(&project, &req.task, req.token_budget, req.legacy)?;
     serde_json::to_string(&result).context("Failed to serialize plan-context response")
 }
 
@@ -514,6 +380,7 @@ pub(super) fn serve(port: u16, idle_secs: u64, verbose: u8) -> Result<()> {
     let _pid = PidGuard::write(port);
     let idle_timeout = Duration::from_secs(if idle_secs == 0 { u64::MAX } else { idle_secs });
     let last_request = Arc::new(Mutex::new(Instant::now()));
+    let active_connections = Arc::new(AtomicUsize::new(0)); // T2.2: bounded thread pool
 
     eprintln!(
         "memory.serve: listening on http://{addr} (idle-timeout={}s)",
@@ -531,11 +398,27 @@ pub(super) fn serve(port: u16, idle_secs: u64, verbose: u8) -> Result<()> {
                 if verbose > 0 {
                     eprintln!("memory.serve: connection from {peer}");
                 }
+                let conn_count = active_connections.fetch_add(1, Ordering::Relaxed); // T2.2: check limit
+                if conn_count >= MAX_CONCURRENT_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("memory.serve: connection limit reached, dropping {peer}");
+                    continue;
+                }
                 let v = verbose;
-                std::thread::spawn(move || handle_connection(stream, v));
+                let active = Arc::clone(&active_connections);
+                std::thread::spawn(move || {
+                    handle_connection(stream, v);
+                    active.fetch_sub(1, Ordering::Relaxed); // T2.2: decrement on exit
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if last_request.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > idle_timeout { // P1: handle poisoned mutex
+                if last_request
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .elapsed()
+                    > idle_timeout
+                {
+                    // P1: handle poisoned mutex
                     eprintln!("memory.serve: idle timeout ({idle_secs}s), stopping");
                     break;
                 }

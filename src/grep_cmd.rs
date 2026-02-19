@@ -4,6 +4,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::process::Command;
 
+#[allow(clippy::too_many_arguments)] // changed: 8 args by design, GrepOptions refactor is future work
 pub fn run(
     pattern: &str,
     path: &str,
@@ -22,20 +23,35 @@ pub fn run(
 
     // Translate BRE -> PCRE: \| -> | (alternation), strip shell-injected escapes like \!
     let rg_pattern = bre_to_pcre(pattern);
+    // changed: compile context regex once per run() call instead of per-line (performance fix)
+    let context_re: Option<Regex> = if context_only {
+        Regex::new(&format!("(?i).{{0,20}}{}.*", regex::escape(&rg_pattern))).ok()
+    } else {
+        None
+    };
 
     let mut rg_cmd = Command::new("rg");
     rg_cmd.args(["-n", "--no-heading", &rg_pattern, path]);
 
     if let Some(ft) = file_type {
-        rg_cmd.arg("--type").arg(ft);
+        rg_cmd.arg("--type").arg(normalize_file_type(ft)); // fix: map extension aliases → rg type names
     }
 
-    for arg in extra_args {
-        // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
+    // fix: translate grep/fd flags to rg equivalents, handle --include=PAT and paired --include PAT
+    let mut args_iter = extra_args.iter().peekable();
+    while let Some(arg) = args_iter.next() {
         if arg == "-r" || arg == "--recursive" {
             continue;
         }
-        rg_cmd.arg(arg);
+        if let Some(glob) = arg.strip_prefix("--include=") {
+            rg_cmd.arg(format!("--glob={}", glob)); // fix: --include= → --glob=
+        } else if arg == "--include" {
+            if let Some(next) = args_iter.next() {
+                rg_cmd.arg("--glob").arg(next); // fix: --include PAT → --glob PAT
+            }
+        } else {
+            rg_cmd.arg(arg);
+        }
     }
 
     let output = rg_cmd
@@ -50,7 +66,11 @@ pub fn run(
     // Bug 1: rg exit 2 = regex parse error — stderr was silently swallowed, showed "0 results"
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     if output.status.code() == Some(2) {
-        let msg = format!("❌ rg regex error for '{}': {}", rg_pattern, stderr_str.trim());
+        let msg = format!(
+            "❌ rg regex error for '{}': {}",
+            rg_pattern,
+            stderr_str.trim()
+        );
         println!("{}", msg);
         timer.track(
             &format!("grep -rn '{}' {}", pattern, path),
@@ -92,7 +112,7 @@ pub fn run(
 
         total += 1;
         // Bug 3: pass rg_pattern (PCRE), not original BRE — regex::escape(BRE) breaks context
-        let cleaned = clean_line(content, max_line_len, context_only, &rg_pattern);
+        let cleaned = clean_line(content, max_line_len, context_re.as_ref(), &rg_pattern);
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
 
@@ -140,6 +160,26 @@ pub fn run(
     Ok(())
 }
 
+/// Map common file extension aliases to ripgrep type names.
+/// rg uses "rust" not "rs", "ruby" not "rb", etc.
+fn normalize_file_type(ft: &str) -> &str {
+    match ft {
+        "rs" => "rust", // fix: rg type is "rust", not "rs"
+        "rb" => "ruby",
+        "js" => "js",
+        "ts" => "ts",
+        "py" => "py",
+        "go" => "go",
+        "sh" => "sh",
+        "md" => "md",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "cpp" | "cc" | "cxx" => "cpp",
+        other => other,
+    }
+}
+
 /// Translate a BRE/grep pattern to a PCRE/Rust-regex pattern for ripgrep.
 ///
 /// Two transformations, single char-by-char pass:
@@ -153,6 +193,17 @@ pub fn run(
 ///   `\d` `\D` `\w` `\W` `\s` `\S` `\b` `\B` `\A` `\z`
 ///   `\x` `\u` `\U` `\p` `\P` `\0`-`\9`
 fn bre_to_pcre(pattern: &str) -> String {
+    let translated = bre_to_pcre_raw(pattern);
+    // changed: validate translated pattern; if invalid, escape bare braces that aren't valid quantifiers
+    if Regex::new(&translated).is_err() {
+        escape_bare_braces(&translated)
+    } else {
+        translated
+    }
+}
+
+/// Raw BRE→PCRE translation (no validation).
+fn bre_to_pcre_raw(pattern: &str) -> String {
     let mut result = String::with_capacity(pattern.len());
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -182,6 +233,58 @@ fn bre_to_pcre(pattern: &str) -> String {
     result
 }
 
+/// Escape bare `{` characters that are not part of valid PCRE quantifiers (`{n}`, `{n,}`, `{n,m}`).
+/// Called as a fallback when the translated pattern fails regex validation.
+fn escape_bare_braces(pattern: &str) -> String { // changed: fix bare { that break PCRE (e.g. "Plan {")
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut result = String::with_capacity(pattern.len() + 8);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            // Keep any \X sequence intact (including \{ already escaped)
+            result.push('\\');
+            result.push(chars[i + 1]);
+            i += 2;
+        } else if chars[i] == '{' {
+            if is_valid_quantifier_brace(&chars, i) {
+                result.push('{');
+            } else {
+                result.push_str("\\{"); // escape bare { that isn't a quantifier
+            }
+            i += 1;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Returns true if `{` at `pos` is the start of a valid PCRE quantifier: `{n}`, `{n,}`, `{n,m}`.
+fn is_valid_quantifier_brace(chars: &[char], pos: usize) -> bool {
+    let mut j = pos + 1;
+    let start = j;
+    // Must start with at least one digit
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == start || j >= chars.len() {
+        return false;
+    }
+    match chars[j] {
+        '}' => true, // {n}
+        ',' => {
+            j += 1;
+            // Optional upper bound digits
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            j < chars.len() && chars[j] == '}' // {n,} or {n,m}
+        }
+        _ => false,
+    }
+}
+
 /// Returns true for characters that form valid/meaningful Rust-regex escape sequences.
 /// Backslash before these chars must be preserved; before anything else it is stripped.
 fn is_pcre_escape_char(c: char) -> bool {
@@ -204,16 +307,15 @@ fn is_pcre_escape_char(c: char) -> bool {
     )
 }
 
-fn clean_line(line: &str, max_len: usize, context_only: bool, pattern: &str) -> String {
+// changed: accepts pre-compiled regex instead of recompiling on every call
+fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
     let trimmed = line.trim();
 
-    if context_only {
-        if let Ok(re) = Regex::new(&format!("(?i).{{0,20}}{}.*", regex::escape(pattern))) {
-            if let Some(m) = re.find(trimmed) {
-                let matched = m.as_str();
-                if matched.len() <= max_len {
-                    return matched.to_string();
-                }
+    if let Some(re) = context_re {
+        if let Some(m) = re.find(trimmed) {
+            let matched = m.as_str();
+            if matched.len() <= max_len {
+                return matched.to_string();
             }
         }
     }
@@ -277,7 +379,7 @@ mod tests {
     #[test]
     fn test_clean_line() {
         let line = "            const result = someFunction();";
-        let cleaned = clean_line(line, 50, false, "result");
+        let cleaned = clean_line(line, 50, None, "result"); // changed: None = no context regex
         assert!(!cleaned.starts_with(' '));
         assert!(cleaned.len() <= 50);
     }
@@ -301,18 +403,17 @@ mod tests {
     fn test_clean_line_multibyte() {
         // Thai text that exceeds max_len in bytes
         let line = "  สวัสดีครับ นี่คือข้อความที่ยาวมากสำหรับทดสอบ  ";
-        let cleaned = clean_line(line, 20, false, "ครับ");
-        // Should not panic
+        let cleaned = clean_line(line, 20, None, "ครับ"); // changed: None = no context regex
+                                                         // Should not panic
         assert!(!cleaned.is_empty());
     }
 
     #[test]
     fn test_clean_line_emoji() {
         let line = "🎉🎊🎈🎁🎂🎄 some text 🎃🎆🎇✨";
-        let cleaned = clean_line(line, 15, false, "text");
+        let cleaned = clean_line(line, 15, None, "text"); // changed: None = no context regex
         assert!(!cleaned.is_empty());
     }
-
 
     // Fix: BRE \| alternation is translated to PCRE | for rg
     #[test]
@@ -355,7 +456,10 @@ mod tests {
     // bre_to_pcre: \| -> |
     #[test]
     fn test_bre_to_pcre_alternation() {
-        assert_eq!(bre_to_pcre(r"panic\|todo\|unimplemented"), "panic|todo|unimplemented");
+        assert_eq!(
+            bre_to_pcre(r"panic\|todo\|unimplemented"),
+            "panic|todo|unimplemented"
+        );
     }
 
     // bre_to_pcre: \! (shell histexpand artifact) -> ! (strip spurious backslash)
@@ -381,4 +485,35 @@ mod tests {
         assert_eq!(result, r"foo\");
     }
 
+    // changed: bare { not a quantifier must be escaped so rg doesn't fail
+    #[test]
+    fn test_bre_to_pcre_escapes_bare_brace() {
+        // "Plan {" — the { is NOT a quantifier, must become \{
+        let r = bre_to_pcre("Plan {");
+        assert!(Regex::new(&r).is_ok(), "escaped pattern must be valid regex: {r}");
+        assert!(r.contains("\\{"), "bare {{ should be escaped: {r}");
+    }
+
+    #[test]
+    fn test_bre_to_pcre_alternation_with_bare_brace() {
+        // "run_plan\|MemorySubcommand\|Plan {" — the real failure case
+        let r = bre_to_pcre(r"run_plan\|MemorySubcommand\|Plan {");
+        assert!(Regex::new(&r).is_ok(), "must compile: {r}");
+        assert!(r.contains("run_plan|MemorySubcommand|"), "alternation preserved: {r}");
+    }
+
+    #[test]
+    fn test_bre_to_pcre_keeps_valid_quantifiers() {
+        // {3}, {3,}, {3,5} must NOT be escaped
+        assert_eq!(bre_to_pcre(r"\w{3}"), r"\w{3}");
+        assert_eq!(bre_to_pcre(r"\d{2,}"), r"\d{2,}");
+        assert_eq!(bre_to_pcre(r"a{1,5}"), r"a{1,5}");
+    }
+
+    #[test]
+    fn test_bre_to_pcre_escapes_brace_in_text() {
+        // Struct literal syntax in code searches
+        let r = bre_to_pcre("Foo { bar }");
+        assert!(Regex::new(&r).is_ok(), "must compile: {r}");
+    }
 }

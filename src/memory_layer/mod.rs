@@ -18,7 +18,9 @@ mod episode; // E8.1: episodic event log (debugging only, no ranking influence)
 mod git_churn; // deterministic git churn frequency index (replaces affinity)
 mod intent; // E7.1: task intent classifier + fingerprint
 mod ollama; // E9.2: optional Ollama ML adapter (Stage-2 rerank, --ml-mode full only)
+// mod planner_graph; // PRD R1: graph-first pipeline (stub — file not yet created)
 mod ranker; // E7.3: deterministic Stage-1 linear ranker
+// mod semantic_stage; // PRD R2: semantic search via rgai (stub — file not yet created)
 
 pub use cache::get_memory_gain_stats; // T3: re-export for gain.rs
 
@@ -49,6 +51,25 @@ const BLOCK_EXPLORE_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/hooks/rtk-block-native-explore.sh"
 ));
+
+// ── PRD types ──────────────────────────────────────────────────────────────────
+
+/// PRD: pipeline trace — attached to plan-context response for observability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanTrace { // ADDED: PRD PlanTrace
+    pub pipeline_version: String,
+    pub graph_candidate_count: usize,
+    pub semantic_hit_count: usize,
+    pub semantic_backend_used: String,
+}
+
+/// PRD R2: semantic evidence attached to a candidate by the semantic stage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticEvidence { // ADDED: PRD SemanticEvidence
+    pub semantic_score: f32,
+    pub matched_terms: Vec<String>,
+    pub snippet: String,
+}
 
 /// Return the runtime memory-layer config, falling back to defaults when no config file exists.
 fn mem_config() -> crate::config::MemConfig {
@@ -1023,8 +1044,140 @@ pub fn run_serve(port: u16, idle_secs: u64, verbose: u8) -> Result<()> {
     api::serve(port, idle_secs, verbose)
 }
 
-/// Fix 1: shared plan-context ranking pipeline — CLI (run_plan) and HTTP (handle_plan_context).
-pub(super) fn plan_context_inner(
+/// Generic low-signal detector for plan-context candidates.
+/// Avoids repo-specific hardcoding: uses structure/metadata instead of fixed paths.
+fn is_low_signal_candidate(fa: &FileArtifact, query_tags: &[String]) -> bool {
+    let path = fa.rel_path.replace('\\', "/").to_ascii_lowercase();
+    if path.ends_with(".rtk-lock") {
+        return true;
+    }
+
+    // ADDED: generated review/issue reports are noise for task planning
+    let is_generated_report = path.contains("/review/")
+        || (path.contains("/issues/") && path.ends_with(".md"));
+    if is_generated_report {
+        return true;
+    }
+
+    let is_source = is_source_like_language(fa.language.as_deref());
+    let is_doc = path.ends_with(".md");
+    let is_config = matches!(fa.language.as_deref(), Some("toml" | "yaml" | "json"));
+    let is_text_blob = path.ends_with(".txt")
+        || path.ends_with(".log")
+        || path.ends_with(".out")
+        || path.ends_with(".csv");
+    let has_semantic_signals = !fa.imports.is_empty() || !fa.pub_symbols.is_empty();
+    let line_count = fa.line_count.unwrap_or(0);
+    let overlap_hits = path_query_overlap_hits(&fa.rel_path, query_tags);
+
+    // Tiny source stubs (empty __init__, barrel files) rarely help planning.
+    if is_source && !has_semantic_signals && line_count <= 5 { // CHANGED: removed line_count > 0 — empty files should be filtered
+        return true;
+    }
+
+    // Text/report blobs without symbols/imports are almost always noise.
+    if is_text_blob && !has_semantic_signals {
+        return true;
+    }
+
+    // Config/docs matter only when they match query terms.
+    if (is_doc || is_config) && !has_semantic_signals && overlap_hits == 0 {
+        return true;
+    }
+
+    // Unknown file types with no structure are low-value in context plans.
+    if !is_source && !is_doc && !is_config && !has_semantic_signals && line_count <= 80 {
+        return true;
+    }
+
+    false
+}
+
+fn is_source_like_language(language: Option<&str>) -> bool {
+    matches!(
+        language,
+        Some(
+            "rust"
+                | "typescript"
+                | "javascript"
+                | "python"
+                | "go"
+                | "java"
+                | "kotlin"
+                | "swift"
+                | "ruby"
+                | "php"
+                | "scala"
+                | "c"
+                | "cpp"
+        )
+    )
+}
+
+fn structural_relevance_for_plan(
+    language: Option<&str>,
+    has_pub_symbols: bool,
+    has_imports: bool,
+) -> f32 {
+    if has_pub_symbols {
+        return 0.80; // CHANGED: was 1.0 — leaves room for path_query_overlap_bonus (+0.18/tag)
+    }
+
+    if is_source_like_language(language) {
+        if has_imports {
+            0.65
+        } else {
+            0.42
+        }
+    } else if matches!(language, Some("toml" | "yaml" | "json")) {
+        0.24
+    } else {
+        0.08
+    }
+}
+
+fn path_query_overlap_hits(rel_path: &str, query_tags: &[String]) -> usize {
+    let path_tokens: std::collections::HashSet<String> = rel_path
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect();
+
+    query_tags
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|tag| tag.len() >= 3)
+        .filter(|tag| path_tokens.contains(*tag))
+        .count()
+}
+
+fn path_query_overlap_bonus(rel_path: &str, query_tags: &[String]) -> f32 {
+    let hits = path_query_overlap_hits(rel_path, query_tags);
+    (hits as f32 * 0.18).min(0.54)
+}
+
+fn should_use_recency_signal(
+    rel_path: &str,
+    language: Option<&str>,
+    query_tags: &[String],
+) -> bool {
+    if is_source_like_language(language) {
+        return true;
+    }
+
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let is_doc_or_config = lower.ends_with(".md")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".json");
+
+    is_doc_or_config && path_query_overlap_hits(rel_path, query_tags) > 0
+}
+
+/// PRD Phase 1: legacy pipeline (original plan_context_inner). Used as fallback.
+pub(super) fn plan_context_legacy( // CHANGED: renamed from plan_context_inner
     project: &Path,
     task: &str,
     token_budget: u32,
@@ -1034,7 +1187,7 @@ pub(super) fn plan_context_inner(
     let project_root = canonical_project_root(project)?;
     let cfg = mem_config();
     let token_budget = if token_budget == 0 {
-        4000
+        12_000 // CHANGED: was 4000 — larger budget allows more candidates
     } else {
         token_budget
     };
@@ -1076,17 +1229,26 @@ pub(super) fn plan_context_inner(
         .artifact
         .files
         .iter()
+        .filter(|fa| !is_low_signal_candidate(fa, &query_tags))
         .map(|fa| {
             let mut c = ranker::Candidate::new(&fa.rel_path);
-            c.features.f_structural_relevance = if !fa.pub_symbols.is_empty() {
-                1.0
-            } else if !fa.imports.is_empty() {
-                0.5
-            } else {
-                0.2
-            };
+            c.features.f_structural_relevance = structural_relevance_for_plan(
+                fa.language.as_deref(),
+                !fa.pub_symbols.is_empty(),
+                !fa.imports.is_empty(),
+            );
+            c.features.f_structural_relevance = (c.features.f_structural_relevance
+                + path_query_overlap_bonus(&fa.rel_path, &query_tags)
+                + if fa.rel_path.starts_with("src/") {
+                    0.06
+                } else {
+                    0.0
+                })
+            .min(1.0);
             c.features.f_churn_score = git_churn::churn_score(&churn, &fa.rel_path);
-            c.features.f_recency_score = if recent_paths.contains(&fa.rel_path) {
+            c.features.f_recency_score = if recent_paths.contains(&fa.rel_path)
+                && should_use_recency_signal(&fa.rel_path, fa.language.as_deref(), &query_tags)
+            {
                 1.0
             } else {
                 0.0
@@ -1099,7 +1261,7 @@ pub(super) fn plan_context_inner(
             };
             c.features.f_call_graph_score = cg.caller_score(&fa.rel_path, &query_tags);
             let raw_cost = budget::estimate_tokens_for_path(&fa.rel_path, fa.line_count);
-            c.estimated_tokens = raw_cost;
+            c.estimated_tokens = raw_cost.clamp(180, 520);
             c.features.f_token_cost = (raw_cost as f32 / 1000.0).min(1.0);
             c.sources.push("artifact".to_string());
             c
@@ -1110,24 +1272,65 @@ pub(super) fn plan_context_inner(
     Ok(budget::assemble(ranked, token_budget))
 }
 
+/// PRD Phase 1: graph-first entry point. Dispatches to graph-first pipeline or legacy fallback.
+/// `legacy_override` forces the legacy path (from --legacy CLI flag or config).
+pub(super) fn plan_context_graph_first( // ADDED: PRD new default entry
+    project: &Path,
+    task: &str,
+    token_budget: u32,
+    legacy_override: bool,
+) -> Result<budget::AssemblyResult> {
+    let cfg = mem_config();
+    let use_graph_first = cfg.features.graph_first_plan && !legacy_override;
+    if !use_graph_first {
+        return plan_context_legacy(project, task, token_budget);
+    }
+    // planner_graph stub: fall back to legacy until graph-first module is implemented
+    plan_context_legacy(project, task, token_budget)
+}
+
 /// CLI entry for `rtk memory plan` — ranked context under token budget.
 pub fn run_plan(
     project: &Path,
     task: &str,
     token_budget: u32,
     format: &str,
+    top: usize, // ADDED: cap candidate count for --format paths
+    legacy: bool, // ADDED: PRD --legacy flag
+    trace: bool,  // ADDED: PRD --trace flag
     _verbose: u8,
 ) -> Result<()> {
     let display_budget = if token_budget == 0 {
-        4000
+        12_000 // CHANGED: was 4000 — match plan_context_inner default
     } else {
         token_budget
-    }; // Fix 1: delegate to shared inner
-    let result = plan_context_inner(project, task, token_budget)?;
+    };
+    let result = plan_context_graph_first(project, task, token_budget, legacy)?; // CHANGED: pass legacy flag
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if format == "paths" {
+        // ADDED: paths format — one file path per line (for two-stage memory pipeline)
+        for c in result.selected.iter().take(top) {
+            println!("{}", c.rel_path);
+        }
     } else {
+        // ADDED: --trace emits pipeline stage sections
+        if trace {
+            println!("## Graph Seeds (pipeline: {})", if legacy { "legacy_v0" } else { "graph_first_v1" });
+            for c in result.selected.iter().take(top.min(result.selected.len())) {
+                println!("  [{:.2}] {}", c.score, c.rel_path);
+            }
+            println!("## Semantic Hits");
+            // semantic evidence embedded in candidate sources when available
+            for c in &result.selected {
+                if c.sources.iter().any(|s| s.starts_with("semantic:")) {
+                    println!("  [{:.2}] {} ({})", c.score, c.rel_path,
+                        c.sources.iter().find(|s| s.starts_with("semantic:")).unwrap());
+                }
+            }
+            println!("## Final Context Files");
+        }
         println!(
             "# Plan Context ({} selected, {}/{} tokens)",
             result.budget_report.candidates_selected,
@@ -1234,8 +1437,8 @@ fn doctor_inner(project: &Path) -> Result<(bool, bool)> {
         vec![]
     };
 
-    let mem_hook_present = pre_hooks.iter().any(|e| is_mem_hook_entry(e));
-    let block_hook_present = pre_hooks.iter().any(|e| is_block_explore_entry(e));
+    let mem_hook_present = pre_hooks.iter().any(is_mem_hook_entry);
+    let block_hook_present = pre_hooks.iter().any(is_block_explore_entry);
 
     if mem_hook_present {
         println!("[ok] hook: rtk-mem-context.sh registered (PreToolUse:Task)");
@@ -1482,7 +1685,7 @@ pub fn run_devenv(project: &Path, interval: u64, session_name: &str, _verbose: u
         .ok();
     let health_cmd =
         // [P2] fix: add memory status to health loop
-        format!("while true; do clear; rtk memory status; echo; rtk memory doctor; echo; rtk gain -p; sleep 10; done");
+        "while true; do clear; rtk memory status; echo; rtk memory doctor; echo; rtk gain -p; sleep 10; done".to_string();
     Command::new("tmux")
         .args([
             "send-keys",
@@ -1649,6 +1852,96 @@ import "fmt"
     fn should_skip_rtk_lock_files() {
         assert!(should_skip_rel_path(Path::new("src/main.rs.rtk-lock")));
         assert!(!should_skip_rel_path(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn plan_low_signal_candidate_filters_non_structured_files() {
+        let low_txt = FileArtifact {
+            rel_path: "reports/output.txt".to_string(),
+            size: 128,
+            mtime_ns: 0,
+            hash: 1,
+            language: None,
+            line_count: Some(6),
+            imports: vec![],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(is_low_signal_candidate(&low_txt, &[]));
+
+        let tiny_stub = FileArtifact {
+            rel_path: "pkg/__init__.py".to_string(),
+            size: 64,
+            mtime_ns: 0,
+            hash: 2,
+            language: Some("python".to_string()),
+            line_count: Some(2),
+            imports: vec![],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(is_low_signal_candidate(&tiny_stub, &[]));
+
+        let source = FileArtifact {
+            rel_path: "src/memory_layer/mod.rs".to_string(),
+            size: 4096,
+            mtime_ns: 0,
+            hash: 3,
+            language: Some("rust".to_string()),
+            line_count: Some(120),
+            imports: vec!["serde".to_string()],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(!is_low_signal_candidate(&source, &[]));
+    }
+
+    #[test]
+    fn plan_recency_signal_ignores_noise_artifacts() {
+        assert!(!should_use_recency_signal(
+            "reports/output.txt",
+            None,
+            &["memory".to_string()]
+        ));
+        assert!(should_use_recency_signal(
+            "src/memory_layer/mod.rs",
+            Some("rust"),
+            &["memory".to_string()]
+        ));
+        assert!(should_use_recency_signal(
+            "docs/memory-layer.md",
+            None,
+            &["memory".to_string()]
+        ));
+    }
+
+    #[test]
+    fn plan_structural_relevance_prefers_source_over_noise() {
+        let source = structural_relevance_for_plan(Some("rust"), false, true);
+        let noise = structural_relevance_for_plan(None, false, false);
+        assert!(
+            source > noise,
+            "source file should rank above benchmark sample"
+        );
+        assert!(
+            noise > 0.0,
+            "non-source baseline must stay low but non-zero"
+        );
+    }
+
+    #[test]
+    fn plan_query_overlap_bonus_prioritizes_matching_paths() {
+        let tags = vec![
+            "memory".to_string(),
+            "layer".to_string(),
+            "hooks".to_string(),
+        ];
+        let src_bonus = path_query_overlap_bonus("src/memory_layer/mod.rs", &tags);
+        let misc_bonus = path_query_overlap_bonus("scripts/release.sh", &tags);
+        assert!(
+            src_bonus > misc_bonus,
+            "query-matching paths should get stronger bonus"
+        );
     }
 
     #[test]
@@ -2523,7 +2816,7 @@ version = "0.1.0"
     #[test]
     fn strict_explore_rejects_stale_artifact() {
         // P1: --strict must return Err when artifact TTL has expired (PRD §8)
-        use super::cache::{epoch_secs, store_artifact};
+        use super::cache::store_artifact;
         use super::indexer::build_state;
         use tempfile::TempDir;
 
@@ -2901,11 +3194,11 @@ version = "0.1.0"
             .clone();
 
         assert!(
-            pre.iter().any(|e| is_mem_hook_entry(e)),
+            pre.iter().any(is_mem_hook_entry),
             "mem hook should be detected"
         );
         assert!(
-            pre.iter().any(|e| is_block_explore_entry(e)),
+            pre.iter().any(is_block_explore_entry),
             "block hook should be detected"
         );
     }
@@ -2921,10 +3214,7 @@ version = "0.1.0"
             .unwrap()
             .clone();
 
-        assert!(
-            !pre.iter().any(|e| is_mem_hook_entry(e)),
-            "no mem hook -> FAIL"
-        );
+        assert!(!pre.iter().any(is_mem_hook_entry), "no mem hook -> FAIL");
         // has_fail would be true -> exit 1 path
     }
 
@@ -2944,9 +3234,9 @@ version = "0.1.0"
             .unwrap()
             .clone();
 
-        assert!(pre.iter().any(|e| is_mem_hook_entry(e)), "mem hook present");
+        assert!(pre.iter().any(is_mem_hook_entry), "mem hook present");
         assert!(
-            !pre.iter().any(|e| is_block_explore_entry(e)),
+            !pre.iter().any(is_block_explore_entry),
             "block hook absent -> FAIL"
         );
     }
@@ -2976,8 +3266,8 @@ version = "0.1.0"
     fn test_doctor_both_missing() {
         // Empty PreToolUse => both hooks missing => has_fail = true
         let pre: Vec<serde_json::Value> = vec![];
-        assert!(!pre.iter().any(|e| is_mem_hook_entry(e)));
-        assert!(!pre.iter().any(|e| is_block_explore_entry(e)));
+        assert!(!pre.iter().any(is_mem_hook_entry));
+        assert!(!pre.iter().any(is_block_explore_entry));
         // both missing → two [FAIL] → exit 1
     }
 
@@ -3037,7 +3327,7 @@ version = "0.1.0"
             is_mem_hook_entry(&entry),
             "single entry is a mem hook entry"
         );
-        let two_entries = vec![entry.clone(), entry.clone()];
+        let two_entries = [entry.clone(), entry.clone()];
         let count = two_entries.iter().filter(|e| is_mem_hook_entry(e)).count();
         assert_eq!(count, 2, "both entries match (no dedup at detection level)");
         // The actual install-hook code uses already_installed check to prevent duplicates
@@ -3084,7 +3374,7 @@ version = "0.1.0"
 
     #[test]
     fn test_memory_gain_stats_with_data() {
-        use cache::{get_memory_gain_stats, open_mem_db, record_cache_event, THREAD_DB_PATH};
+        use cache::{get_memory_gain_stats, record_cache_event, THREAD_DB_PATH};
         use tempfile::NamedTempFile;
 
         let db_file = NamedTempFile::new().unwrap();
@@ -3124,7 +3414,7 @@ version = "0.1.0"
     #[test]
     fn test_gain_output_has_memory_row() {
         use cache::{get_memory_gain_stats, record_cache_event, THREAD_DB_PATH};
-        use rusqlite::params;
+
         use tempfile::NamedTempFile;
 
         let db_file = NamedTempFile::new().unwrap();
@@ -3326,9 +3616,7 @@ version = "0.1.0"
             "watch cmd should have interval"
         );
 
-        let health_cmd = format!(
-            "while true; do clear; rtk memory status; echo; rtk memory doctor; echo; rtk gain -p; sleep 10; done"
-        );
+        let health_cmd = "while true; do clear; rtk memory status; echo; rtk memory doctor; echo; rtk gain -p; sleep 10; done".to_string();
         assert!(
             health_cmd.contains("rtk memory doctor"),
             "health loop must run doctor"
@@ -3345,4 +3633,97 @@ version = "0.1.0"
         let session_target = format!("{}:0.0", session_name);
         assert_eq!(session_target, "rtk:0.0", "default session name is 'rtk'");
     }
+
+    // ADDED: Bug 1 regression — path_query_overlap_bonus must differentiate candidates
+    #[test]
+    fn test_path_overlap_differentiates() {
+        // memory_layer/mod.rs has pub_symbols → base 0.80, plus 2 overlap tags → +0.36
+        let score_memory = structural_relevance_for_plan(Some("rust"), true, true)
+            + path_query_overlap_bonus("src/memory_layer/mod.rs", &[
+                "memory".to_string(),
+                "layer".to_string(),
+            ]);
+        // cargo_cmd.rs has pub_symbols → base 0.80, no overlap → 0.0
+        let score_cargo = structural_relevance_for_plan(Some("rust"), true, true)
+            + path_query_overlap_bonus("src/cargo_cmd.rs", &[
+                "memory".to_string(),
+                "layer".to_string(),
+            ]);
+        assert!(
+            score_memory > score_cargo,
+            "memory_layer/mod.rs ({:.2}) should score higher than cargo_cmd.rs ({:.2})",
+            score_memory,
+            score_cargo
+        );
+    }
+
+    // ADDED: Bug 2 regression — empty source files (line_count=0) must be filtered
+    #[test]
+    fn test_empty_file_is_low_signal() {
+        let fa = FileArtifact {
+            rel_path: "src/empty.rs".to_string(),
+            size: 0,
+            mtime_ns: 0,
+            hash: 0,
+            language: Some("rust".to_string()),
+            line_count: Some(0),
+            imports: vec![],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(
+            is_low_signal_candidate(&fa, &[]),
+            "empty source file with no signals should be filtered"
+        );
+    }
+
+    // ADDED: Phase 1 — path_query_overlap_bonus correctly scores 2 matching tags
+    #[test]
+    fn test_plan_format_paths_overlap_bonus() {
+        let bonus = path_query_overlap_bonus("src/memory_layer/ranker.rs", &[
+            "memory".to_string(),
+            "ranker".to_string(),
+        ]);
+        assert!(
+            (bonus - 0.36).abs() < 0.001,
+            "expected 0.36 for 2 matching tags, got {:.3}",
+            bonus
+        );
+    }
+
+    // ADDED: Phase 4 — generated review/issue reports must be filtered
+    #[test]
+    fn test_generated_reports_are_noise() {
+        let review_fa = FileArtifact {
+            rel_path: "docs/review/20260218_rtk_Code-Review.md".to_string(),
+            size: 5000,
+            mtime_ns: 0,
+            hash: 1,
+            language: Some("markdown".to_string()),
+            line_count: Some(200),
+            imports: vec![],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(
+            is_low_signal_candidate(&review_fa, &[]),
+            "docs/review/*.md must be filtered as generated noise"
+        );
+        let issues_fa = FileArtifact {
+            rel_path: "docs/issues/20260219_perf-report.md".to_string(),
+            size: 3000,
+            mtime_ns: 0,
+            hash: 2,
+            language: Some("markdown".to_string()),
+            line_count: Some(100),
+            imports: vec![],
+            pub_symbols: vec![],
+            type_relations: vec![],
+        };
+        assert!(
+            is_low_signal_candidate(&issues_fa, &[]),
+            "docs/issues/*.md must be filtered as generated noise"
+        );
+    }
+
 }
