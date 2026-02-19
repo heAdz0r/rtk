@@ -18,9 +18,9 @@ mod episode; // E8.1: episodic event log (debugging only, no ranking influence)
 mod git_churn; // deterministic git churn frequency index (replaces affinity)
 mod intent; // E7.1: task intent classifier + fingerprint
 mod ollama; // E9.2: optional Ollama ML adapter (Stage-2 rerank, --ml-mode full only)
-// mod planner_graph; // PRD R1: graph-first pipeline (stub — file not yet created)
+mod planner_graph; // PRD R1: graph-first Tier A/B/C candidate builder // ADDED
 mod ranker; // E7.3: deterministic Stage-1 linear ranker
-// mod semantic_stage; // PRD R2: semantic search via rgai (stub — file not yet created)
+mod semantic_stage; // PRD R2: targeted semantic search via rgai ladder // ADDED
 
 pub use cache::get_memory_gain_stats; // T3: re-export for gain.rs
 
@@ -54,18 +54,10 @@ const BLOCK_EXPLORE_SCRIPT: &str = include_str!(concat!(
 
 // ── PRD types ──────────────────────────────────────────────────────────────────
 
-/// PRD: pipeline trace — attached to plan-context response for observability.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlanTrace { // ADDED: PRD PlanTrace
-    pub pipeline_version: String,
-    pub graph_candidate_count: usize,
-    pub semantic_hit_count: usize,
-    pub semantic_backend_used: String,
-}
-
 /// PRD R2: semantic evidence attached to a candidate by the semantic stage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SemanticEvidence { // ADDED: PRD SemanticEvidence
+pub struct SemanticEvidence {
+    // ADDED: PRD SemanticEvidence
     pub semantic_score: f32,
     pub matched_terms: Vec<String>,
     pub snippet: String,
@@ -1053,8 +1045,8 @@ fn is_low_signal_candidate(fa: &FileArtifact, query_tags: &[String]) -> bool {
     }
 
     // ADDED: generated review/issue reports are noise for task planning
-    let is_generated_report = path.contains("/review/")
-        || (path.contains("/issues/") && path.ends_with(".md"));
+    let is_generated_report =
+        path.contains("/review/") || (path.contains("/issues/") && path.ends_with(".md"));
     if is_generated_report {
         return true;
     }
@@ -1071,7 +1063,8 @@ fn is_low_signal_candidate(fa: &FileArtifact, query_tags: &[String]) -> bool {
     let overlap_hits = path_query_overlap_hits(&fa.rel_path, query_tags);
 
     // Tiny source stubs (empty __init__, barrel files) rarely help planning.
-    if is_source && !has_semantic_signals && line_count <= 5 { // CHANGED: removed line_count > 0 — empty files should be filtered
+    if is_source && !has_semantic_signals && line_count <= 5 {
+        // CHANGED: removed line_count > 0 — empty files should be filtered
         return true;
     }
 
@@ -1177,7 +1170,8 @@ fn should_use_recency_signal(
 }
 
 /// PRD Phase 1: legacy pipeline (original plan_context_inner). Used as fallback.
-pub(super) fn plan_context_legacy( // CHANGED: renamed from plan_context_inner
+pub(super) fn plan_context_legacy(
+    // CHANGED: renamed from plan_context_inner
     project: &Path,
     task: &str,
     token_budget: u32,
@@ -1274,7 +1268,8 @@ pub(super) fn plan_context_legacy( // CHANGED: renamed from plan_context_inner
 
 /// PRD Phase 1: graph-first entry point. Dispatches to graph-first pipeline or legacy fallback.
 /// `legacy_override` forces the legacy path (from --legacy CLI flag or config).
-pub(super) fn plan_context_graph_first( // ADDED: PRD new default entry
+pub(super) fn plan_context_graph_first(
+    // ADDED: PRD new default entry
     project: &Path,
     task: &str,
     token_budget: u32,
@@ -1285,8 +1280,20 @@ pub(super) fn plan_context_graph_first( // ADDED: PRD new default entry
     if !use_graph_first {
         return plan_context_legacy(project, task, token_budget);
     }
-    // planner_graph stub: fall back to legacy until graph-first module is implemented
-    plan_context_legacy(project, task, token_budget)
+    // CHANGED: delegate to graph-first pipeline (PRD Phase 2+3+4)
+    let result = planner_graph::run_graph_first_pipeline(project, task, token_budget, &cfg);
+    match result {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if cfg.features.plan_fail_open {
+                eprintln!("rtk memory plan: graph-first failed ({e}), falling back to legacy");
+                let _ = record_cache_event("rtk", "plan_legacy_fallback"); // PRD Phase 5 telemetry
+                plan_context_legacy(project, task, token_budget)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// CLI entry for `rtk memory plan` — ranked context under token budget.
@@ -1295,7 +1302,7 @@ pub fn run_plan(
     task: &str,
     token_budget: u32,
     format: &str,
-    top: usize, // ADDED: cap candidate count for --format paths
+    top: usize,   // ADDED: cap candidate count for --format paths
     legacy: bool, // ADDED: PRD --legacy flag
     trace: bool,  // ADDED: PRD --trace flag
     _verbose: u8,
@@ -1317,7 +1324,14 @@ pub fn run_plan(
     } else {
         // ADDED: --trace emits pipeline stage sections
         if trace {
-            println!("## Graph Seeds (pipeline: {})", if legacy { "legacy_v0" } else { "graph_first_v1" });
+            println!(
+                "## Graph Seeds (pipeline: {})",
+                if legacy {
+                    "legacy_v0"
+                } else {
+                    "graph_first_v1"
+                }
+            );
             for c in result.selected.iter().take(top.min(result.selected.len())) {
                 println!("  [{:.2}] {}", c.score, c.rel_path);
             }
@@ -1325,8 +1339,15 @@ pub fn run_plan(
             // semantic evidence embedded in candidate sources when available
             for c in &result.selected {
                 if c.sources.iter().any(|s| s.starts_with("semantic:")) {
-                    println!("  [{:.2}] {} ({})", c.score, c.rel_path,
-                        c.sources.iter().find(|s| s.starts_with("semantic:")).unwrap());
+                    println!(
+                        "  [{:.2}] {} ({})",
+                        c.score,
+                        c.rel_path,
+                        c.sources
+                            .iter()
+                            .find(|s| s.starts_with("semantic:"))
+                            .unwrap()
+                    );
                 }
             }
             println!("## Final Context Files");
@@ -3639,16 +3660,16 @@ version = "0.1.0"
     fn test_path_overlap_differentiates() {
         // memory_layer/mod.rs has pub_symbols → base 0.80, plus 2 overlap tags → +0.36
         let score_memory = structural_relevance_for_plan(Some("rust"), true, true)
-            + path_query_overlap_bonus("src/memory_layer/mod.rs", &[
-                "memory".to_string(),
-                "layer".to_string(),
-            ]);
+            + path_query_overlap_bonus(
+                "src/memory_layer/mod.rs",
+                &["memory".to_string(), "layer".to_string()],
+            );
         // cargo_cmd.rs has pub_symbols → base 0.80, no overlap → 0.0
         let score_cargo = structural_relevance_for_plan(Some("rust"), true, true)
-            + path_query_overlap_bonus("src/cargo_cmd.rs", &[
-                "memory".to_string(),
-                "layer".to_string(),
-            ]);
+            + path_query_overlap_bonus(
+                "src/cargo_cmd.rs",
+                &["memory".to_string(), "layer".to_string()],
+            );
         assert!(
             score_memory > score_cargo,
             "memory_layer/mod.rs ({:.2}) should score higher than cargo_cmd.rs ({:.2})",
@@ -3680,10 +3701,10 @@ version = "0.1.0"
     // ADDED: Phase 1 — path_query_overlap_bonus correctly scores 2 matching tags
     #[test]
     fn test_plan_format_paths_overlap_bonus() {
-        let bonus = path_query_overlap_bonus("src/memory_layer/ranker.rs", &[
-            "memory".to_string(),
-            "ranker".to_string(),
-        ]);
+        let bonus = path_query_overlap_bonus(
+            "src/memory_layer/ranker.rs",
+            &["memory".to_string(), "ranker".to_string()],
+        );
         assert!(
             (bonus - 0.36).abs() < 0.001,
             "expected 0.36 for 2 matching tags, got {:.3}",
@@ -3725,5 +3746,4 @@ version = "0.1.0"
             "docs/issues/*.md must be filtered as generated noise"
         );
     }
-
 }

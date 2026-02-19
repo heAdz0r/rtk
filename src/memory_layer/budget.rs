@@ -31,6 +31,18 @@ pub struct AssemblyResult {
     pub budget_report: BudgetReport,
     /// Human-readable trace of why each selected candidate was chosen.
     pub decision_trace: Vec<String>,
+    /// PRD R4: pipeline version identifier (additive, old consumers ignore it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_version: Option<String>, // ADDED: PRD additive field
+    /// PRD R4: semantic backend used in this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_backend_used: Option<String>, // ADDED: PRD additive field
+    /// PRD R4: number of graph-first candidates built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_candidate_count: Option<usize>, // ADDED: PRD additive field
+    /// PRD R4: number of candidates with semantic evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_hit_count: Option<usize>, // ADDED: PRD additive field
 }
 
 // ── Token estimator ────────────────────────────────────────────────────────────
@@ -38,25 +50,34 @@ pub struct AssemblyResult {
 const BASE_TOKENS_PER_FILE: u32 = 40; // path + metadata overhead
 const TOKENS_PER_CHAR: f32 = 0.28; // empirical: ~3.5 chars per token
 
-/// Estimate token cost for a file by extension (rough median line-count-based heuristic).
-pub fn estimate_tokens_for_path(rel_path: &str) -> u32 {
+/// Estimate token cost for a file. Uses actual line_count when available (T4.1).
+/// Falls back to extension-based median estimates.
+pub fn estimate_tokens_for_path(rel_path: &str, line_count: Option<u32>) -> u32 {
+    // T4.1: line_count param
     let base = BASE_TOKENS_PER_FILE;
     let path_tokens = (rel_path.len() as f32 * TOKENS_PER_CHAR) as u32;
-    let content_tokens: u32 = match rel_path.rsplit('.').next().unwrap_or("") {
-        "rs" | "ts" | "tsx" | "java" | "go" | "cpp" | "c" => 350,
-        "py" | "js" | "jsx" | "swift" | "kt" => 280,
-        "md" | "toml" | "yaml" | "yml" => 150,
-        "json" | "lock" => 120,
-        _ => 200,
+    let content_tokens = if let Some(lines) = line_count {
+        // T4.1: use actual line count
+        (lines as f32 * 14.0) as u32 // ~55 chars/line × 0.25 tok/char
+    } else {
+        match rel_path.rsplit('.').next().unwrap_or("") {
+            "rs" | "ts" | "tsx" | "java" | "go" | "cpp" | "c" => 350,
+            "py" | "js" | "jsx" | "swift" | "kt" => 280,
+            "md" | "toml" | "yaml" | "yml" => 150,
+            "json" | "lock" => 120,
+            _ => 200,
+        }
     };
     base + path_tokens + content_tokens
 }
 
-/// Utility of a candidate: score / normalized_token_cost.
-/// Higher score and lower token cost = higher utility.
+/// Utility of a candidate: score / sqrt(normalized_token_cost).
+/// CHANGED: use sqrt to reduce cost penalty — prevents cheap low-relevance files
+/// from displacing expensive high-relevance source files in greedy selection.
 fn utility(c: &Candidate) -> f32 {
+    // CHANGED: score / sqrt(cost) instead of score / cost
     let cost_normalized = (c.estimated_tokens.max(1) as f32 / 100.0).max(0.1);
-    c.score / cost_normalized
+    c.score / cost_normalized.sqrt()
 }
 
 // ── Assembly ───────────────────────────────────────────────────────────────────
@@ -122,6 +143,11 @@ pub fn assemble(candidates: Vec<Candidate>, token_budget: u32) -> AssemblyResult
         decision_trace: trace,
         selected,
         dropped,
+        // ADDED: PRD additive fields — None by default (set by graph-first pipeline)
+        pipeline_version: None,
+        semantic_backend_used: None,
+        graph_candidate_count: None,
+        semantic_hit_count: None,
     }
 }
 
@@ -205,7 +231,13 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens_by_extension() {
-        assert!(estimate_tokens_for_path("src/main.rs") > estimate_tokens_for_path("config.json"));
-        assert!(estimate_tokens_for_path("README.md") < estimate_tokens_for_path("src/lib.rs"));
+        assert!(
+            estimate_tokens_for_path("src/main.rs", None)
+                > estimate_tokens_for_path("config.json", None)
+        ); // T4.3: None as second arg
+        assert!(
+            estimate_tokens_for_path("README.md", None)
+                < estimate_tokens_for_path("src/lib.rs", None)
+        );
     }
 }

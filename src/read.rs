@@ -15,6 +15,7 @@ use std::path::Path;
 // Re-export ReadMode from read_types for backward compat with main.rs
 pub use crate::read_types::ReadMode;
 
+#[allow(clippy::too_many_arguments)] // changed: file read params bundle naturally together
 pub fn run(
     file: &Path,
     level: FilterLevel,

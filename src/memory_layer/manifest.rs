@@ -130,7 +130,6 @@ pub(super) fn split_pep508(spec: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_layer::*;
 
     #[test]
     fn parse_cargo_toml_content_extracts_deps() {

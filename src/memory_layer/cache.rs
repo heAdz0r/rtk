@@ -538,11 +538,7 @@ pub(super) fn epoch_secs(ts: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-pub(super) fn epoch_nanos(ts: SystemTime) -> u128 {
-    ts.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
+// changed: removed unused epoch_nanos (dead code since nanosecond precision not needed)
 
 // ── Test isolation ────────────────────────────────────────────────────────────
 

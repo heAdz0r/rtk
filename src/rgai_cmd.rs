@@ -78,7 +78,8 @@ pub fn run(
     max_file_kb: usize,
     json_output: bool,
     compact: bool,
-    builtin: bool, // --builtin flag: skip grepai delegation
+    builtin: bool,       // --builtin flag: skip grepai delegation
+    files: Option<&str>, // ADDED: --files flag — restrict search to listed paths
     verbose: u8,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
@@ -93,9 +94,10 @@ pub fn run(
         bail!("path does not exist: {}", path);
     }
 
-    // Try grepai delegation first (unless --builtin flag is set)
+    // Try grepai delegation first (unless --builtin flag is set or --files is provided)
     // CHANGED: unpack (raw, filtered) for correct savings tracking
-    if !builtin {
+    if !builtin && files.is_none() {
+        // CHANGED: skip grepai when --files restricts search
         if let Some((raw, filtered)) = try_grepai_delegation(
             query,
             path,
@@ -131,8 +133,19 @@ pub fn run(
     let effective_context = if compact { 0 } else { context_lines };
     let snippets_per_file = if compact { 1 } else { MAX_SNIPPETS_PER_FILE };
 
+    // ADDED: --files mode — restrict search to specific files (two-stage memory pipeline)
     // CHANGED: try ripgrep backend first (fast), fall back to built-in walker (slow)
-    let (outcome, backend) = if !builtin {
+    let (outcome, backend) = if let Some(files_csv) = files {
+        let file_paths: Vec<String> = files_csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (
+            search_file_list(&query_model, root, &file_paths, snippets_per_file, verbose)?,
+            "rg-files", // ADDED: new backend label for file-list search
+        )
+    } else if !builtin {
         match try_ripgrep_search(
             &query_model,
             root,
@@ -172,6 +185,8 @@ pub fn run(
     // ADDED: tracking label reflects which backend was used
     let tracking_label = if backend == "rg" {
         "rtk rgai (rg)"
+    } else if backend == "rg-files" {
+        "rtk rgai (files)" // ADDED: files-list backend label
     } else {
         "rtk rgai"
     };
@@ -734,6 +749,70 @@ fn parse_rg_output(
     });
     prune_by_relevance(&mut hits);
     hits
+}
+
+/// Search a specific list of files — used by --files flag (two-stage memory pipeline).
+/// Runs rg against the listed file paths directly, skipping WalkBuilder.
+fn search_file_list(
+    query_model: &QueryModel,
+    root: &Path,
+    file_paths: &[String],
+    snippets_per_file: usize,
+    verbose: u8,
+) -> Result<SearchOutcome> {
+    if query_model.terms.is_empty() || file_paths.is_empty() {
+        return Ok(SearchOutcome::default());
+    }
+    let pattern = build_rg_pattern(query_model);
+    let mut cmd = Command::new("rg");
+    cmd.args(["-n", "--no-heading", "-i", "--max-count", "50"]);
+    cmd.arg(&pattern);
+    // Resolve each path relative to root (or use as-is if absolute)
+    let mut any_added = false;
+    for fp in file_paths {
+        let candidate = if std::path::Path::new(fp).is_absolute() {
+            std::path::PathBuf::from(fp)
+        } else {
+            root.join(fp)
+        };
+        if candidate.exists() {
+            cmd.arg(candidate);
+            any_added = true;
+        }
+    }
+    if !any_added {
+        return Ok(SearchOutcome::default());
+    }
+    if verbose > 0 {
+        eprintln!(
+            "rgai[rg-files]: pattern={} files={}",
+            pattern,
+            file_paths.len()
+        );
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            if verbose > 0 {
+                eprintln!("rgai[rg-files]: rg failed: {}", e);
+            }
+            return Ok(SearchOutcome::default());
+        }
+    };
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        _ => return Ok(SearchOutcome::default()),
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hits = parse_rg_output(&stdout, query_model, root, snippets_per_file);
+    let raw_output = build_raw_output(&hits);
+    Ok(SearchOutcome {
+        scanned_files: file_paths.len(),
+        skipped_large: 0,
+        skipped_binary: 0,
+        hits,
+        raw_output,
+    })
 }
 
 /// Ripgrep-accelerated search: fast file discovery via rg + built-in scoring.
@@ -2107,6 +2186,39 @@ src/ok.rs:20:another token match";
             "filtered ({}) should be < raw ({})",
             filtered.len(),
             raw.len()
+        );
+    }
+
+    // ADDED: Phase 2 — search_file_list never returns hits from files outside the list
+    #[test]
+    fn test_rgai_files_restricts_search() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        // Both files have matching content; only one is in the file list
+        let content = b"pub fn score_structural_relevance() -> f32 { 0.99 }";
+        fs::write(root.join("allowed.rs"), content).unwrap();
+        fs::write(root.join("excluded.rs"), content).unwrap();
+
+        let qm = build_query_model("structural relevance");
+        // Only allowed.rs in the list — excluded.rs must not appear even though it also matches
+        let file_list = vec!["allowed.rs".to_string()];
+        let outcome = search_file_list(&qm, root, &file_list, 2, 0).unwrap();
+
+        // Key invariant: excluded.rs must never appear in any hit
+        for hit in &outcome.hits {
+            assert!(
+                !hit.path.contains("excluded.rs"),
+                "excluded.rs must not appear when restricted to allowed.rs"
+            );
+        }
+        // scanned_files reflects the file list length, not all files in the dir
+        assert_eq!(
+            outcome.scanned_files, 1,
+            "scanned_files must equal the file list length"
         );
     }
 }

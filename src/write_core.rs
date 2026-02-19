@@ -14,6 +14,7 @@ pub enum DurabilityMode {
 
 // CAS infrastructure — activated for concurrent write safety (flock + CAS + retry)
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // changed: public API, used in tests and write_cmd.rs
 pub struct FileSnapshot {
     pub len: Option<u64>,
     pub modified: Option<SystemTime>,
@@ -28,6 +29,7 @@ pub struct CasOptions {
 }
 
 impl CasOptions {
+    #[allow(dead_code)] // changed: used in write_cmd.rs tests; bin target sees it as unused
     pub fn from_snapshot(snapshot: &FileSnapshot) -> Self {
         // changed: removed dead_code — now used by locked_write
         Self {
@@ -94,10 +96,12 @@ impl Default for WriteOptions {
 }
 
 impl WriteOptions {
+    #[allow(dead_code)] // changed: convenience constructors, used in tests
     pub fn durable() -> Self {
         Self::default()
     }
 
+    #[allow(dead_code)] // changed: convenience constructor, used in tests
     pub fn fast() -> Self {
         Self {
             durability: DurabilityMode::Fast,
@@ -246,6 +250,7 @@ impl AtomicWriter {
     }
 }
 
+#[allow(dead_code)] // changed: used in tests and write_cmd.rs; bin target sees it as unused
 pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnapshot>> {
     // changed: removed dead_code — now used by locked_write
     let metadata = match fs::metadata(path) {
@@ -268,6 +273,7 @@ pub fn snapshot_file(path: &Path, include_hash: bool) -> Result<Option<FileSnaps
 }
 
 /// Build a CAS snapshot from already-read file content, avoiding a second file read.
+#[allow(dead_code)] // changed: used in tests; bin target sees it as unused
 pub fn snapshot_from_content(
     path: &Path,
     content: &[u8],
@@ -449,8 +455,11 @@ mod tests {
         let path = tmp.path().join("e.txt");
         fs::write(&path, "hello").unwrap();
 
-        let mut opts = WriteOptions::default();
-        opts.idempotent_skip = false;
+        // changed: struct update syntax instead of field assignment after Default
+        let opts = WriteOptions {
+            idempotent_skip: false,
+            ..WriteOptions::default()
+        };
         let writer = AtomicWriter::new(opts);
         let stats = writer.write_str(&path, "hello").unwrap();
         assert!(!stats.skipped_unchanged);
@@ -463,12 +472,15 @@ mod tests {
         let path = tmp.path().join("c.txt");
         fs::write(&path, "hello").unwrap();
 
-        let mut opts = WriteOptions::default();
-        opts.cas = Some(CasOptions {
-            expected_len: Some(999),
-            expected_modified: None,
-            expected_hash: None,
-        });
+        // changed: struct update syntax instead of field assignment after Default
+        let opts = WriteOptions {
+            cas: Some(CasOptions {
+                expected_len: Some(999),
+                expected_modified: None,
+                expected_hash: None,
+            }),
+            ..WriteOptions::default()
+        };
         let writer = AtomicWriter::new(opts);
 
         let err = writer.write_str(&path, "new content").unwrap_err();
@@ -483,12 +495,15 @@ mod tests {
         let path = tmp.path().join("typed_cas.txt");
         fs::write(&path, "hello").unwrap();
 
-        let mut opts = WriteOptions::default();
-        opts.cas = Some(CasOptions {
-            expected_len: Some(999),
-            expected_modified: None,
-            expected_hash: None,
-        });
+        // changed: struct update syntax instead of field assignment after Default
+        let opts = WriteOptions {
+            cas: Some(CasOptions {
+                expected_len: Some(999),
+                expected_modified: None,
+                expected_hash: None,
+            }),
+            ..WriteOptions::default()
+        };
         let writer = AtomicWriter::new(opts);
         let err = writer.write_str(&path, "new").unwrap_err();
         // Must be downcastable to CasError::LenMismatch
@@ -503,8 +518,11 @@ mod tests {
         fs::write(&path, "hello").unwrap();
 
         let snapshot = snapshot_file(&path, true).unwrap().unwrap();
-        let mut opts = WriteOptions::default();
-        opts.cas = Some(CasOptions::from_snapshot(&snapshot));
+        // changed: struct update syntax instead of field assignment after Default
+        let opts = WriteOptions {
+            cas: Some(CasOptions::from_snapshot(&snapshot)),
+            ..WriteOptions::default()
+        };
         let writer = AtomicWriter::new(opts);
 
         let stats = writer.write_str(&path, "world").unwrap();

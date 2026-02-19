@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*; // parallel iterators for memory layer hot paths
 use std::collections::{BTreeMap, HashMap, HashSet}; // E3.2: HashSet for cascade sets
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;

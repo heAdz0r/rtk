@@ -60,7 +60,7 @@ struct PlanRequest {
     legacy: bool, // ADDED: PRD additive field
     /// PRD: include pipeline trace in response (default: false)
     #[serde(default)]
-    trace: bool,  // ADDED: PRD additive field
+    trace: bool, // ADDED: PRD additive field
 }
 
 #[derive(Debug, Serialize)]
@@ -307,8 +307,9 @@ fn handle_plan_context(body: &[u8]) -> Result<String> {
     let req: PlanRequest =
         serde_json::from_slice(body).context("Invalid JSON in plan-context request")?;
     let project = std::path::PathBuf::from(&req.project_root);
-    // CHANGED: pass legacy flag from request; trace not yet exposed in JSON response
-    let result = super::plan_context_graph_first(&project, &req.task, req.token_budget, req.legacy)?;
+    // Trace fields (pipeline_version, semantic_backend_used, etc.) are always present in graph-first response
+    let result =
+        super::plan_context_graph_first(&project, &req.task, req.token_budget, req.legacy)?;
     serde_json::to_string(&result).context("Failed to serialize plan-context response")
 }
 

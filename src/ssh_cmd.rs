@@ -1063,7 +1063,7 @@ fn compact_ports(ports: &str) -> String {
     }
     let port_nums: Vec<&str> = ports
         .split(',')
-        .filter_map(|p| p.split("->").next().and_then(|s| s.split(':').last()))
+        .filter_map(|p| p.split("->").next().and_then(|s| s.split(':').next_back()))
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1529,7 +1529,7 @@ Triggers:
     fn test_filter_docker_images_basic() {
         // added: basic docker images filter with size aggregation
         let output = "REPOSITORY          TAG       IMAGE ID       CREATED        SIZE\nnginx               latest    abc123def456   2 weeks ago    187MB\npostgres            15        bcd234efg567   3 weeks ago    412MB";
-        let result = filter_docker_images(&output, 0);
+        let result = filter_docker_images(output, 0);
         assert!(result.contains("2 images"), "got: {}", result);
         assert!(result.contains("599MB"), "got: {}", result);
         assert!(result.contains("nginx"), "got: {}", result);

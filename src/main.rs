@@ -344,6 +344,9 @@ enum Commands {
         /// Force built-in keyword search (skip grepai delegation)
         #[arg(long)]
         builtin: bool,
+        /// Restrict search to specific files (comma-separated paths)
+        #[arg(long)]
+        files: Option<String>, // ADDED: --files flag for two-stage memory pipeline
     },
 
     /// Initialize rtk instructions in CLAUDE.md
@@ -1237,12 +1240,21 @@ enum MemoryCommands {
         /// Project root to index
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Maximum token budget for context (0 = default 4000)
-        #[arg(long, default_value = "4000")]
+        /// Maximum token budget for context (0 = default 12000)
+        #[arg(long, default_value = "12000")] // CHANGED: was 4000
         token_budget: u32,
-        /// Output format: json (default), text
+        /// Output format: json (default), text, paths
         #[arg(short, long, default_value = "json")]
         format: String,
+        /// Cap candidate count regardless of budget (for --format paths)
+        #[arg(long, default_value = "25")]
+        top: usize, // ADDED: --top N flag
+        /// Force legacy (pre-graph-first) pipeline
+        #[arg(long)]
+        legacy: bool, // ADDED: PRD --legacy flag
+        /// Print stage trace (graph seeds / semantic hits / final set)
+        #[arg(long)]
+        trace: bool, // ADDED: PRD --trace flag
     },
 
     /// Diagnose memory layer setup: hooks, cache, gain, rtk binary // T1
@@ -1580,6 +1592,7 @@ fn main() -> Result<()> {
                     output,
                     concurrency,
                 };
+                let plan = write_cmd::expand_at_ref(&plan)?.into_owned(); // changed: support @file/@- for --plan (bypasses shell escaping for complex content)
                 write_cmd::run_batch(&plan, params)?;
             }
             // changed: new create subcommand handler
@@ -1814,6 +1827,7 @@ fn main() -> Result<()> {
             json,
             compact,
             builtin, // --builtin flag: skip grepai delegation
+            files,   // ADDED: --files flag
         } => {
             // Backward-compat: rtk rgai "query words" ./src -> path="./src"
             let (query, path) = normalize_rgai_args(query, path);
@@ -1826,7 +1840,8 @@ fn main() -> Result<()> {
                 max_file_kb,
                 json,
                 compact,
-                builtin, // pass --builtin flag
+                builtin,          // pass --builtin flag
+                files.as_deref(), // ADDED: pass --files list
                 cli.verbose,
             )?;
         }
@@ -2106,9 +2121,21 @@ fn main() -> Result<()> {
                 project,
                 token_budget,
                 format,
+                top,    // ADDED: --top N flag
+                legacy, // ADDED: PRD --legacy flag
+                trace,  // ADDED: PRD --trace flag
             } => {
                 // Plan-context: ranked candidates under token budget
-                memory_layer::run_plan(&project, &task, token_budget, &format, cli.verbose)?;
+                memory_layer::run_plan(
+                    &project,
+                    &task,
+                    token_budget,
+                    &format,
+                    top,
+                    legacy,
+                    trace,
+                    cli.verbose,
+                )?; // CHANGED: pass legacy/trace
             }
             MemoryCommands::Doctor { project } => {
                 // T1

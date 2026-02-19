@@ -483,7 +483,7 @@ fn extract_go(lines: &[&str], symbols: &mut Vec<Symbol>) {
             let receiver = caps[1].trim().to_string();
             let name = caps[2].to_string();
             let params = caps[3].trim().to_string();
-            let vis = if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            let vis = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -510,7 +510,7 @@ fn extract_go(lines: &[&str], symbols: &mut Vec<Symbol>) {
         if let Some(caps) = re_fn.captures(line) {
             let name = caps[1].to_string();
             let params = caps[2].trim().to_string();
-            let vis = if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            let vis = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -531,7 +531,7 @@ fn extract_go(lines: &[&str], symbols: &mut Vec<Symbol>) {
 
         if let Some(caps) = re_struct.captures(line) {
             let name = caps[1].to_string();
-            let vis = if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            let vis = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -552,7 +552,7 @@ fn extract_go(lines: &[&str], symbols: &mut Vec<Symbol>) {
 
         if let Some(caps) = re_interface.captures(line) {
             let name = caps[1].to_string();
-            let vis = if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            let vis = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -575,7 +575,7 @@ fn extract_go(lines: &[&str], symbols: &mut Vec<Symbol>) {
         if re_type.is_match(line) && !re_struct.is_match(line) && !re_interface.is_match(line) {
             if let Some(caps) = re_type.captures(line) {
                 let name = caps[1].to_string();
-                let vis = if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                let vis = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     Visibility::Public
                 } else {
                     Visibility::Private

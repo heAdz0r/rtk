@@ -84,7 +84,9 @@ rtk gain  # MUST show token savings, not "command not found"
 
 ```bash
 rtk init -g
-# → Installs hook to ~/.claude/hooks/rtk-rewrite.sh
+# → Installs ~/.claude/hooks/rtk-rewrite.sh (command rewriting)
+# → Installs ~/.claude/hooks/rtk-block-native-*.sh (Grep/Read/Write/Task policy)
+# → Installs ~/.claude/hooks/rtk-mem-context.sh (memory context injection for ALL Task subagents)
 # → Creates ~/.claude/RTK.md (10 lines, meta commands only)
 # → Adds @RTK.md reference to ~/.claude/CLAUDE.md
 # → Prompts: "Patch settings.json? [y/N]"

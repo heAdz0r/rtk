@@ -97,6 +97,12 @@ pub struct MemFeatureFlags {
     /// Apply `--strict` mode by default in `rtk memory explore`. Default: false.
     #[serde(default)]
     pub strict_by_default: bool,
+    /// PRD R1: Enable graph-first plan pipeline (default: true). Default: true.
+    #[serde(default = "bool_true")]
+    pub graph_first_plan: bool, // ADDED: PRD graph-first pipeline switch
+    /// PRD R1: Fail-open to legacy pipeline on graph-first error (default: true).
+    #[serde(default = "bool_true")]
+    pub plan_fail_open: bool, // ADDED: PRD fail-open fallback flag
 }
 
 fn bool_true() -> bool {
@@ -112,6 +118,8 @@ impl Default for MemFeatureFlags {
             cascade_invalidation: true,
             git_delta: true,
             strict_by_default: false,
+            graph_first_plan: true, // ADDED: default on
+            plan_fail_open: true,   // ADDED: default on
         }
     }
 }
@@ -127,6 +135,15 @@ pub struct MemConfig {
     pub max_symbols_per_file: usize, // L3: cap symbols per file (default: 64)
     #[serde(default)]
     pub features: MemFeatureFlags, // E6.4: per-feature enable/disable flags
+    /// PRD R1: max candidates passed to graph-first pipeline (default: 60).
+    #[serde(default = "MemConfig::default_plan_candidate_cap")]
+    pub plan_candidate_cap: usize, // ADDED: PRD R1 hard cap
+    /// PRD R2: max candidates passed to semantic stage (default: 30).
+    #[serde(default = "MemConfig::default_plan_semantic_cap")]
+    pub plan_semantic_cap: usize, // ADDED: PRD R2 semantic cap
+    /// PRD R3: minimum final score to retain candidate (default: 0.12).
+    #[serde(default = "MemConfig::default_plan_min_final_score")]
+    pub plan_min_final_score: f32, // ADDED: PRD R3 threshold
 }
 
 impl MemConfig {
@@ -139,6 +156,15 @@ impl MemConfig {
     fn default_max_symbols_per_file() -> usize {
         64 // matches MAX_SYMBOLS_PER_FILE compile-time fallback
     }
+    fn default_plan_candidate_cap() -> usize {
+        60
+    } // ADDED: PRD R1
+    fn default_plan_semantic_cap() -> usize {
+        30
+    } // ADDED: PRD R2
+    fn default_plan_min_final_score() -> f32 {
+        0.12
+    } // ADDED: PRD R3
 }
 
 impl Default for MemConfig {
@@ -148,6 +174,9 @@ impl Default for MemConfig {
             cache_max_projects: Self::default_cache_max_projects(),
             max_symbols_per_file: Self::default_max_symbols_per_file(),
             features: MemFeatureFlags::default(), // E6.4
+            plan_candidate_cap: Self::default_plan_candidate_cap(), // ADDED
+            plan_semantic_cap: Self::default_plan_semantic_cap(), // ADDED
+            plan_min_final_score: Self::default_plan_min_final_score(), // ADDED
         }
     }
 }

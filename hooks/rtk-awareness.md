@@ -94,6 +94,33 @@ Batch groups I/O, reports `applied/failed/total`, and continues on partial failu
 
 Prefer this over ad-hoc `sed -i` / `perl -pi` when the transformation fits these primitives.
 
+### Complex content with shell metacharacters (`!`, `[`, `{`, `'`)
+
+Shell quoting breaks when content contains `!` (zsh extendedglob), `[`, `{`, or embedded single quotes.
+**Always use `@file` or `@-` (stdin) for multiline/complex patches:**
+
+```bash
+# Write content to temp files, then reference with @file
+python3 -c "
+old = open('src/lib.rs').read()[start:end]  # or write literally
+open('/tmp/rtk_old.txt', 'w').write(old)
+open('/tmp/rtk_new.txt', 'w').write(new_code)
+"
+rtk write patch src/lib.rs --old @/tmp/rtk_old.txt --new @/tmp/rtk_new.txt
+
+# Pipe batch plan via stdin (--plan @- supported)
+python3 -c "
+import json
+plan = [{'op':'patch','file':'src/lib.rs',
+         'old':open('/tmp/rtk_old.txt').read(),
+         'new':open('/tmp/rtk_new.txt').read()}]
+print(json.dumps(plan))
+" | rtk write batch --plan @-
+
+# BatchOp @file refs inside JSON plan are also expanded
+rtk write batch --plan '[{"op":"patch","file":"src/lib.rs","old":"@/tmp/old.txt","new":"@/tmp/new.txt"}]'
+```
+
 ## Tabular Files (CSV/TSV)
 
 - `rtk read <file>` in filtered modes returns a compact digest (rows/cols/sample/sampled-stats).
@@ -105,3 +132,19 @@ Prefer this over ad-hoc `sed -i` / `perl -pi` when the transformation fits these
 - Cache auto-invalidates when file path/size/mtime change.
 
 Refer to CLAUDE.md for full command reference.
+
+## Memory Layer + Subagent Policy (MANDATORY)
+
+RTK injects project memory context into **all Task subagents** automatically via PreToolUse hook.
+
+- Memory context is pre-indexed — subagents receive a compressed project map **before** reading files.
+- Native `Task(subagent_type=Explore)` is blocked by default. Use `RTK_ALLOW_NATIVE_EXPLORE=1` to override.
+- **All subagent types are covered** (Explore, general-purpose, Plan, it-architect-reviewer, Bash, and any future types).
+- Do **not** re-read project files from scratch inside subagents — the injected context already covers structure, symbols, and recent diffs.
+
+```bash
+rtk memory explore .     # Manual: build/reuse shared context artifact
+rtk memory plan "task"   # Task-aware context slice (used by hook automatically)
+rtk memory status        # Check cache freshness
+rtk memory refresh .     # Force full reindex
+```

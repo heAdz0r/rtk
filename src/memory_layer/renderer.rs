@@ -181,7 +181,7 @@ pub(super) fn build_context_slice(
 
     // L2: type_graph — type relationships (implements/extends/contains/alias)
     let type_graph = if layers.l2_type_graph {
-        build_type_graph(artifact, 64)
+        build_type_graph(artifact, limits.max_modules) // T3.1: respect DetailLevel limits
     } else {
         Vec::new()
     };
@@ -195,7 +195,7 @@ pub(super) fn build_context_slice(
 
     // L5: test_map — list of test files with kind classification
     let test_map = if layers.l5_test_map {
-        build_test_map(artifact, 64)
+        build_test_map(artifact, limits.max_modules) // T3.1: respect DetailLevel limits
     } else {
         Vec::new()
     };
@@ -231,10 +231,12 @@ pub(super) fn select_entry_points(files: &[FileArtifact], max: usize) -> Vec<Str
             if is_hidden_rel_path(&file.rel_path) {
                 continue;
             }
-            if file.rel_path.contains("main") || file.rel_path.contains("index") {
-                if !picked.contains(&file.rel_path) {
-                    picked.push(file.rel_path.clone());
-                }
+            let stem = std::path::Path::new(&file.rel_path) // T3.2: filename stem match
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if (stem == "main" || stem == "index") && !picked.contains(&file.rel_path) {
+                picked.push(file.rel_path.clone());
             }
         }
     }
@@ -286,7 +288,11 @@ fn select_top_imports(files: &[FileArtifact], max: usize) -> Vec<ImportStat> {
 
     for file in files {
         for import in &file.imports {
-            if import.starts_with("self:") {
+            if import.starts_with("self:")    // T3.3: filter Rust internals
+                || import.starts_with("super::")
+                || import.starts_with("crate::")
+                || import.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            {
                 continue;
             }
             *counts.entry(import.clone()).or_insert(0) += 1;
@@ -525,7 +531,8 @@ pub(super) fn print_response(response: &MemoryResponse, format: &str) -> Result<
 
 pub(super) fn render_text(response: &MemoryResponse) -> String {
     let mut out = String::new();
-    // P0: include freshness in header line (PRD §8 — consumers can verify data validity)
+    out.push_str("# format: entry_points=read-first hot_paths(N)=git-freq api_surface=pub-symbols[lang] delta=+add~mod-rm\n"); // T3.5: format legend
+                                                                                                                               // P0: include freshness in header line (PRD §8 — consumers can verify data validity)
     out.push_str(&format!(
         "memory.{} project={} id={} cache={} freshness={}\n",
         response.command,
@@ -535,12 +542,9 @@ pub(super) fn render_text(response: &MemoryResponse) -> String {
         response.freshness
     ));
     out.push_str(&format!(
-        "stats files={} bytes={} reused={} rehashed={} scanned={}\n",
+        "stats files={} bytes={}\n", // T3.4: remove cache telemetry from LLM context
         response.stats.file_count,
         format_bytes(response.stats.total_bytes),
-        response.stats.reused_entries,
-        response.stats.rehashed_entries,
-        response.stats.scanned_files
     ));
     if let Some(delta) = &response.delta {
         out.push_str(&format!(
@@ -600,7 +604,7 @@ pub(super) fn render_text(response: &MemoryResponse) -> String {
                     if let Some(sig) = &s.sig {
                         format!("{}{}({})", s.name, sig, s.kind)
                     } else {
-                        format!("{}", s.name)
+                        s.name.to_string()
                     }
                 })
                 .collect();
@@ -660,11 +664,6 @@ pub(super) fn render_text(response: &MemoryResponse) -> String {
             out.push_str(&format!("deps_build {}\n", names.join(", ")));
         }
     }
-
-    out.push_str(&format!(
-        "graph nodes={} edges={}\n",
-        response.graph.nodes, response.graph.edges
-    ));
 
     out
 }

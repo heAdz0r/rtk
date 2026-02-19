@@ -10,6 +10,7 @@ const BLOCK_GREP_HOOK: &str = include_str!("../hooks/rtk-block-native-grep.sh");
 const BLOCK_READ_HOOK: &str = include_str!("../hooks/rtk-block-native-read.sh"); // prefer rtk over native Read
 const BLOCK_WRITE_HOOK: &str = include_str!("../hooks/rtk-block-native-write.sh"); // prefer rtk over native Edit/Write
 const BLOCK_EXPLORE_HOOK: &str = include_str!("../hooks/rtk-block-native-explore.sh"); // prefer rtk memory over native Task/Explore
+const MEM_CONTEXT_HOOK: &str = include_str!("../hooks/rtk-mem-context.sh"); // inject memory context into all Task subagents
 
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
@@ -236,8 +237,16 @@ pub fn run(
     }
 }
 
-/// Prepare hook directory and return paths (hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path, block_explore_path)
-fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
+/// Prepare hook directory and return paths (hook_dir, rewrite_path, block_grep_path, block_read_path, block_write_path, block_explore_path, mem_context_path)
+fn prepare_hook_paths() -> Result<(
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+)> {
     let claude_dir = resolve_claude_dir()?;
     let hook_dir = claude_dir.join("hooks");
     fs::create_dir_all(&hook_dir)
@@ -247,6 +256,7 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, 
     let block_read_path = hook_dir.join("rtk-block-native-read.sh"); // Read guidance/optional block hook
     let block_write_path = hook_dir.join("rtk-block-native-write.sh"); // Edit/Write guidance/optional block hook
     let block_explore_path = hook_dir.join("rtk-block-native-explore.sh"); // Task/Explore guidance/optional block hook
+    let mem_context_path = hook_dir.join("rtk-mem-context.sh"); // memory context injection for all Task subagents
     Ok((
         hook_dir,
         rewrite_path,
@@ -254,6 +264,7 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, 
         block_read_path,
         block_write_path,
         block_explore_path,
+        mem_context_path,
     ))
 }
 
@@ -294,7 +305,7 @@ fn install_single_hook(hook_path: &Path, content: &str, verbose: u8) -> Result<b
     Ok(changed)
 }
 
-/// Install all hook files (rewrite + grep/read/write/explore policy hooks), return true if any changed
+/// Install all hook files (rewrite + grep/read/write/explore/mem-context hooks), return true if any changed
 #[cfg(unix)]
 fn ensure_hooks_installed(
     rewrite_path: &Path,
@@ -302,6 +313,7 @@ fn ensure_hooks_installed(
     block_read_path: &Path,
     block_write_path: &Path,
     block_explore_path: &Path,
+    mem_context_path: &Path, // memory context injection for all Task subagents
     verbose: u8,
 ) -> Result<bool> {
     let r1 = install_single_hook(rewrite_path, REWRITE_HOOK, verbose)?;
@@ -309,7 +321,8 @@ fn ensure_hooks_installed(
     let r3 = install_single_hook(block_read_path, BLOCK_READ_HOOK, verbose)?; // Read guidance hook
     let r4 = install_single_hook(block_write_path, BLOCK_WRITE_HOOK, verbose)?; // Edit/Write guidance hook
     let r5 = install_single_hook(block_explore_path, BLOCK_EXPLORE_HOOK, verbose)?; // Task/Explore guidance hook
-    Ok(r1 || r2 || r3 || r4 || r5)
+    let r6 = install_single_hook(mem_context_path, MEM_CONTEXT_HOOK, verbose)?; // memory context hook
+    Ok(r1 || r2 || r3 || r4 || r5 || r6)
 }
 
 /// Idempotent file write: create or update if content differs
@@ -377,6 +390,7 @@ fn print_manual_instructions(
     block_read_path: &Path,
     block_write_path: &Path,
     block_explore_path: &Path,
+    mem_context_path: &Path, // memory context injection hook
 ) {
     println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
     println!("  {{");
@@ -422,6 +436,13 @@ fn print_manual_instructions(
         "        \"hooks\": [{{ \"type\": \"command\", \"command\": \"{}\", \"timeout\": 10 }}]",
         block_explore_path.display()
     );
+    println!("      }},");
+    println!("      {{");
+    println!("        \"matcher\": \"Task\","); // second Task entry: memory context injection
+    println!(
+        "        \"hooks\": [{{ \"type\": \"command\", \"command\": \"{}\", \"timeout\": 10 }}]",
+        mem_context_path.display()
+    );
     println!("      }}");
     println!("    ]}}");
     println!("  }}");
@@ -441,7 +462,7 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
         None => return false,
     };
 
-    // Find and remove all RTK entries (rewrite + block-grep + block-read + block-write + block-explore)
+    // Find and remove all RTK entries (rewrite + block-grep + block-read + block-write + block-explore + mem-context)
     let original_len = pre_tool_use_array.len();
     pre_tool_use_array.retain(|entry| {
         if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
@@ -452,6 +473,8 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
                         || command.contains("rtk-block-native-read.sh")
                         || command.contains("rtk-block-native-write.sh")
                         || command.contains("rtk-block-native-explore.sh")
+                        || command.contains("rtk-mem-context.sh")
+                    // memory context hook
                     {
                         return false; // Remove this RTK entry
                     }
@@ -524,6 +547,7 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
         "rtk-block-native-read.sh",
         "rtk-block-native-write.sh",
         "rtk-block-native-explore.sh",
+        "rtk-mem-context.sh", // memory context hook
     ] {
         let hook_path = claude_dir.join("hooks").join(hook_name);
         if hook_path.exists() {
@@ -560,7 +584,7 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
             fs::write(&claude_md_path, cleaned).with_context(|| {
                 format!("Failed to write CLAUDE.md: {}", claude_md_path.display())
             })?;
-            removed.push(format!("CLAUDE.md: removed @RTK.md reference"));
+            removed.push("CLAUDE.md: removed @RTK.md reference".to_string());
         }
     }
 
@@ -583,14 +607,16 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Orchestrator: patch settings.json with RTK hooks (rewrite + grep/read/write/explore policy hooks)
+/// Orchestrator: patch settings.json with RTK hooks (rewrite + grep/read/write/explore/mem-context hooks)
 /// Handles reading, checking, prompting, merging, backing up, and atomic writing
+#[allow(clippy::too_many_arguments)] // changed: hook paths bundle naturally together
 fn patch_settings_json(
     rewrite_path: &Path,
     block_grep_path: &Path,
     block_read_path: &Path,
     block_write_path: &Path,
     block_explore_path: &Path,
+    mem_context_path: &Path, // memory context injection hook
     mode: PatchMode,
     verbose: u8,
 ) -> Result<PatchResult> {
@@ -611,6 +637,9 @@ fn patch_settings_json(
     let block_explore_command = block_explore_path
         .to_str()
         .context("Block-explore hook path contains invalid UTF-8")?;
+    let mem_context_command = mem_context_path
+        .to_str()
+        .context("Mem-context hook path contains invalid UTF-8")?;
 
     // Read or create settings.json
     let mut root = if settings_path.exists() {
@@ -635,6 +664,7 @@ fn patch_settings_json(
         block_read_command,
         block_write_command,
         block_explore_command,
+        mem_context_command, // memory context hook
     ) {
         if verbose > 0 {
             eprintln!("settings.json: all hooks already present");
@@ -651,6 +681,7 @@ fn patch_settings_json(
                 block_read_path,
                 block_write_path,
                 block_explore_path,
+                mem_context_path, // memory context hook
             );
             return Ok(PatchResult::Skipped);
         }
@@ -662,6 +693,7 @@ fn patch_settings_json(
                     block_read_path,
                     block_write_path,
                     block_explore_path,
+                    mem_context_path, // memory context hook
                 );
                 return Ok(PatchResult::Declined);
             }
@@ -674,7 +706,7 @@ fn patch_settings_json(
     // Remove any existing RTK entries first (clean slate for idempotent re-insert)
     remove_hook_from_json(&mut root);
 
-    // Deep-merge all hooks (rewrite + grep/read/write/explore policy hooks)
+    // Deep-merge all hooks (rewrite + grep/read/write/explore/mem-context hooks)
     insert_hook_entry(
         &mut root,
         rewrite_command,
@@ -682,6 +714,7 @@ fn patch_settings_json(
         block_read_command,
         block_write_command,
         block_explore_command,
+        mem_context_command, // memory context injection hook
     );
 
     // Backup original
@@ -699,7 +732,7 @@ fn patch_settings_json(
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
     atomic_write(&settings_path, &serialized)?;
 
-    println!("\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write/Task policy)");
+    println!("\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write/Task policy + memory context)");
     if settings_path.with_extension("json.bak").exists() {
         println!(
             "  Backup: {}",
@@ -745,7 +778,7 @@ fn clean_double_blanks(content: &str) -> String {
 
 /// Deep-merge RTK hook entries into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
-/// Adds Bash (rewrite), Grep (block), Read (block), Edit (block), Write (block), Task/Explore (block) entries
+/// Adds Bash (rewrite), Grep (block), Read (block), Edit (block), Write (block), Task/Explore (block), Task/mem-context entries
 fn insert_hook_entry(
     root: &mut serde_json::Value,
     rewrite_command: &str,
@@ -753,6 +786,7 @@ fn insert_hook_entry(
     block_read_command: &str,
     block_write_command: &str,
     block_explore_command: &str,
+    mem_context_command: &str, // memory context injection for all Task subagents
 ) {
     // Ensure root is an object
     let root_obj = match root.as_object_mut() {
@@ -836,10 +870,20 @@ fn insert_hook_entry(
             "timeout": 10
         }]
     }));
+
+    // Append Task/mem-context hook entry (injects project memory into all Task subagents)
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "Task",
+        "hooks": [{
+            "type": "command",
+            "command": mem_context_command,
+            "timeout": 10
+        }]
+    }));
 }
 
 /// Check if RTK hooks are already present in settings.json
-/// Returns true only if all 6 hooks are present: rewrite + grep/read/write + task/explore policy hooks
+/// Returns true only if all 7 hooks are present: rewrite + grep/read/write + task/explore policy + task/mem-context hooks
 fn hooks_already_present(
     root: &serde_json::Value,
     rewrite_command: &str,
@@ -847,6 +891,7 @@ fn hooks_already_present(
     block_read_command: &str,
     block_write_command: &str,
     block_explore_command: &str,
+    mem_context_command: &str, // memory context hook
 ) -> bool {
     let pre_tool_use_array = match root
         .get("hooks")
@@ -899,24 +944,31 @@ fn hooks_already_present(
             && entry_has_command(entry, block_explore_command, "rtk-block-native-explore.sh")
     });
 
+    let has_mem_context = pre_tool_use_array.iter().any(|entry| {
+        // memory context hook check
+        entry.get("matcher").and_then(|m| m.as_str()) == Some("Task")
+            && entry_has_command(entry, mem_context_command, "rtk-mem-context.sh")
+    });
+
     has_rewrite
         && has_block_grep
         && has_block_read
         && has_block_edit
         && has_block_write
         && has_block_explore
+        && has_mem_context
 }
 
 /// Check if any RTK hook is present (for diagnostics / show_config)
-/// Returns (rewrite, block_grep, block_read, block_edit, block_write, block_explore)
-fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bool, bool) {
+/// Returns (rewrite, block_grep, block_read, block_edit, block_write, block_explore, mem_context)
+fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bool, bool, bool) {
     let pre_tool_use_array = match root
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|p| p.as_array())
     {
         Some(arr) => arr,
-        None => return (false, false, false, false, false, false),
+        None => return (false, false, false, false, false, false, false),
     };
 
     fn has_matcher_with_file(
@@ -947,6 +999,8 @@ fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bo
         has_matcher_with_file(pre_tool_use_array, "Write", "rtk-block-native-write.sh");
     let has_block_explore =
         has_matcher_with_file(pre_tool_use_array, "Task", "rtk-block-native-explore.sh");
+    let has_mem_context = // memory context hook check
+        has_matcher_with_file(pre_tool_use_array, "Task", "rtk-mem-context.sh");
 
     (
         has_rewrite,
@@ -955,6 +1009,7 @@ fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bo
         has_block_edit,
         has_block_write,
         has_block_explore,
+        has_mem_context,
     )
 }
 
@@ -986,6 +1041,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         block_read_path,
         block_write_path,
         block_explore_path,
+        mem_context_path, // memory context injection hook
     ) = prepare_hook_paths()?;
     ensure_hooks_installed(
         &rewrite_path,
@@ -993,6 +1049,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         &block_read_path,
         &block_write_path,
         &block_explore_path,
+        &mem_context_path, // memory context injection hook
         verbose,
     )?;
 
@@ -1012,8 +1069,12 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         block_write_path.display()
     );
     println!(
-        "  Task Hook:  {} (Task/Explore)",
+        "  Task Hook:  {} (Task/Explore block)",
         block_explore_path.display()
+    );
+    println!(
+        "  Mem Hook:   {} (Task/memory context)", // memory context hook
+        mem_context_path.display()
     );
     println!("  RTK.md:     {} (10 lines)", rtk_md_path.display());
     println!("  CLAUDE.md:  @RTK.md reference added");
@@ -1030,6 +1091,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
         &block_read_path,
         &block_write_path,
         &block_explore_path,
+        &mem_context_path, // memory context injection hook
         patch_mode,
         verbose,
     )?;
@@ -1170,6 +1232,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         block_read_path,
         block_write_path,
         block_explore_path,
+        mem_context_path, // memory context injection hook
     ) = prepare_hook_paths()?;
     ensure_hooks_installed(
         &rewrite_path,
@@ -1177,6 +1240,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         &block_read_path,
         &block_write_path,
         &block_explore_path,
+        &mem_context_path, // memory context injection hook
         verbose,
     )?;
 
@@ -1189,8 +1253,12 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         block_write_path.display()
     );
     println!(
-        "  Task Hook:  {} (Task/Explore)",
+        "  Task Hook:  {} (Task/Explore block)",
         block_explore_path.display()
+    );
+    println!(
+        "  Mem Hook:   {} (Task/memory context)", // memory context hook
+        mem_context_path.display()
     );
     println!(
         "  Note: No RTK.md created. Claude won't know about meta commands (gain, discover, proxy)."
@@ -1203,6 +1271,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
         &block_read_path,
         &block_write_path,
         &block_explore_path,
+        &mem_context_path, // memory context injection hook
         patch_mode,
         verbose,
     )?;
@@ -1480,6 +1549,7 @@ fn cleanup_project_local_hooks(verbose: u8) -> Result<bool> {
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
             "rtk-block-native-explore.sh",
+            "rtk-mem-context.sh", // memory context hook
         ] {
             let local_hook = local_hooks_dir.join(hook_name);
             if local_hook.exists() {
@@ -1665,6 +1735,7 @@ pub fn show_config() -> Result<()> {
                     has_block_edit,
                     has_block_write,
                     has_block_explore,
+                    has_mem_context, // memory context hook
                 ) = any_rtk_hook_present(&root);
                 if has_rewrite
                     && has_block_grep
@@ -1672,6 +1743,7 @@ pub fn show_config() -> Result<()> {
                     && has_block_edit
                     && has_block_write
                     && has_block_explore
+                    && has_mem_context
                 {
                     println!("  [ok] settings.json: all RTK hooks configured");
                 } else {
@@ -1693,6 +1765,10 @@ pub fn show_config() -> Result<()> {
                     }
                     if !has_block_explore {
                         println!("       Missing: Task/Explore hook (Task matcher)");
+                    }
+                    if !has_mem_context {
+                        // memory context hook
+                        println!("       Missing: memory context hook (Task matcher, rtk-mem-context.sh)");
                     }
                     println!("       Run: rtk init -g --auto-patch");
                 }
@@ -1717,6 +1793,7 @@ pub fn show_config() -> Result<()> {
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
             "rtk-block-native-explore.sh",
+            "rtk-mem-context.sh", // memory context hook
         ] {
             if local_hooks_dir.join(hook_name).exists() {
                 local_dupes.push(*hook_name);
@@ -2096,6 +2173,10 @@ More notes
                     {
                         "matcher": "Task",
                         "hooks": [{"type": "command", "command": "/Users/test/.claude/hooks/rtk-block-native-explore.sh"}]
+                    },
+                    {
+                        "matcher": "Task",
+                        "hooks": [{"type": "command", "command": "/Users/test/.claude/hooks/rtk-mem-context.sh"}]
                     }
                 ]
             }
@@ -2108,6 +2189,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
             "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
+            "/Users/test/.claude/hooks/rtk-mem-context.sh", // added mem_context arg
         ));
     }
 
@@ -2130,6 +2212,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
             "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
+            "/Users/test/.claude/hooks/rtk-mem-context.sh", // added mem_context arg
         ));
     }
 
@@ -2144,7 +2227,8 @@ More notes
                     {"matcher": "Read", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-read.sh"}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-write.sh"}]},
                     {"matcher": "Write", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-write.sh"}]},
-                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-explore.sh"}]}
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-block-native-explore.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/home/user/.claude/hooks/rtk-mem-context.sh"}]}
                 ]
             }
         });
@@ -2156,6 +2240,7 @@ More notes
             "~/.claude/hooks/rtk-block-native-read.sh",
             "~/.claude/hooks/rtk-block-native-write.sh",
             "~/.claude/hooks/rtk-block-native-explore.sh",
+            "~/.claude/hooks/rtk-mem-context.sh", // added mem_context arg
         ));
     }
 
@@ -2169,6 +2254,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
             "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
+            "/Users/test/.claude/hooks/rtk-mem-context.sh", // added mem_context arg
         ));
     }
 
@@ -2190,6 +2276,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
             "/Users/test/.claude/hooks/rtk-block-native-explore.sh",
+            "/Users/test/.claude/hooks/rtk-mem-context.sh", // added mem_context arg
         ));
     }
 
@@ -2204,13 +2291,14 @@ More notes
                     {"matcher": "Read", "hooks": [{"type": "command", "command": "/x/rtk-block-native-read.sh"}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
                     {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/rtk-block-native-write.sh"}]},
-                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/x/rtk-block-native-explore.sh"}]}
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/x/rtk-block-native-explore.sh"}]},
+                    {"matcher": "Task", "hooks": [{"type": "command", "command": "/x/rtk-mem-context.sh"}]}
                 ]
             }
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, true, true, true, true, true)
+            (true, true, true, true, true, true, true) // 7-tuple with mem_context
         );
     }
 
@@ -2225,7 +2313,7 @@ More notes
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, false, false, false, false, false)
+            (true, false, false, false, false, false, false) // 7-tuple with mem_context
         );
     }
 
@@ -2234,7 +2322,7 @@ More notes
         let json_content = serde_json::json!({});
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (false, false, false, false, false, false)
+            (false, false, false, false, false, false, false) // 7-tuple with mem_context
         );
     }
 
@@ -2247,6 +2335,7 @@ More notes
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
         let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
+        let mem_context = "/Users/test/.claude/hooks/rtk-mem-context.sh"; // added
 
         insert_hook_entry(
             &mut json_content,
@@ -2255,11 +2344,12 @@ More notes
             block_read,
             block_write,
             block_explore,
+            mem_context, // added mem_context arg
         );
 
         // Should create full structure with all entries
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 6); // Bash rewrite + Grep block + Read block + Edit block + Write block + Task block
+        assert_eq!(pre_tool_use.len(), 7); // Bash rewrite + Grep block + Read block + Edit block + Write block + Task/block + Task/mem-context
 
         // First: Bash rewrite
         assert_eq!(pre_tool_use[0]["matcher"], "Bash");
@@ -2308,6 +2398,14 @@ More notes
             block_explore
         );
         assert_eq!(pre_tool_use[5]["hooks"][0]["timeout"], 10);
+
+        // Seventh: Task/mem-context
+        assert_eq!(pre_tool_use[6]["matcher"], "Task"); // mem-context entry
+        assert_eq!(
+            pre_tool_use[6]["hooks"][0]["command"].as_str().unwrap(),
+            mem_context
+        );
+        assert_eq!(pre_tool_use[6]["hooks"][0]["timeout"], 10);
     }
 
     #[test]
@@ -2326,6 +2424,7 @@ More notes
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
         let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
+        let mem_context = "/Users/test/.claude/hooks/rtk-mem-context.sh"; // added
         insert_hook_entry(
             &mut json_content,
             rewrite,
@@ -2333,10 +2432,11 @@ More notes
             block_read,
             block_write,
             block_explore,
+            mem_context, // added mem_context arg
         );
 
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 7); // existing + rewrite + grep + read + edit + write + task
+        assert_eq!(pre_tool_use.len(), 8); // existing + rewrite + grep + read + edit + write + task/block + task/mem-context
 
         // Check first hook is preserved
         assert_eq!(
@@ -2374,6 +2474,12 @@ More notes
             pre_tool_use[6]["hooks"][0]["command"].as_str().unwrap(),
             block_explore
         );
+        // Index 7: mem-context
+        assert_eq!(pre_tool_use[7]["matcher"], "Task"); // mem-context entry
+        assert_eq!(
+            pre_tool_use[7]["hooks"][0]["command"].as_str().unwrap(),
+            mem_context
+        );
     }
 
     #[test]
@@ -2389,6 +2495,7 @@ More notes
         let block_read = "/Users/test/.claude/hooks/rtk-block-native-read.sh";
         let block_write = "/Users/test/.claude/hooks/rtk-block-native-write.sh";
         let block_explore = "/Users/test/.claude/hooks/rtk-block-native-explore.sh";
+        let mem_context = "/Users/test/.claude/hooks/rtk-mem-context.sh"; // added
         insert_hook_entry(
             &mut json_content,
             rewrite,
@@ -2396,6 +2503,7 @@ More notes
             block_read,
             block_write,
             block_explore,
+            mem_context, // added mem_context arg
         );
 
         // Should preserve all other keys

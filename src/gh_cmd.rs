@@ -4,7 +4,6 @@
 //! Focuses on extracting essential information from JSON outputs.
 
 use crate::git;
-use crate::json_cmd;
 use crate::tracking;
 use crate::utils::{ok_confirmation, truncate};
 use anyhow::{Context, Result};
@@ -489,12 +488,10 @@ fn list_issues(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()>
                 } else {
                     "C"
                 }
+            } else if state == "OPEN" {
+                "🟢"
             } else {
-                if state == "OPEN" {
-                    "🟢"
-                } else {
-                    "🔴"
-                }
+                "🔴"
             };
             let line = format!("  {} #{} {}\n", icon, number, truncate(title, 60));
             filtered.push_str(&line);
@@ -1133,6 +1130,66 @@ fn run_passthrough(cmd: &str, subcommand: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// --- Pure functions for gh api filtering ---
+
+/// Check if args contain --jq or --template (user-side filtering)
+fn has_jq_or_template(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--jq" || a == "-q" || a == "--template" || a == "-t")
+}
+
+/// Compact JSON preview: truncate long strings, limit arrays, keep all keys.
+/// Falls back to raw text (no truncation) if input is not valid JSON.
+fn compact_json_preview(raw: &str, max_str_len: usize) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(val) => {
+            let compacted = compact_value(val, max_str_len);
+            serde_json::to_string_pretty(&compacted).unwrap_or_else(|_| raw.to_string())
+        }
+        Err(_) => raw.to_string(), // not JSON — return as-is
+    }
+}
+
+/// Recursively compact a JSON Value: truncate strings, limit arrays.
+fn compact_value(val: serde_json::Value, max_str_len: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) if s.len() > max_str_len => {
+            // truncate long string values
+            let truncated = format!("{}...", &s[..max_str_len.min(s.len())]);
+            Value::String(truncated)
+        }
+        Value::Array(arr) => {
+            let total = arr.len();
+            const MAX_ITEMS: usize = 5;
+            if total > MAX_ITEMS {
+                let mut kept: Vec<Value> = arr
+                    .into_iter()
+                    .take(MAX_ITEMS)
+                    .map(|v| compact_value(v, max_str_len))
+                    .collect();
+                let remaining = total - MAX_ITEMS;
+                kept.push(Value::String(format!("...{} more", remaining)));
+                Value::Array(kept)
+            } else {
+                Value::Array(
+                    arr.into_iter()
+                        .map(|v| compact_value(v, max_str_len))
+                        .collect(),
+                )
+            }
+        }
+        Value::Object(map) => {
+            let compacted = map
+                .into_iter()
+                .map(|(k, v)| (k, compact_value(v, max_str_len)))
+                .collect();
+            Value::Object(compacted)
+        }
+        other => other, // numbers, booleans, null — pass through
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,65 +1355,5 @@ mod tests {
     #[test]
     fn test_run_view_no_passthrough_other_flags() {
         assert!(!should_passthrough_run_view(&["--web".into()]));
-    }
-}
-
-// --- Pure functions for gh api filtering ---
-
-/// Check if args contain --jq or --template (user-side filtering)
-fn has_jq_or_template(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| a == "--jq" || a == "-q" || a == "--template" || a == "-t")
-}
-
-/// Compact JSON preview: truncate long strings, limit arrays, keep all keys.
-/// Falls back to raw text (no truncation) if input is not valid JSON.
-fn compact_json_preview(raw: &str, max_str_len: usize) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(val) => {
-            let compacted = compact_value(val, max_str_len);
-            serde_json::to_string_pretty(&compacted).unwrap_or_else(|_| raw.to_string())
-        }
-        Err(_) => raw.to_string(), // not JSON — return as-is
-    }
-}
-
-/// Recursively compact a JSON Value: truncate strings, limit arrays.
-fn compact_value(val: serde_json::Value, max_str_len: usize) -> serde_json::Value {
-    use serde_json::Value;
-    match val {
-        Value::String(s) if s.len() > max_str_len => {
-            // truncate long string values
-            let truncated = format!("{}...", &s[..max_str_len.min(s.len())]);
-            Value::String(truncated)
-        }
-        Value::Array(arr) => {
-            let total = arr.len();
-            const MAX_ITEMS: usize = 5;
-            if total > MAX_ITEMS {
-                let mut kept: Vec<Value> = arr
-                    .into_iter()
-                    .take(MAX_ITEMS)
-                    .map(|v| compact_value(v, max_str_len))
-                    .collect();
-                let remaining = total - MAX_ITEMS;
-                kept.push(Value::String(format!("...{} more", remaining)));
-                Value::Array(kept)
-            } else {
-                Value::Array(
-                    arr.into_iter()
-                        .map(|v| compact_value(v, max_str_len))
-                        .collect(),
-                )
-            }
-        }
-        Value::Object(map) => {
-            let compacted = map
-                .into_iter()
-                .map(|(k, v)| (k, compact_value(v, max_str_len)))
-                .collect();
-            Value::Object(compacted)
-        }
-        other => other, // numbers, booleans, null — pass through
     }
 }

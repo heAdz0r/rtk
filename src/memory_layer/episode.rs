@@ -61,6 +61,7 @@ pub struct EpisodeEvent {
 // ── Episode lifecycle ──────────────────────────────────────────────────────────
 
 /// Start a new episode. Returns the `session_id` (16-char hex).
+#[allow(dead_code)] // changed: memory layer API, wired up via mod.rs in future
 pub fn start_episode(
     project_id: &str,
     task_text: &str,
@@ -105,6 +106,7 @@ fn start_episode_inner(
 }
 
 /// Record a single event within a session. Also updates `task_file_affinity` for file events.
+#[allow(dead_code)] // changed: memory layer API, wired up via mod.rs in future
 pub fn record_episode_event(event: &EpisodeEvent) -> Result<()> {
     with_retry(3, || record_episode_event_inner(event))
 }

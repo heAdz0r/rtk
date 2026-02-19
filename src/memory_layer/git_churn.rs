@@ -63,7 +63,9 @@ pub fn load_churn(repo_root: &Path) -> Result<ChurnCache> {
 
     // P1: fast path — return cached result if HEAD hasn't changed
     {
-        let guard = churn_cache_global().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = churn_cache_global()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
             if cached.head_sha == head_sha {
                 return Ok(cached.clone());
@@ -74,7 +76,11 @@ pub fn load_churn(repo_root: &Path) -> Result<ChurnCache> {
     // Cache miss (first call or new commit): run git log
     let freq_map = build_freq_map(repo_root)?;
     let max_count = freq_map.values().copied().max().unwrap_or(0);
-    let result = ChurnCache { head_sha, freq_map, max_count };
+    let result = ChurnCache {
+        head_sha,
+        freq_map,
+        max_count,
+    };
 
     // Store in cache (lock re-acquired after drop above — no deadlock)
     churn_cache_global()
@@ -100,8 +106,12 @@ fn get_head_sha(repo_root: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+// changed: streaming BufReader instead of loading full git log into RAM (performance fix)
 fn build_freq_map(repo_root: &Path) -> Result<HashMap<String, u32>> {
-    let out = Command::new("git")
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = Command::new("git")
         .args([
             "-C",
             repo_root.to_str().unwrap_or("."),
@@ -110,17 +120,20 @@ fn build_freq_map(repo_root: &Path) -> Result<HashMap<String, u32>> {
             "--format=", // empty commit header → only file names
             "--name-only",
         ])
-        .output()
-        .context("git log --name-only failed")?;
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("git log spawn failed")?;
 
-    let text = String::from_utf8_lossy(&out.stdout);
+    let reader = BufReader::new(child.stdout.take().context("no stdout")?);
     let mut map: HashMap<String, u32> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            *map.entry(line.to_string()).or_insert(0) += 1;
+    for line in reader.lines() {
+        let line = line.context("git log read error")?;
+        let trimmed = line.trim().to_string();
+        if !trimmed.is_empty() {
+            *map.entry(trimmed).or_insert(0) += 1;
         }
     }
+    child.wait().context("git log wait failed")?;
     Ok(map)
 }
 

@@ -289,7 +289,7 @@ fn classify_intent(normalized: &str) -> (IntentKind, f32) {
     match best {
         Some((kind, score)) if *score > 0.0 => {
             let raw = if total > 0.0 { score / total } else { 0.0 };
-            (kind.clone(), raw.max(0.4).min(0.95)) // floor 0.4, cap 0.95
+            (kind.clone(), raw.clamp(0.4, 0.95)) // changed: .clamp() replaces .max().min() chain
         }
         _ => (IntentKind::Unknown, 0.0),
     }

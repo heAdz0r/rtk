@@ -7,9 +7,10 @@ use std::path::PathBuf;
 // ── ReadMode ────────────────────────────────────────────────
 
 /// Target read mode, selected by CLI flags.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ReadMode {
     /// Default: full file read with filter+digest+cache pipeline
+    #[default]
     Full,
     /// Structural outline with line spans (PR-3)
     Outline,
@@ -19,12 +20,6 @@ pub enum ReadMode {
     Changed,
     /// Changed hunks relative to a revision (PR-5)
     Since(String),
-}
-
-impl Default for ReadMode {
-    fn default() -> Self {
-        ReadMode::Full
-    }
 }
 
 // ── ReadRequest ─────────────────────────────────────────────

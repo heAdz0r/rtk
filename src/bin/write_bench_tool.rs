@@ -51,9 +51,12 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", cli.content_file.display(), e))?;
 
     if cli.implementation == "write_core" {
-        let mut opts = WriteOptions::default();
-        opts.durability = durability;
-        opts.idempotent_skip = !cli.assume_changed;
+        // changed: struct update syntax instead of field assignment after Default
+        let opts = WriteOptions {
+            durability,
+            idempotent_skip: !cli.assume_changed,
+            ..WriteOptions::default()
+        };
         let writer = AtomicWriter::new(opts);
         let stats = writer.write_bytes(&cli.path, &content)?;
 
