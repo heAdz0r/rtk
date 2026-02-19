@@ -48,18 +48,27 @@ for cmd in "${commands[@]}"; do
 done
 echo "README/CLAUDE command coverage: OK"
 
-for hook in .claude/hooks/rtk-rewrite.sh hooks/rtk-rewrite.sh; do
-  if [[ ! -f "${hook}" ]]; then
-    echo "ERROR: missing hook file: ${hook}"
+# changed: check repo hook (hooks/rtk-rewrite.sh); .claude/hooks/ is a global install path, not in repo
+hook="hooks/rtk-rewrite.sh"
+if [[ ! -f "${hook}" ]]; then
+  echo "ERROR: missing hook file: ${hook}"
+  exit 1
+fi
+for cmd in ruff pytest pip "go " golangci; do
+  if ! grep -q "${cmd}" "${hook}"; then
+    echo "ERROR: ${hook} missing rewrite coverage for: ${cmd}"
     exit 1
   fi
+done
+# Also check global install location if present (optional, CI skips)
+if [[ -f ".claude/hooks/rtk-rewrite.sh" ]]; then
   for cmd in ruff pytest pip "go " golangci; do
-    if ! grep -q "${cmd}" "${hook}"; then
-      echo "ERROR: ${hook} missing rewrite coverage for: ${cmd}"
+    if ! grep -q "${cmd}" ".claude/hooks/rtk-rewrite.sh"; then
+      echo "ERROR: .claude/hooks/rtk-rewrite.sh missing rewrite coverage for: ${cmd}"
       exit 1
     fi
   done
-done
+fi
 echo "Hook coverage: OK"
 
 echo "Documentation validation passed"
