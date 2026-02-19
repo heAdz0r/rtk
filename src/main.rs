@@ -827,6 +827,20 @@ enum WriteCommands {
         #[arg(long, default_value = "0")]
         retry: u32,
     },
+    /// Create a new file with the given content (atomic, idempotent) // changed: new create subcommand
+    Create {
+        /// Target file path (created including parent directories)
+        file: PathBuf,
+        /// File content. Use @path to read from file, @- for stdin.
+        #[arg(long, default_value = "")]
+        content: String,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Use fast durability mode (skip fsync)
+        #[arg(long)]
+        fast: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1206,7 +1220,7 @@ enum MemoryCommands {
         project: PathBuf,
     },
 
-    /// E4.1: Start localhost HTTP API server (GET /v1/health, POST /v1/{explore,delta,refresh,context})
+    /// E4.1: Start localhost HTTP API server (GET /v1/health, POST /v1/{explore,delta,refresh,context,plan-context})
     Serve {
         /// TCP port to listen on
         #[arg(long, default_value = "7700")]
@@ -1214,6 +1228,21 @@ enum MemoryCommands {
         /// Stop after N seconds with no requests (0 = run forever)
         #[arg(long, default_value = "300")]
         idle_secs: u64,
+    },
+
+    /// Ranked context plan for a specific task (budget-aware, deterministic)
+    Plan {
+        /// Task description (e.g. "fix jwt token refresh bug")
+        task: String,
+        /// Project root to index
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Maximum token budget for context (0 = default 4000)
+        #[arg(long, default_value = "4000")]
+        token_budget: u32,
+        /// Output format: json (default), text
+        #[arg(short, long, default_value = "json")]
+        format: String,
     },
 }
 
@@ -1513,6 +1542,22 @@ fn main() -> Result<()> {
                     concurrency,
                 };
                 write_cmd::run_batch(&plan, params)?;
+            }
+            // changed: new create subcommand handler
+            WriteCommands::Create {
+                file,
+                content,
+                dry_run,
+                fast,
+            } => {
+                let params = write_cmd::WriteParams {
+                    dry_run,
+                    fast,
+                    verbose: cli.verbose,
+                    output,
+                    concurrency: write_cmd::ConcurrencyOpts::default(),
+                };
+                write_cmd::run_create(&file, &content, params)?;
             }
         },
 
@@ -2015,6 +2060,16 @@ fn main() -> Result<()> {
             MemoryCommands::Serve { port, idle_secs } => {
                 // E4.1: HTTP API daemon
                 memory_layer::run_serve(port, idle_secs, cli.verbose)?;
+            }
+
+            MemoryCommands::Plan {
+                task,
+                project,
+                token_budget,
+                format,
+            } => {
+                // Plan-context: ranked candidates under token budget
+                memory_layer::run_plan(&project, &task, token_budget, &format, cli.verbose)?;
             }
         },
 

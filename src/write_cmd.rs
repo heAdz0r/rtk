@@ -11,12 +11,33 @@ use serde_json::{Map, Value as JsonValue};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read as _; // changed: for expand_at_ref stdin support
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use toml::Value as TomlValue;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlEditValue};
+
+/// Expand `@filename` references in argument values before processing. // changed: @filename expansion helper
+/// - `@/path/to/file` or `@relative/path` -> reads file content (UTF-8)
+/// - `@-` -> reads stdin to end
+/// - Any other value -> passed through as-is (zero-copy)
+pub fn expand_at_ref(val: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let Some(path) = val.strip_prefix('@') else {
+        return Ok(std::borrow::Cow::Borrowed(val));
+    };
+    if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("@-: failed to read stdin")?;
+        return Ok(std::borrow::Cow::Owned(buf));
+    }
+    let file_content =
+        fs::read_to_string(path).with_context(|| format!("@file: failed to read {:?}", path))?;
+    Ok(std::borrow::Cow::Owned(file_content))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ConfigFormat {
@@ -194,6 +215,8 @@ pub struct BatchOp {
     pub value_type: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>, // changed: content for create op
 }
 
 /// Generate concise message from WriteResponse for rendering. // changed: extracted from run_* functions
@@ -244,8 +267,12 @@ where
         // Always acquire flock (transparent, ~0.1ms overhead)
         let _guard = FileLockGuard::acquire(file)?;
 
-        let content = fs::read_to_string(file)
-            .with_context(|| format!("Failed to read {}", file.display()))?;
+        // changed: handle NotFound gracefully so create ops can write new files
+        let content = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("Failed to read {}", file.display())),
+        };
 
         // Build CAS snapshot from in-memory content to avoid an extra file re-read.
         let snapshot = if use_cas {
@@ -379,7 +406,7 @@ fn is_shell_escaped_punct(ch: char) -> bool {
 }
 
 /// Single-pass best-effort unescape for shell-escaped punctuation
-/// (e.g. "\!" -> "!"). Used only as a fallback when exact matching fails.
+/// (e.g. r"\!" -> "!"). Used only as a fallback when exact matching fails.
 fn maybe_unescape_shell_escapes_once(input: &str) -> Option<String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -403,7 +430,7 @@ fn maybe_unescape_shell_escapes_once(input: &str) -> Option<String> {
 }
 
 /// Generate progressively unescaped variants (up to `max_steps`).
-/// This handles cases where strings are escaped multiple times (e.g. "\\\\!" -> "\\!" -> "!").
+/// This handles cases where strings are escaped multiple times (e.g. r"\\\\!" -> r"\\!" -> "!").
 fn shell_unescape_candidates(input: &str, max_steps: usize) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut current = input.to_string();
@@ -448,7 +475,7 @@ fn smart_no_match_hint(base: &str, flag: &str, pattern: &str) -> String {
 
     if has_shell_escape_like_pattern(pattern) {
         hints.push(format!(
-            "pattern for {} contains shell-style escapes (for example, '\\\\!'); pass literal text or single-quote the argument",
+            r"pattern for {} contains shell-style escapes (for example, '\\\\!'); pass literal text or single-quote the argument",
             flag
         ));
     }
@@ -676,6 +703,77 @@ pub fn run_set(
     if let Some(timer) = timer.as_ref() {
         let (ti, to_str, tc) = write_tracking_args("set", &content, &msg);
         timer.track(&format!("write set {}", file.display()), tc, ti, to_str);
+    }
+    Ok(())
+}
+
+/// Create a new file with the given content (atomic, idempotent). // changed: new create command
+/// - File does not exist -> create it.
+/// - File exists with same content -> noop.
+/// - File exists with different content -> error (use replace/patch instead).
+pub fn run_create(file: &Path, content: &str, params: WriteParams) -> Result<()> {
+    let content_val = expand_at_ref(content)?; // changed: support @filename expansion
+    let content_str = content_val.as_ref();
+    let timer = write_tracking_enabled().then(tracking::TimedExecution::start);
+
+    let existing = match fs::read_to_string(file) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", file.display())),
+    };
+
+    // Idempotent: content already matches -> noop
+    if existing.as_deref() == Some(content_str) {
+        let resp = WriteResponse::noop("create");
+        let msg = format_response_msg(&resp, "create");
+        resp.render(params.output, &msg);
+        return Ok(());
+    }
+
+    // File exists but content differs -> refuse (create != overwrite)
+    if existing.is_some() {
+        return Err(write_error(
+            "FILE_EXISTS",
+            &format!(
+                "{} already exists with different content; use replace/patch to modify it",
+                file.display()
+            ),
+            params.output,
+        ));
+    }
+
+    if params.dry_run {
+        let resp = WriteResponse::dry_run("create", 1);
+        let msg = format_response_msg(&resp, "create");
+        resp.render(params.output, &msg);
+        return Ok(());
+    }
+
+    // Create parent dirs if needed
+    if let Some(parent) = file.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", file.display())
+            })?;
+        }
+    }
+
+    let options = if params.fast {
+        WriteOptions::fast()
+    } else {
+        WriteOptions::durable()
+    };
+    let writer = AtomicWriter::new(options);
+    writer
+        .write_str(file, content_str)
+        .with_context(|| format!("Failed to create {}", file.display()))?;
+
+    let resp = WriteResponse::success("create", 1);
+    let msg = format_response_msg(&resp, "create");
+    resp.render(params.output, &msg);
+    if let Some(timer) = timer.as_ref() {
+        let (ti, to_str, tc) = write_tracking_args("create", content_str, &msg);
+        timer.track(&format!("write create {}", file.display()), tc, ti, to_str);
     }
     Ok(())
 }
@@ -968,6 +1066,25 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
                 return Ok(BatchApplyResult::Noop);
             }
             Ok(BatchApplyResult::Applied { updated, count: 1 })
+        }
+        // changed: new create op — writes content to a new file (idempotent, fails if file exists with different content)
+        "create" => {
+            let content_str = op.content.as_deref().unwrap_or("");
+            // Idempotent: file already has exactly the desired content
+            if content == content_str {
+                return Ok(BatchApplyResult::Noop);
+            }
+            // File already exists with different content (non-empty) → error
+            if !content.is_empty() {
+                bail!(
+                    "FILE_EXISTS: {} already exists with different content; use replace/patch to modify it",
+                    op.file.display()
+                );
+            }
+            Ok(BatchApplyResult::Applied {
+                updated: content_str.to_string(),
+                count: 1,
+            })
         }
         other => bail!("Unknown batch operation: '{}'", other),
     }
@@ -1270,7 +1387,7 @@ mod tests {
         let file = tmp.path().join("escaped_bang_replace.txt");
         fs::write(&file, "if a != b { return; }\n").unwrap();
 
-        run_replace(&file, "\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
+        run_replace(&file, r"\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             "if a == b { return; }\n"
@@ -1279,32 +1396,35 @@ mod tests {
 
     #[test]
     fn patch_unescapes_shell_escaped_bang_as_fallback() {
+        // Pattern uses shell-escaped bang (\\! → !) with real newlines in file.
+        // run_patch must unescape \\!= → \!= → != over two fallback steps.
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("escaped_bang_patch.txt");
-        fs::write(&file, "if left != right {\n    return;\n}\n").unwrap();
+        fs::write(&file, "if left != right { return; }\n").unwrap();
 
         run_patch(
             &file,
-            "if left \\!= right {\n    return;\n}\n",
-            "if left == right {\n    return;\n}\n",
+            r"if left \\!= right { return; }", // raw: literal \\!= needing 2 unescape steps
+            "if left == right { return; }",
             false,
             tp(OutputMode::Quiet),
         )
         .unwrap();
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
-            "if left == right {\n    return;\n}\n"
+            "if left == right { return; }\n"
         );
     }
 
     #[test]
     fn replace_prefers_exact_match_over_unescape_fallback() {
+        // File literally contains \\!= — exact match wins over unescape fallback.
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("escaped_bang_exact_precedence.txt");
-        fs::write(&file, "\\!= and !=\n").unwrap();
+        fs::write(&file, "\\\\!= and !=").unwrap(); // file: \\!= and !=
 
-        run_replace(&file, "\\!=", "MATCH", false, tp(OutputMode::Quiet)).unwrap();
-        assert_eq!(fs::read_to_string(&file).unwrap(), "MATCH and !=\n");
+        run_replace(&file, r"\\!=", "MATCH", false, tp(OutputMode::Quiet)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "MATCH and !=");
     }
 
     #[test]
@@ -1313,7 +1433,7 @@ mod tests {
         let file = tmp.path().join("escaped_bang_nomatch.txt");
         fs::write(&file, "alpha beta\n").unwrap();
 
-        let err = run_replace(&file, "\\!=", "==", false, tp(OutputMode::Quiet)).unwrap_err();
+        let err = run_replace(&file, r"\\!=", "==", false, tp(OutputMode::Quiet)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("NO_MATCH"));
         assert!(msg.contains("shell-style escapes"));
@@ -1334,7 +1454,7 @@ mod tests {
         let file = tmp.path().join("double_escaped_bang_replace.txt");
         fs::write(&file, "if a != b { return; }\n").unwrap();
 
-        run_replace(&file, "\\\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
+        run_replace(&file, r"\\\\!=", "==", false, tp(OutputMode::Quiet)).unwrap();
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             "if a == b { return; }\n"
@@ -1569,7 +1689,7 @@ mod tests {
         fs::write(&f1, "x != y\n").unwrap();
 
         let plan = serde_json::json!([
-            {"op":"replace","file": f1.to_str().unwrap(), "from":"\\!=", "to":"=="}
+            {"op":"replace","file": f1.to_str().unwrap(), "from":r"\\!=", "to":"=="}
         ]);
 
         run_batch(&plan.to_string(), tp(OutputMode::Quiet)).unwrap();
@@ -1859,5 +1979,29 @@ mod tests {
         let resp = WriteResponse::success("patch", 1);
         let msg = format_response_msg(&resp, "patch");
         assert_eq!(msg, "OK patch applied=1");
+    }
+
+    // --- expand_at_ref tests ---
+
+    #[test]
+    fn expand_at_ref_passthrough() {
+        let result = expand_at_ref("hello world").unwrap();
+        assert_eq!(result.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn expand_at_ref_reads_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("atref_content.txt");
+        fs::write(&file, "file content here").unwrap();
+        let path_str = format!("@{}", file.display());
+        let result = expand_at_ref(&path_str).unwrap();
+        assert_eq!(result.as_ref(), "file content here");
+    }
+
+    #[test]
+    fn expand_at_ref_missing_file_errors() {
+        let result = expand_at_ref("@/tmp/__rtk_nonexistent_test_xyz.txt");
+        assert!(result.is_err(), "missing @ref file should error");
     }
 }

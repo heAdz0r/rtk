@@ -12,6 +12,14 @@ mod indexer; // E0.1: scanning, incremental hashing, delta
 mod manifest; // E0.1: dep manifest parsing
 mod renderer; // E0.1: response building, text rendering, layer selection
 
+mod budget; // E7.4: budget-aware greedy knapsack assembler
+mod call_graph; // symbol call graph: who calls what (regex-based static analysis)
+mod episode; // E8.1: episodic event log (debugging only, no ranking influence)
+mod git_churn; // deterministic git churn frequency index (replaces affinity)
+mod intent; // E7.1: task intent classifier + fingerprint
+mod ollama; // E9.2: optional Ollama ML adapter (Stage-2 rerank, --ml-mode full only)
+mod ranker; // E7.3: deterministic Stage-1 linear ranker
+
 use cache::{
     canonical_project_root, delete_artifact, epoch_secs, is_artifact_stale, load_artifact,
     mem_db_path, query_cache_stats, record_cache_event, record_event, store_artifact,
@@ -952,6 +960,123 @@ pub fn run_clear(project: &Path, _verbose: u8) -> Result<()> {
 /// E4.1: Start localhost HTTP API server with idle-timeout daemon lifecycle.
 pub fn run_serve(port: u16, idle_secs: u64, verbose: u8) -> Result<()> {
     api::serve(port, idle_secs, verbose)
+}
+
+/// CLI entry for `rtk memory plan` — ranked context under token budget.
+pub fn run_plan(
+    project: &Path,
+    task: &str,
+    token_budget: u32,
+    format: &str,
+    _verbose: u8,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    let project_root = canonical_project_root(project)?;
+    let cfg = mem_config();
+    let token_budget = if token_budget == 0 {
+        4000
+    } else {
+        token_budget
+    };
+
+    // Build/reuse artifact
+    let state = indexer::build_state(&project_root, false, cfg.features.cascade_invalidation, 0)?;
+    if !state.cache_hit {
+        store_artifact(&state.artifact)?;
+        store_import_edges(&state.artifact);
+    }
+
+    // Load git churn (cached by HEAD sha)
+    let churn = git_churn::load_churn(&project_root).unwrap_or_else(|_| git_churn::ChurnCache {
+        head_sha: "unknown".to_string(),
+        freq_map: std::collections::HashMap::new(),
+        max_count: 0,
+    });
+
+    // Parse intent for weight tuning
+    let parsed_intent = intent::parse_intent(task, &state.project_id);
+
+    // Recent-change paths for f_recency_score
+    let recent_paths: HashSet<String> =
+        state.delta.changes.iter().map(|d| d.path.clone()).collect();
+
+    // Build call graph from artifact pub fn symbols
+    let all_symbols: Vec<(String, Vec<String>)> = state
+        .artifact
+        .files
+        .iter()
+        .map(|fa| {
+            let syms: Vec<String> = fa
+                .pub_symbols
+                .iter()
+                .filter(|s| s.kind == "fn")
+                .map(|s| s.name.clone())
+                .collect();
+            (fa.rel_path.clone(), syms)
+        })
+        .collect();
+    let cg = call_graph::CallGraph::build(&all_symbols, &project_root);
+    let query_tags = parsed_intent.extracted_tags.clone();
+
+    // Build candidates
+    let candidates: Vec<ranker::Candidate> = state
+        .artifact
+        .files
+        .iter()
+        .map(|fa| {
+            let mut c = ranker::Candidate::new(&fa.rel_path);
+            c.features.f_structural_relevance = if !fa.pub_symbols.is_empty() {
+                1.0
+            } else if !fa.imports.is_empty() {
+                0.5
+            } else {
+                0.2
+            };
+            c.features.f_churn_score = git_churn::churn_score(&churn, &fa.rel_path);
+            c.features.f_recency_score = if recent_paths.contains(&fa.rel_path) {
+                1.0
+            } else {
+                0.0
+            };
+            c.features.f_risk_score = ranker::path_risk_score(&fa.rel_path);
+            c.features.f_test_proximity = if ranker::is_test_file(&fa.rel_path) {
+                0.8
+            } else {
+                0.0
+            };
+            c.features.f_call_graph_score = cg.caller_score(&fa.rel_path, &query_tags);
+            let raw_cost = budget::estimate_tokens_for_path(&fa.rel_path);
+            c.estimated_tokens = raw_cost;
+            c.features.f_token_cost = (raw_cost as f32 / 1000.0).min(1.0);
+            c.sources.push("artifact".to_string());
+            c
+        })
+        .collect();
+
+    // Stage-1 rank
+    let ranked = ranker::rank_stage1(candidates, &parsed_intent);
+
+    // Budget-aware assembly
+    let result = budget::assemble(ranked, token_budget);
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "# Plan Context ({} selected, {}/{} tokens)",
+            result.budget_report.candidates_selected,
+            result.budget_report.estimated_used,
+            token_budget
+        );
+        for c in &result.selected {
+            println!("  [{:.2}] {}", c.score, c.rel_path);
+        }
+        if !result.dropped.is_empty() {
+            println!("# Dropped: {}", result.dropped.len());
+        }
+    }
+    Ok(())
 }
 
 pub fn run_gain(project: &Path, verbose: u8) -> Result<()> {
@@ -1931,7 +2056,6 @@ version = "0.1.0"
     #[test]
     fn cache_stats_record_and_query_roundtrip() {
         // E1.4: record hit/miss events, verify aggregate query.
-        // Uses a unique project_id to avoid interference with parallel tests.
         use super::cache::{query_cache_stats, record_cache_event};
 
         let project_id = "test_task10_stats_v1";

@@ -1,10 +1,12 @@
 // E0.1: Indexing/scanning extracted from mod.rs
 use anyhow::{Context, Result};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
+use rayon::prelude::*; // parallel iterators for memory layer hot paths
 use std::collections::{BTreeMap, HashMap, HashSet}; // E3.2: HashSet for cascade sets
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache::{
@@ -259,24 +261,24 @@ fn find_cascade_dependents(
         return HashSet::new();
     }
 
-    let mut dependents = HashSet::new();
-    'file_loop: for (rel_path, artifact) in previous_map {
-        if changed_paths.contains(rel_path) {
-            continue; // already being rehashed
-        }
-        for import in &artifact.imports {
-            if import.starts_with("self:") {
-                continue; // skip synthetic anchors
+    // parallel: each file is independent — par_iter replaces sequential loop
+    previous_map
+        .par_iter()
+        .filter(|(rel_path, _)| !changed_paths.contains(*rel_path))
+        .filter_map(|(rel_path, artifact)| {
+            let is_dependent = artifact.imports.iter().any(|import| {
+                !import.starts_with("self:")
+                    && changed_stems
+                        .iter()
+                        .any(|stem| import.contains(stem.as_str()))
+            });
+            if is_dependent {
+                Some(rel_path.clone())
+            } else {
+                None
             }
-            for stem in &changed_stems {
-                if import.contains(stem.as_str()) {
-                    dependents.insert(rel_path.clone());
-                    continue 'file_loop;
-                }
-            }
-        }
-    }
-    dependents
+        })
+        .collect()
 }
 
 fn build_incremental_files(
@@ -314,6 +316,108 @@ fn build_incremental_files(
         HashSet::new()
     };
 
+    // Parallel: hash_file() + analyze_file() are I/O+CPU bound and fully independent per file.
+    // par_iter() replaces the sequential for-loop; accumulation stays sequential after collect.
+    struct FileEntry {
+        artifact: FileArtifact,
+        delta: Option<FileDelta>,
+        reused: bool,
+    }
+
+    let raw: Vec<Result<FileEntry>> = current_files
+        .par_iter()
+        .map(|(rel_path, meta)| -> Result<FileEntry> {
+            match previous_map.get(rel_path) {
+                Some(previous) => {
+                    let metadata_match =
+                        previous.size == meta.size && previous.mtime_ns == meta.mtime_ns;
+                    // E3.2: also force rehash if this file is a cascade dependent
+                    if metadata_match && !force_rehash && !cascade_paths.contains(rel_path) {
+                        return Ok(FileEntry {
+                            artifact: previous.clone(),
+                            delta: None,
+                            reused: true,
+                        });
+                    }
+
+                    let current_hash = hash_file(&meta.abs_path)
+                        .with_context(|| format!("Failed to hash {}", meta.abs_path.display()))?;
+
+                    if current_hash == previous.hash {
+                        let mut kept = previous.clone();
+                        kept.size = meta.size;
+                        kept.mtime_ns = meta.mtime_ns;
+                        return Ok(FileEntry {
+                            artifact: kept,
+                            delta: None,
+                            reused: false,
+                        });
+                    }
+
+                    let mut next = previous.clone();
+                    let analysis =
+                        extractor::analyze_file(&meta.abs_path, meta.size, current_hash)?;
+                    next.size = meta.size;
+                    next.mtime_ns = meta.mtime_ns;
+                    next.hash = current_hash;
+                    next.language = analysis.language;
+                    next.line_count = analysis.line_count;
+                    next.imports = analysis.imports;
+                    next.pub_symbols = analysis.pub_symbols; // L3: refresh API surface
+                    next.type_relations = analysis.type_relations; // L2: refresh type graph
+                    let delta = FileDelta {
+                        path: rel_path.clone(),
+                        change: DeltaKind::Modified,
+                        old_hash: Some(format_hash(previous.hash)),
+                        new_hash: Some(format_hash(current_hash)),
+                    };
+                    Ok(FileEntry {
+                        artifact: next,
+                        delta: Some(delta),
+                        reused: false,
+                    })
+                }
+                None => {
+                    let current_hash = hash_file(&meta.abs_path).with_context(|| {
+                        format!(
+                            "Failed to hash newly discovered file {}",
+                            meta.abs_path.display()
+                        )
+                    })?;
+                    let analysis =
+                        extractor::analyze_file(&meta.abs_path, meta.size, current_hash)?;
+                    let artifact = FileArtifact {
+                        rel_path: rel_path.clone(),
+                        size: meta.size,
+                        mtime_ns: meta.mtime_ns,
+                        hash: current_hash,
+                        language: analysis.language,
+                        line_count: analysis.line_count,
+                        imports: analysis.imports,
+                        pub_symbols: analysis.pub_symbols, // L3: public API surface
+                        type_relations: analysis.type_relations, // L2: type graph edges
+                    };
+                    let delta = FileDelta {
+                        path: rel_path.clone(),
+                        change: DeltaKind::Added,
+                        old_hash: None,
+                        new_hash: Some(format_hash(current_hash)),
+                    };
+                    Ok(FileEntry {
+                        artifact,
+                        delta: Some(delta),
+                        reused: false,
+                    })
+                }
+            }
+        })
+        .collect();
+
+    // Sequential accumulation of parallel results into scan_stats + file lists.
+    // Note: unlike the previous sequential loop, all files are processed before the
+    // first error is propagated (par_iter does not short-circuit). This is intentional:
+    // errors (hash/IO failures) are rare and wasting redundant work is preferable to
+    // the added complexity of early-exit parallel iteration.
     let mut files: Vec<FileArtifact> = Vec::with_capacity(current_files.len());
     let mut changes: Vec<FileDelta> = Vec::new();
     let mut scan_stats = ScanStats {
@@ -322,81 +426,18 @@ fn build_incremental_files(
     };
     let mut total_bytes: u64 = 0;
 
-    for (rel_path, meta) in current_files {
-        total_bytes = total_bytes.saturating_add(meta.size);
-
-        match previous_map.get(rel_path) {
-            Some(previous) => {
-                let metadata_match =
-                    previous.size == meta.size && previous.mtime_ns == meta.mtime_ns;
-                // E3.2: also force rehash if this file is a cascade dependent
-                if metadata_match && !force_rehash && !cascade_paths.contains(rel_path) {
-                    scan_stats.reused_entries += 1;
-                    files.push(previous.clone());
-                    continue;
-                }
-
-                let current_hash = hash_file(&meta.abs_path)
-                    .with_context(|| format!("Failed to hash {}", meta.abs_path.display()))?;
-                scan_stats.rehashed_entries += 1;
-
-                if current_hash == previous.hash {
-                    let mut kept = previous.clone();
-                    kept.size = meta.size;
-                    kept.mtime_ns = meta.mtime_ns;
-                    files.push(kept);
-                    continue;
-                }
-
-                let mut next = previous.clone();
-                let analysis = extractor::analyze_file(&meta.abs_path, meta.size, current_hash)?;
-                next.size = meta.size;
-                next.mtime_ns = meta.mtime_ns;
-                next.hash = current_hash;
-                next.language = analysis.language;
-                next.line_count = analysis.line_count;
-                next.imports = analysis.imports;
-                next.pub_symbols = analysis.pub_symbols; // L3: refresh API surface
-                next.type_relations = analysis.type_relations; // L2: refresh type graph
-                files.push(next);
-
-                changes.push(FileDelta {
-                    path: rel_path.clone(),
-                    change: DeltaKind::Modified,
-                    old_hash: Some(format_hash(previous.hash)),
-                    new_hash: Some(format_hash(current_hash)),
-                });
-            }
-            None => {
-                let current_hash = hash_file(&meta.abs_path).with_context(|| {
-                    format!(
-                        "Failed to hash newly discovered file {}",
-                        meta.abs_path.display()
-                    )
-                })?;
-                scan_stats.rehashed_entries += 1;
-
-                let analysis = extractor::analyze_file(&meta.abs_path, meta.size, current_hash)?;
-                files.push(FileArtifact {
-                    rel_path: rel_path.clone(),
-                    size: meta.size,
-                    mtime_ns: meta.mtime_ns,
-                    hash: current_hash,
-                    language: analysis.language,
-                    line_count: analysis.line_count,
-                    imports: analysis.imports,
-                    pub_symbols: analysis.pub_symbols, // L3: public API surface
-                    type_relations: analysis.type_relations, // L2: type graph edges
-                });
-
-                changes.push(FileDelta {
-                    path: rel_path.clone(),
-                    change: DeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(format_hash(current_hash)),
-                });
-            }
+    for entry_result in raw {
+        let entry = entry_result?;
+        total_bytes = total_bytes.saturating_add(entry.artifact.size);
+        if entry.reused {
+            scan_stats.reused_entries += 1;
+        } else {
+            scan_stats.rehashed_entries += 1;
         }
+        if let Some(delta) = entry.delta {
+            changes.push(delta);
+        }
+        files.push(entry.artifact);
     }
 
     for (rel_path, previous) in previous_map {
@@ -440,66 +481,73 @@ fn build_incremental_files(
 }
 
 pub(super) fn scan_project_metadata(project_root: &Path) -> Result<BTreeMap<String, FileMeta>> {
-    let mut result: BTreeMap<String, FileMeta> = BTreeMap::new();
+    // mpsc channel: each worker thread owns its own Sender clone — zero lock contention.
+    // Factory (mkf) is called once per thread under the hood; workers send independently.
+    let (tx, rx) = mpsc::channel::<(String, FileMeta)>();
+    let project_root_buf = project_root.to_path_buf();
 
-    let mut builder = WalkBuilder::new(project_root);
-    builder
+    WalkBuilder::new(project_root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .parents(true)
-        .follow_links(false);
+        .follow_links(false)
+        .build_parallel()
+        .run(|| {
+            // Clone sender for this worker thread. Factory is called once per thread
+            // (not once per entry), so each thread gets exactly one Sender clone.
+            let tx = tx.clone();
+            let project_root = project_root_buf.clone();
+            Box::new(move |entry_result| {
+                let entry = match entry_result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                let file_type = match entry.file_type() {
+                    Some(ft) => ft,
+                    None => return WalkState::Continue,
+                };
+                if !file_type.is_file() {
+                    return WalkState::Continue;
+                }
+                let abs_path = entry.path();
+                let rel_path = match abs_path.strip_prefix(&project_root) {
+                    Ok(rel) => rel,
+                    Err(_) => return WalkState::Continue,
+                };
+                if should_skip_rel_path(rel_path) {
+                    return WalkState::Continue;
+                }
+                // Use DirEntry::metadata() (lstat — consistent with follow_links(false))
+                // instead of fs::metadata() (stat — follows symlinks).
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => return WalkState::Continue,
+                };
+                let rel = normalize_rel_path(rel_path);
+                let mtime_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0);
+                let _ = tx.send((
+                    rel,
+                    FileMeta {
+                        abs_path: abs_path.to_path_buf(),
+                        size: metadata.len(),
+                        mtime_ns,
+                    },
+                ));
+                WalkState::Continue
+            })
+        });
 
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let file_type = match entry.file_type() {
-            Some(file_type) => file_type,
-            None => continue,
-        };
-
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let abs_path = entry.path();
-        let rel_path = match abs_path.strip_prefix(project_root) {
-            Ok(rel) => rel,
-            Err(_) => continue,
-        };
-
-        if should_skip_rel_path(rel_path) {
-            continue;
-        }
-
-        let metadata = match fs::metadata(abs_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let rel = normalize_rel_path(rel_path);
-        let mtime_ns = metadata
-            .modified()
-            .ok()
-            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or(0);
-
-        result.insert(
-            rel,
-            FileMeta {
-                abs_path: abs_path.to_path_buf(),
-                size: metadata.len(),
-                mtime_ns,
-            },
-        );
-    }
-
-    Ok(result)
+    // All worker threads are joined synchronously by run(). Drop the original sender
+    // here to close the channel so rx.into_iter() terminates instead of blocking.
+    drop(tx);
+    Ok(rx.into_iter().collect())
 }
 
 pub(super) fn should_skip_rel_path(path: &Path) -> bool {
@@ -597,6 +645,43 @@ mod tests {
             total_bytes: files.iter().map(|f| f.size).sum(),
             files,
             dep_manifest: None,
+        }
+    }
+
+    #[test]
+    fn scan_project_metadata_parallel_returns_all_files_and_excludes_rtk_lock() {
+        // TDD: parallel walk must return same set as sequential; .rtk-lock must be excluded.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn add() {}").unwrap();
+        std::fs::write(dir.path().join("config.rs"), "// config").unwrap();
+        std::fs::write(dir.path().join("secret.rtk-lock"), "lock").unwrap();
+
+        let result = scan_project_metadata(dir.path()).expect("scan must succeed");
+
+        assert_eq!(
+            result.len(),
+            3,
+            "expected 3 .rs files, got {:?}",
+            result.keys().collect::<Vec<_>>()
+        );
+        assert!(result.contains_key("main.rs"), "main.rs must be present");
+        assert!(result.contains_key("lib.rs"), "lib.rs must be present");
+        assert!(
+            result.contains_key("config.rs"),
+            "config.rs must be present"
+        );
+        assert!(
+            !result.contains_key("secret.rtk-lock"),
+            ".rtk-lock must be excluded"
+        );
+        // rel_paths must not have leading separator
+        for (rel, meta) in &result {
+            assert!(
+                !rel.starts_with('/') && !rel.starts_with('\\'),
+                "rel_path must be relative: {rel}"
+            );
+            assert!(meta.size > 0, "size must be > 0 for {rel}");
         }
     }
 
@@ -699,6 +784,125 @@ mod tests {
             !deps.contains("src/cache.rs"),
             "changed file itself must not be in cascade set"
         );
+    }
+
+    #[test]
+    fn build_incremental_files_stats_and_deltas() {
+        // TDD: parallel impl must produce identical scan_stats, total_bytes, and change list.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn c() {}").unwrap();
+
+        let current_files = scan_project_metadata(dir.path()).expect("scan");
+        assert_eq!(current_files.len(), 3);
+
+        // a.rs: supply correct size+mtime → metadata_match=true → reused (no hash IO)
+        let a_meta = current_files.get("a.rs").unwrap();
+        // b.rs: supply wrong mtime → metadata_match=false → rehashed → Modified delta
+        let b_meta = current_files.get("b.rs").unwrap();
+
+        let mut previous_map: HashMap<String, FileArtifact> = HashMap::new();
+        previous_map.insert(
+            "a.rs".to_string(),
+            FileArtifact {
+                rel_path: "a.rs".to_string(),
+                size: a_meta.size,
+                mtime_ns: a_meta.mtime_ns,
+                hash: 9999,
+                language: None,
+                line_count: None,
+                imports: vec![],
+                pub_symbols: vec![],
+                type_relations: vec![],
+            },
+        );
+        previous_map.insert(
+            "b.rs".to_string(),
+            FileArtifact {
+                rel_path: "b.rs".to_string(),
+                size: b_meta.size,
+                mtime_ns: b_meta.mtime_ns.wrapping_add(1),
+                hash: 0,
+                language: None,
+                line_count: None,
+                imports: vec![],
+                pub_symbols: vec![],
+                type_relations: vec![],
+            },
+        );
+        // c.rs not in previous_map → Added delta
+
+        let (files, delta, stats, total_bytes) =
+            build_incremental_files(&current_files, &previous_map, false, false, 0).unwrap();
+
+        assert_eq!(files.len(), 3, "all 3 files must be in output");
+        assert!(
+            files.windows(2).all(|w| w[0].rel_path <= w[1].rel_path),
+            "files must be sorted"
+        );
+        assert_eq!(stats.reused_entries, 1, "a.rs metadata matched → reuse");
+        assert_eq!(stats.rehashed_entries, 2, "b.rs + c.rs must be rehashed");
+        assert_eq!(delta.added, 1, "c.rs is new → Added");
+        assert_eq!(delta.modified, 1, "b.rs mtime changed → Modified");
+        assert_eq!(delta.removed, 0, "nothing removed");
+        assert!(total_bytes > 0);
+    }
+
+    #[test]
+    fn find_cascade_dependents_large_set_deterministic() {
+        // Regression: parallel impl must return same results as sequential for large input.
+        let mut previous_map: HashMap<String, FileArtifact> = HashMap::new();
+        // 50 files that import "auth" → all should be in cascade set
+        for i in 0..50u64 {
+            previous_map.insert(
+                format!("src/user_{i}.rs"),
+                FileArtifact {
+                    rel_path: format!("src/user_{i}.rs"),
+                    size: 100,
+                    mtime_ns: i,
+                    hash: i,
+                    language: Some("rust".to_string()),
+                    line_count: Some(10),
+                    imports: vec!["crate::auth".to_string()],
+                    pub_symbols: vec![],
+                    type_relations: vec![],
+                },
+            );
+        }
+        // 50 files that do NOT import "auth" → must not appear
+        for i in 0..50u64 {
+            previous_map.insert(
+                format!("src/unrelated_{i}.rs"),
+                FileArtifact {
+                    rel_path: format!("src/unrelated_{i}.rs"),
+                    size: 50,
+                    mtime_ns: i,
+                    hash: 1000 + i,
+                    language: Some("rust".to_string()),
+                    line_count: Some(5),
+                    imports: vec!["std::fmt".to_string()],
+                    pub_symbols: vec![],
+                    type_relations: vec![],
+                },
+            );
+        }
+        let mut changed = HashSet::new();
+        changed.insert("src/auth.rs".to_string());
+
+        let deps = find_cascade_dependents(&changed, &previous_map);
+
+        assert_eq!(deps.len(), 50, "expected 50 dependents, got {}", deps.len());
+        for i in 0..50u64 {
+            assert!(
+                deps.contains(&format!("src/user_{i}.rs")),
+                "missing user_{i}.rs"
+            );
+            assert!(
+                !deps.contains(&format!("src/unrelated_{i}.rs")),
+                "false positive unrelated_{i}.rs"
+            );
+        }
     }
 
     #[test]

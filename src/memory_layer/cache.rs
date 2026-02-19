@@ -31,9 +31,24 @@ pub(super) fn project_cache_key(project_root: &Path) -> String {
 
 // ── SQLite helpers ───────────────────────────────────────────────────────────
 
+/// Thread-local DB path override — set by `isolated_db()` in tests.
+/// Takes priority over `RTK_MEM_DB_PATH` env var, invisible to other threads.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static THREAD_DB_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Returns the path to the shared memory-layer SQLite database.
-/// Honours the `RTK_MEM_DB_PATH` env var for test overrides.
+/// Priority: test thread-local > RTK_MEM_DB_PATH env var > default location.
 pub(super) fn mem_db_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        let local = THREAD_DB_PATH.with(|p| p.borrow().clone());
+        if let Some(path) = local {
+            return path;
+        }
+    }
     if let Ok(p) = std::env::var("RTK_MEM_DB_PATH") {
         return PathBuf::from(p);
     }
@@ -105,7 +120,43 @@ fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_events_project
              ON events(project_id, event_type);
          CREATE INDEX IF NOT EXISTS idx_artifacts_version
-             ON artifacts(project_id, artifact_version);",
+             ON artifacts(project_id, artifact_version);
+         CREATE TABLE IF NOT EXISTS episodes (
+            session_id       TEXT    PRIMARY KEY,
+            project_id       TEXT    NOT NULL,
+            task_text        TEXT    NOT NULL,
+            task_fingerprint TEXT,
+            query_type       TEXT,
+            started_at       INTEGER NOT NULL,
+            ended_at         INTEGER,
+            outcome          TEXT,
+            token_budget     INTEGER,
+            token_used       INTEGER,
+            latency_ms       INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS episode_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   TEXT    NOT NULL,
+            event_type   TEXT    NOT NULL,
+            file_path    TEXT,
+            symbol       TEXT,
+            payload_json TEXT,
+            timestamp    INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS causal_links (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   TEXT    NOT NULL,
+            issue_ref    TEXT,
+            commit_sha   TEXT,
+            change_path  TEXT    NOT NULL,
+            change_kind  TEXT    NOT NULL,
+            rationale    TEXT,
+            timestamp    INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_episodes_project
+             ON episodes(project_id, started_at);
+         CREATE INDEX IF NOT EXISTS idx_episode_events_session
+             ON episode_events(session_id);",
     )
     .context("Failed to initialise mem.db schema")?;
     Ok(())
@@ -412,3 +463,10 @@ pub(super) fn epoch_nanos(ts: SystemTime) -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0)
 }
+
+// ── Test isolation ────────────────────────────────────────────────────────────
+
+/// Global mutex for tests that mutate RTK_MEM_DB_PATH.
+/// env::set_var is not thread-safe; this serializes all env-var-touching tests.
+#[cfg(test)]
+pub(crate) static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
