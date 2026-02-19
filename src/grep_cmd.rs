@@ -20,8 +20,8 @@ pub fn run(
         eprintln!("grep: '{}' in {}", pattern, path);
     }
 
-    // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
-    let rg_pattern = pattern.replace(r"\|", "|");
+    // Translate BRE -> PCRE: \| -> | (alternation), strip shell-injected escapes like \!
+    let rg_pattern = bre_to_pcre(pattern);
 
     let mut rg_cmd = Command::new("rg");
     rg_cmd.args(["-n", "--no-heading", &rg_pattern, path]);
@@ -47,8 +47,23 @@ pub fn run(
 
     let raw_output = stdout.to_string();
 
+    // Bug 1: rg exit 2 = regex parse error — stderr was silently swallowed, showed "0 results"
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(2) {
+        let msg = format!("❌ rg regex error for '{}': {}", rg_pattern, stderr_str.trim());
+        println!("{}", msg);
+        timer.track(
+            &format!("grep -rn '{}' {}", pattern, path),
+            "rtk grep",
+            &raw_output,
+            &msg,
+        );
+        return Ok(());
+    }
+
     if stdout.trim().is_empty() {
-        let msg = format!("🔍 0 for '{}'", pattern);
+        // Bug 2: show rg_pattern (post-translation), not original BRE
+        let msg = format!("🔍 0 for '{}'", rg_pattern);
         println!("{}", msg);
         timer.track(
             &format!("grep -rn '{}' {}", pattern, path),
@@ -76,7 +91,8 @@ pub fn run(
         };
 
         total += 1;
-        let cleaned = clean_line(content, max_line_len, context_only, pattern);
+        // Bug 3: pass rg_pattern (PCRE), not original BRE — regex::escape(BRE) breaks context
+        let cleaned = clean_line(content, max_line_len, context_only, &rg_pattern);
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
 
@@ -122,6 +138,70 @@ pub fn run(
     );
 
     Ok(())
+}
+
+/// Translate a BRE/grep pattern to a PCRE/Rust-regex pattern for ripgrep.
+///
+/// Two transformations, single char-by-char pass:
+/// 1. `\|`  -> `|`   BRE GNU alternation -> PCRE alternation
+/// 2. `\X`  -> `X`   backslash before a non-regex-metachar (e.g. `\!` injected by
+///                   zsh histexpand) is an undefined/invalid escape; strip the backslash.
+///
+/// Characters kept as `\X` (valid PCRE escape sequences):
+///   `\\` `\^` `\$` `\.` `\*` `\+` `\?` `\(` `\)` `\[` `\]` `\{` `\}`
+///   `\n` `\r` `\t` `\f` `\a` `\v`
+///   `\d` `\D` `\w` `\W` `\s` `\S` `\b` `\B` `\A` `\z`
+///   `\x` `\u` `\U` `\p` `\P` `\0`-`\9`
+fn bre_to_pcre(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // BRE alternation \| -> PCRE |
+            Some('|') => {
+                result.push('|');
+                chars.next();
+            }
+            // Valid PCRE/Rust-regex escape — keep backslash unchanged
+            Some(next) if is_pcre_escape_char(next) => {
+                result.push('\\');
+                result.push(chars.next().unwrap());
+            }
+            // Unknown/shell-injected escape (e.g. \! from zsh histexpand) — strip backslash
+            Some(_) => {
+                result.push(chars.next().unwrap());
+            }
+            // Trailing bare backslash — keep (rg will emit its own regex error)
+            None => result.push('\\'),
+        }
+    }
+    result
+}
+
+/// Returns true for characters that form valid/meaningful Rust-regex escape sequences.
+/// Backslash before these chars must be preserved; before anything else it is stripped.
+fn is_pcre_escape_char(c: char) -> bool {
+    matches!(
+        c,
+        // Metacharacters that need escaping to be literal
+        '\\' | '^' | '$' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+        // Character class shorthands
+        | 'd' | 'D' | 'w' | 'W' | 's' | 'S'
+        // Anchors
+        | 'b' | 'B' | 'A' | 'z'
+        // Standard C escape chars
+        | 'n' | 'r' | 't' | 'f' | 'a' | 'v'
+        // Hex / Unicode
+        | 'x' | 'u' | 'U'
+        // Unicode properties
+        | 'p' | 'P'
+        // Back-references \0-\9
+        | '0'..='9'
+    )
 }
 
 fn clean_line(line: &str, max_len: usize, context_only: bool, pattern: &str) -> String {
@@ -233,6 +313,7 @@ mod tests {
         assert!(!cleaned.is_empty());
     }
 
+
     // Fix: BRE \| alternation is translated to PCRE | for rg
     #[test]
     fn test_bre_alternation_translated() {
@@ -270,4 +351,34 @@ mod tests {
         }
         // If rg is not installed, skip gracefully (test still passes)
     }
+
+    // bre_to_pcre: \| -> |
+    #[test]
+    fn test_bre_to_pcre_alternation() {
+        assert_eq!(bre_to_pcre(r"panic\|todo\|unimplemented"), "panic|todo|unimplemented");
+    }
+
+    // bre_to_pcre: \! (shell histexpand artifact) -> ! (strip spurious backslash)
+    #[test]
+    fn test_bre_to_pcre_strips_shell_escaped_bang() {
+        assert_eq!(bre_to_pcre(r"panic\!"), "panic!");
+        assert_eq!(bre_to_pcre(r"panic\!\|todo\!"), "panic!|todo!");
+    }
+
+    // bre_to_pcre: valid PCRE escapes are preserved unchanged
+    #[test]
+    fn test_bre_to_pcre_preserves_valid_escapes() {
+        assert_eq!(bre_to_pcre(r"\d+\.\w+"), r"\d+\.\w+");
+        assert_eq!(bre_to_pcre(r"word"), r"word");
+        assert_eq!(bre_to_pcre(r"#\[tokio"), r"#\[tokio"); // \[ = literal [, keep
+    }
+
+    // bre_to_pcre: trailing bare backslash preserved (rg will report its own error)
+    #[test]
+    fn test_bre_to_pcre_trailing_backslash() {
+        // trailing backslash: use raw literal to avoid Rust string escape ambiguity
+        let result = bre_to_pcre(r"foo\");
+        assert_eq!(result, r"foo\");
+    }
+
 }

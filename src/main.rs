@@ -1474,6 +1474,9 @@ fn main() -> Result<()> {
                     output,
                     concurrency,
                 };
+                // expand @file refs so multi-line/special-char content can bypass shell escaping
+                let from = write_cmd::expand_at_ref(&from)?;
+                let to = write_cmd::expand_at_ref(&to)?;
                 write_cmd::run_replace(&file, &from, &to, all, params)?;
             }
             WriteCommands::Patch {
@@ -1497,6 +1500,9 @@ fn main() -> Result<()> {
                     output,
                     concurrency,
                 };
+                // expand @file refs so multi-line/special-char content can bypass shell escaping
+                let old = write_cmd::expand_at_ref(&old)?;
+                let new_text = write_cmd::expand_at_ref(&new_text)?;
                 write_cmd::run_patch(&file, &old, &new_text, all, params)?;
             }
             WriteCommands::Set {
