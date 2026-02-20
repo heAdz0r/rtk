@@ -37,21 +37,11 @@ pub fn run(
         rg_cmd.arg("--type").arg(normalize_file_type(ft)); // fix: map extension aliases → rg type names
     }
 
-    // fix: translate grep/fd flags to rg equivalents, handle --include=PAT and paired --include PAT
-    let mut args_iter = extra_args.iter().peekable();
-    while let Some(arg) = args_iter.next() {
-        if arg == "-r" || arg == "--recursive" {
-            continue;
-        }
-        if let Some(glob) = arg.strip_prefix("--include=") {
-            rg_cmd.arg(format!("--glob={}", glob)); // fix: --include= → --glob=
-        } else if arg == "--include" {
-            if let Some(next) = args_iter.next() {
-                rg_cmd.arg("--glob").arg(next); // fix: --include PAT → --glob PAT
-            }
-        } else {
-            rg_cmd.arg(arg);
-        }
+    // changed: centralised flag translation (output_mode compat + rtk read flag guard)
+    let translated = translate_extra_args(extra_args);
+    let passthrough = is_passthrough_mode(&translated); // changed: detect output_mode before rg
+    for arg in &translated {
+        rg_cmd.arg(arg);
     }
 
     let output = rg_cmd
@@ -77,6 +67,24 @@ pub fn run(
             "rtk grep",
             &raw_output,
             &msg,
+        );
+        return Ok(());
+    }
+
+    // changed: structural output modes — bypass line grouping, print rg output directly
+    if passthrough {
+        let mode = if translated.contains(&"--files-with-matches".to_string()) {
+            "--files-with-matches"
+        } else {
+            "--count"
+        };
+        let result = format_passthrough_output(&stdout, mode);
+        print!("{}", result);
+        timer.track(
+            &format!("grep -rn '{}' {}", pattern, path),
+            "rtk grep",
+            &raw_output,
+            &result,
         );
         return Ok(());
     }
@@ -163,6 +171,120 @@ pub fn run(
     );
 
     Ok(())
+}
+
+/// Returns true when translated args contain a structural-query flag (--files-with-matches or --count).
+/// In these modes rg's output format changes, so normal line grouping is skipped.
+// changed: detect passthrough mode for output_mode compat
+fn is_passthrough_mode(translated: &[String]) -> bool {
+    translated
+        .iter()
+        .any(|a| a == "--files-with-matches" || a == "--count")
+}
+
+/// Format rg output for structural modes (--files-with-matches, --count).
+/// Returns a compact human-readable string with a summary header.
+// changed: passthrough display for output_mode files_with_matches / count
+fn format_passthrough_output(rg_stdout: &str, mode: &str) -> String {
+    let lines: Vec<&str> = rg_stdout.lines().filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return "🔍 0 matches\n".to_string();
+    }
+    if mode == "--count" {
+        // rg --count outputs either "file:N" (dir search) or bare "N" (single file)
+        let is_file_count = lines.iter().any(|l| l.contains(':'));
+        if is_file_count {
+            // changed: sort by count descending for easy prioritisation
+            let mut pairs: Vec<(&str, u64)> = lines
+                .iter()
+                .filter_map(|l| {
+                    let (f, n) = l.rsplit_once(':')?;
+                    Some((f, n.trim().parse().unwrap_or(0)))
+                })
+                .collect();
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: u64 = pairs.iter().map(|(_, n)| n).sum();
+            let mut out = format!(
+                "🔍 {} matches in {} file{}:\n",
+                total,
+                pairs.len(),
+                if pairs.len() == 1 { "" } else { "s" }
+            );
+            for (file, n) in &pairs {
+                out.push_str(&format!("  {:>5}  {}\n", n, compact_path(file)));
+            }
+            out
+        } else {
+            // single-file bare count
+            let n: u64 = lines[0].trim().parse().unwrap_or(0);
+            format!("🔍 {} matches\n", n)
+        }
+    } else {
+        // --files-with-matches: one path per line
+        let mut out = format!(
+            "🔍 {} file{}:\n",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" }
+        );
+        for line in &lines {
+            out.push_str(&format!("  {}\n", compact_path(line)));
+        }
+        out
+    }
+}
+
+/// Translate extra_args before passing to rg:
+/// - Strip rtk-read-only flags (--from, --to, --level) + consume their value; hint to stderr
+/// - Translate native Grep tool output_mode: -o files_with_matches → --files-with-matches,
+///   -o count → --count, -o content → skip (default behaviour)
+/// - Strip -r/--recursive (rg is recursive by default)
+/// - Translate --include=PAT / --include PAT → --glob=PAT
+// changed: extracted from inline loop in run() for testability + output_mode compat
+fn translate_extra_args(extra_args: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut iter = extra_args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "-r" || arg == "--recursive" {
+            continue; // rg is recursive by default
+        }
+        if arg == "--from" || arg == "--to" || arg == "--level" {
+            // consume the paired value if it does not start with "-"
+            if iter.peek().map(|a| !a.starts_with('-')).unwrap_or(false) {
+                iter.next();
+            }
+            eprintln!("hint: '{}' is an rtk read flag — use: rtk read <file> --level none --from N --to M", arg);
+            continue;
+        }
+        if arg == "-o" {
+            // Translate native Grep tool output_mode values; bare -o (only-matching) passes through
+            match iter.peek().map(|s| s.as_str()) {
+                Some("files_with_matches") => {
+                    iter.next();
+                    result.push("--files-with-matches".to_string()); // -o files_with_matches → rg -l
+                }
+                Some("count") => {
+                    iter.next();
+                    result.push("--count".to_string()); // -o count → rg --count
+                }
+                Some("content") => {
+                    iter.next(); // -o content = default behaviour, skip silently
+                }
+                _ => result.push(arg.clone()), // bare -o (rg only-matching), pass through
+            }
+            continue;
+        }
+        if let Some(glob) = arg.strip_prefix("--include=") {
+            result.push(format!("--glob={}", glob)); // fix: --include= → --glob=
+        } else if arg == "--include" {
+            if let Some(next) = iter.next() {
+                result.push("--glob".to_string()); // fix: --include PAT → --glob PAT
+                result.push(next.clone());
+            }
+        } else {
+            result.push(arg.clone());
+        }
+    }
+    result
 }
 
 /// If pattern has unescaped `(` or `)` (PCRE groups), suggest escaped literal version.
@@ -429,6 +551,140 @@ fn compact_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // changed: files_with_matches output mode detected in translated args
+    #[test]
+    fn test_is_passthrough_mode_files_with_matches() {
+        let args = vec!["-o".to_string(), "files_with_matches".to_string()];
+        let translated = translate_extra_args(&args);
+        assert!(is_passthrough_mode(&translated));
+    }
+
+    // changed: count output mode detected
+    #[test]
+    fn test_is_passthrough_mode_count() {
+        let args = vec!["-o".to_string(), "count".to_string()];
+        let translated = translate_extra_args(&args);
+        assert!(is_passthrough_mode(&translated));
+    }
+
+    // changed: normal content mode is NOT passthrough
+    #[test]
+    fn test_is_passthrough_mode_content_false() {
+        let args: Vec<String> = vec![];
+        assert!(!is_passthrough_mode(&translate_extra_args(&args)));
+    }
+
+    // changed: format_passthrough_output wraps file list with header (files_with_matches)
+    #[test]
+    fn test_format_passthrough_files_with_matches() {
+        let rg_out = "src/foo.rs\nsrc/bar.rs\n";
+        let result = format_passthrough_output(rg_out, "--files-with-matches");
+        assert!(result.contains("2 files"), "got: {result}");
+        assert!(result.contains("src/foo.rs"), "got: {result}");
+        assert!(result.contains("src/bar.rs"), "got: {result}");
+    }
+
+    // changed: format_passthrough_output count (dir search) shows total + sorted by count
+    #[test]
+    fn test_format_passthrough_count_dir() {
+        let rg_out = "src/foo.rs:12\nsrc/bar.rs:3\n";
+        let result = format_passthrough_output(rg_out, "--count");
+        assert!(result.contains("15 matches"), "total: {result}");
+        assert!(result.contains("2 files"), "files: {result}");
+        // foo.rs (12) should appear before bar.rs (3) after sort-by-count-desc
+        let pos_foo = result.find("foo.rs").unwrap_or(usize::MAX);
+        let pos_bar = result.find("bar.rs").unwrap_or(usize::MAX);
+        assert!(pos_foo < pos_bar, "sorted by count desc: {result}");
+    }
+
+    // changed: format_passthrough_output count (single file) shows bare match count
+    #[test]
+    fn test_format_passthrough_count_single_file() {
+        let rg_out = "34\n";
+        let result = format_passthrough_output(rg_out, "--count");
+        assert!(result.contains("34 matches"), "got: {result}");
+    }
+
+    // changed: format_passthrough_output empty rg output
+    #[test]
+    fn test_format_passthrough_empty() {
+        let result = format_passthrough_output("", "--files-with-matches");
+        assert!(result.contains('0'), "got: {result}");
+    }
+
+    // changed: -o files_with_matches → rg --files-with-matches (native Grep tool output_mode compat)
+    #[test]
+    fn test_translate_output_mode_files_with_matches() {
+        let args = vec!["-o".to_string(), "files_with_matches".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--files-with-matches"]);
+    }
+
+    // changed: -o count → rg --count
+    #[test]
+    fn test_translate_output_mode_count() {
+        let args = vec!["-o".to_string(), "count".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--count"]);
+    }
+
+    // changed: -o content is the default, skip silently
+    #[test]
+    fn test_translate_output_mode_content_skipped() {
+        let args = vec!["-o".to_string(), "content".to_string()];
+        assert!(translate_extra_args(&args).is_empty());
+    }
+
+    // changed: bare -o (rg only-matching) must pass through unchanged
+    #[test]
+    fn test_translate_bare_o_passes_through() {
+        let args = vec!["-o".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["-o"]);
+    }
+
+    // changed: --from/--to are rtk read flags — must be filtered with hint
+    #[test]
+    fn test_translate_rtk_read_flags_filtered() {
+        let args = vec![
+            "--from".to_string(),
+            "10".to_string(),
+            "--to".to_string(),
+            "50".to_string(),
+        ];
+        assert!(translate_extra_args(&args).is_empty());
+    }
+
+    // changed: --level is an rtk read flag, filtered; sibling rg flags kept
+    #[test]
+    fn test_translate_rtk_level_flag_filtered_keeps_others() {
+        let args = vec![
+            "--level".to_string(),
+            "none".to_string(),
+            "-C".to_string(),
+            "3".to_string(),
+        ];
+        assert_eq!(translate_extra_args(&args), vec!["-C", "3"]);
+    }
+
+    // changed: --include=PAT → --glob=PAT (existing behaviour, now via helper)
+    #[test]
+    fn test_translate_include_to_glob_inline() {
+        let args = vec!["--include=*.go".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--glob=*.go"]);
+    }
+
+    // changed: --include PAT (space-separated) → --glob PAT
+    #[test]
+    fn test_translate_include_paired_to_glob() {
+        let args = vec!["--include".to_string(), "*.rs".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--glob", "*.rs"]);
+    }
+
+    // changed: -r/--recursive stripped (rg is recursive by default)
+    #[test]
+    fn test_translate_recursive_stripped() {
+        let args = vec!["-r".to_string(), "-i".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["-i"]);
+    }
 
     #[test]
     fn test_clean_line() {
