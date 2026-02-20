@@ -734,6 +734,11 @@ fn filter_cargo_test(output: &str) -> String {
         .filter(|l| l.trim_start().starts_with("test result:"))
         .collect();
 
+    // Compilation failed: no test result lines → show actual error messages
+    if summary_lines.is_empty() && diag.errors > 0 {
+        return filter_cargo_build(output).replace("cargo build:", "cargo test:");
+    }
+
     let mut aggregated: Option<AggregatedTestResult> = None;
     let mut parsed_any = false;
     let mut parsed_all = true;
@@ -1225,6 +1230,30 @@ test result: MALFORMED LINE WITHOUT PROPER FORMAT
             "Expected fallback format, got: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_filter_cargo_test_compile_error_shows_details() {
+        // When cargo test fails to compile, show actual error[E...] messages
+        let output = r#"   Compiling rtk v0.5.0
+error[E0425]: cannot find value `mem_context` in this scope
+ --> src/init.rs:567:13
+  |
+567|     let x = mem_context;
+  |             ^^^^^^^^^^^ not found in this scope
+
+error[E0061]: this function takes 6 arguments but 7 were supplied
+ --> src/init.rs:123:5
+
+error: aborting due to 2 previous errors
+"#;
+        let result = filter_cargo_test(output);
+        // Must show error codes, not just a count
+        assert!(result.contains("E0425"), "Expected error code E0425, got: {}", result);
+        assert!(result.contains("E0061"), "Expected error code E0061, got: {}", result);
+        assert!(result.contains("cargo test:"), "Expected cargo test: prefix, got: {}", result);
+        // Must NOT reduce to just a count summary
+        assert!(!result.contains("cargo test: completed"), "Should not show 'completed' on compile failure");
     }
 
     #[test]

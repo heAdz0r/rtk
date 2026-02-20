@@ -23,8 +23,7 @@ use crate::config::MemConfig;
 
 // ── Noise filter ───────────────────────────────────────────────────────────────
 
-/// PRD R1: language-agnostic noise filter for candidate pool.
-/// Returns true if the file should be excluded from Tier A/B.
+/// C2: Delegates to unified noise_filter module (graph-first pipeline).
 fn is_noise(
     rel_path: &str,
     language: Option<&str>,
@@ -34,72 +33,25 @@ fn is_noise(
     query_tags: &[String],
     tier: u8,
 ) -> bool {
-    let path = rel_path.replace('\\', "/").to_ascii_lowercase();
-
-    // Always exclude .rtk-lock files (PRD R1)
-    if path.ends_with(".rtk-lock") {
-        return true;
-    }
-
-    // Exclude generated review/issue reports
-    if path.contains("/review/") || (path.contains("/issues/") && path.ends_with(".md")) {
-        return true;
-    }
-
-    let lines = line_count.unwrap_or(0);
-    let is_source = is_source_lang(language);
-    let is_doc = path.ends_with(".md") || path.ends_with(".rst") || path.ends_with(".txt");
-    let is_config = matches!(language, Some("toml" | "yaml" | "json"));
-    let is_test = path.contains("/test") || path.contains("_test") || path.contains("spec");
-
-    // Tiny marker files (line_count <= 5 without imports/symbols) — PRD R1
-    if is_source && !has_symbols && !has_imports && lines <= 5 {
-        return true;
-    }
-
-    // For Tier A/B: test/docs/config without task overlap excluded (PRD R1)
-    if tier <= 2 {
-        let overlap = path_overlap(rel_path, query_tags);
-        if (is_doc || is_config) && !has_symbols && overlap == 0 {
-            return true;
-        }
-        if is_test && overlap == 0 && !has_symbols {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn is_source_lang(language: Option<&str>) -> bool {
-    matches!(
+    super::noise_filter::is_noise_candidate(
+        rel_path,
         language,
-        Some(
-            "rust"
-                | "python"
-                | "javascript"
-                | "typescript"
-                | "go"
-                | "java"
-                | "c"
-                | "cpp"
-                | "csharp"
-                | "ruby"
-                | "swift"
-                | "kotlin"
-        )
+        line_count,
+        has_symbols,
+        has_imports,
+        query_tags,
+        Some(tier), // graph-first pipeline — tier-aware filtering
     )
 }
 
+/// C2: Delegates to unified noise_filter::is_source_like_language.
+fn is_source_lang(language: Option<&str>) -> bool {
+    super::noise_filter::is_source_like_language(language)
+}
+
+/// C2: Delegates to unified noise_filter::path_query_overlap_hits (HashSet tokenization).
 fn path_overlap(rel_path: &str, query_tags: &[String]) -> usize {
-    if query_tags.is_empty() {
-        return 0;
-    }
-    let lower = rel_path.to_ascii_lowercase();
-    query_tags
-        .iter()
-        .filter(|t| lower.contains(t.as_str()))
-        .count()
+    super::noise_filter::path_query_overlap_hits(rel_path, query_tags)
 }
 
 // ── Tier building ──────────────────────────────────────────────────────────────

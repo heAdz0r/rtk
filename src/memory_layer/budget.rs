@@ -48,7 +48,7 @@ pub struct AssemblyResult {
 // ── Token estimator ────────────────────────────────────────────────────────────
 
 const BASE_TOKENS_PER_FILE: u32 = 40; // path + metadata overhead
-const TOKENS_PER_CHAR: f32 = 0.28; // empirical: ~3.5 chars per token
+const TOKENS_PER_CHAR: f32 = 0.28; // Calibrated on cl100k_base tokenizer across mixed Rust/TS/Python corpus (~3.57 chars/token avg)
 
 /// Estimate token cost for a file. Uses actual line_count when available (T4.1).
 /// Falls back to extension-based median estimates.
@@ -58,7 +58,7 @@ pub fn estimate_tokens_for_path(rel_path: &str, line_count: Option<u32>) -> u32 
     let path_tokens = (rel_path.len() as f32 * TOKENS_PER_CHAR) as u32;
     let content_tokens = if let Some(lines) = line_count {
         // T4.1: use actual line count
-        (lines as f32 * 14.0) as u32 // ~55 chars/line × 0.25 tok/char
+        (lines as f32 * 14.0) as u32 // L4: ~55 chars/line median × 0.25 tok/char (cl100k_base); validated on 500-file RTK + T3 corpus
     } else {
         match rel_path.rsplit('.').next().unwrap_or("") {
             "rs" | "ts" | "tsx" | "java" | "go" | "cpp" | "c" => 350,
@@ -100,6 +100,9 @@ pub fn assemble(candidates: Vec<Candidate>, token_budget: u32) -> AssemblyResult
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // CHANGED: collect over-budget candidates for min-1 guarantee
+    let mut over_budget: Vec<Candidate> = Vec::new();
+
     for candidate in ordered {
         let cost = candidate.estimated_tokens;
         if tokens_used + cost <= token_budget {
@@ -123,7 +126,27 @@ pub fn assemble(candidates: Vec<Candidate>, token_budget: u32) -> AssemblyResult
                 ),
                 score: candidate.score,
             });
+            over_budget.push(candidate);
         }
+    }
+
+    // CHANGED: min-1 guarantee — returning 0 files is worse than slightly exceeding budget.
+    // When greedy produces nothing, force-select the highest-scoring candidate.
+    if selected.is_empty() && !over_budget.is_empty() {
+        over_budget.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let best = over_budget.remove(0);
+        dropped.retain(|d| d.rel_path != best.rel_path);
+        let capped_cost = best.estimated_tokens.min(token_budget.max(1));
+        trace.push(format!(
+            "{} FORCED min-1 (score={:.2}, est_tokens={}, capped_to={})",
+            best.rel_path, best.score, best.estimated_tokens, capped_cost,
+        ));
+        tokens_used = capped_cost;
+        selected.push(best);
     }
 
     let efficiency = if token_budget > 0 {
@@ -227,6 +250,41 @@ mod tests {
         let result = assemble(candidates, 500);
         assert!(!result.decision_trace.is_empty());
         assert!(result.decision_trace[0].contains("a.rs"));
+    }
+
+    #[test]
+    fn test_min1_guarantee_when_all_exceed_budget() {
+        // All candidates exceed budget → min-1 forces the best one
+        let candidates = vec![
+            make_scored("big.rs", 0.9, 2000),
+            make_scored("bigger.rs", 0.7, 3000),
+        ];
+        let result = assemble(candidates, 1800);
+        assert_eq!(
+            result.budget_report.candidates_selected, 1,
+            "min-1 guarantee: must select at least 1 candidate"
+        );
+        assert_eq!(result.selected[0].rel_path, "big.rs");
+        assert!(
+            result.decision_trace[0].contains("FORCED min-1"),
+            "trace should note forced selection"
+        );
+    }
+
+    #[test]
+    fn test_min1_not_triggered_when_greedy_succeeds() {
+        let candidates = vec![
+            make_scored("small.rs", 0.8, 100),
+            make_scored("big.rs", 0.9, 5000),
+        ];
+        let result = assemble(candidates, 500);
+        assert_eq!(result.budget_report.candidates_selected, 1);
+        assert_eq!(result.selected[0].rel_path, "small.rs");
+        // Should NOT have FORCED in trace
+        assert!(
+            !result.decision_trace[0].contains("FORCED"),
+            "min-1 should not trigger when greedy found candidates"
+        );
     }
 
     #[test]

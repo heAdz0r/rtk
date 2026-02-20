@@ -5,15 +5,15 @@
 # Set RTK_NOTIFY_NATIVE_EXPLORE=0 to suppress allow-mode notifications.
 
 if ! command -v jq >/dev/null 2>&1; then
-  cat <<'EOF'
+  cat <<'EOF_JSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Task/Explore policy requires jq and enforces hard deny when jq is unavailable. Use `rtk memory explore <path>`."
+    "permissionDecisionReason": "Task/Explore policy requires jq. Use Bash: rtk memory explore <path>."
   }
 }
-EOF
+EOF_JSON
   exit 0
 fi
 
@@ -33,24 +33,24 @@ if [ "${RTK_ALLOW_NATIVE_EXPLORE:-0}" = "1" ] || [ "${RTK_BLOCK_NATIVE_EXPLORE:-
     exit 0
   fi
 
-  cat <<'EOF'
+  cat <<'EOF_JSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "allow",
-    "permissionDecisionReason": "Native Task/Explore explicitly allowed by policy override. Preferred path is `rtk memory explore <path>` or `rtk memory serve` API."
+    "permissionDecisionReason": "Native Task/Explore allowed by override. Preferred: Bash rtk memory explore <path>."
   }
 }
-EOF
+EOF_JSON
   exit 0
 fi
 
-cat <<'EOF'
+cat <<'EOF_JSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Native Task/Explore is disabled by RTK policy (default hard deny). Use RTK memory layer instead: `rtk memory explore <path>` (CLI) or `rtk memory serve` + POST /v1/explore (API). Override: RTK_ALLOW_NATIVE_EXPLORE=1 (legacy: RTK_BLOCK_NATIVE_EXPLORE=0)."
+    "permissionDecisionReason": "Native Task/Explore blocked by RTK policy. Use Bash: rtk memory explore <path> (or rtk memory serve API). Override: RTK_ALLOW_NATIVE_EXPLORE=1 (RTK_BLOCK_NATIVE_EXPLORE=0)."
   }
 }
-EOF
+EOF_JSON

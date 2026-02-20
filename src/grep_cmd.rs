@@ -83,7 +83,12 @@ pub fn run(
 
     if stdout.trim().is_empty() {
         // Bug 2: show rg_pattern (post-translation), not original BRE
-        let msg = format!("🔍 0 for '{}'", rg_pattern);
+        let mut msg = format!("🔍 0 for '{}'", rg_pattern);
+        // changed: hint when unescaped ( ) are likely meant as literals (BRE vs PCRE confusion)
+        if let Some(hint) = hint_literal_parens(&rg_pattern) {
+            msg.push('\n');
+            msg.push_str(&hint);
+        }
         println!("{}", msg);
         timer.track(
             &format!("grep -rn '{}' {}", pattern, path),
@@ -158,6 +163,54 @@ pub fn run(
     );
 
     Ok(())
+}
+
+/// If pattern has unescaped `(` or `)` (PCRE groups), suggest escaped literal version.
+/// BRE users expect `(` to be literal; in PCRE it starts a capturing group.
+// changed: hint for BRE-vs-PCRE paren confusion (0-results false negative)
+fn hint_literal_parens(pattern: &str) -> Option<String> {
+    // Walk pattern, detect first unescaped ( or )
+    let mut chars = pattern.chars().peekable();
+    let mut found = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next(); // skip escaped char
+            continue;
+        }
+        if c == '(' || c == ')' {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return None;
+    }
+    let escaped = escape_literal_parens(pattern);
+    Some(format!(
+        "hint: '(' and ')' are PCRE groups in rg — use \\( \\) for literal parens
+  → try: rtk grep '{}'",
+        escaped
+    ))
+}
+
+/// Escape all unescaped `(` and `)` in a PCRE pattern so they match literally.
+fn escape_literal_parens(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            result.push(c);
+            if let Some(next) = chars.next() {
+                result.push(next);
+            }
+            continue;
+        }
+        if c == '(' || c == ')' {
+            result.push('\\');
+        }
+        result.push(c);
+    }
+    result
 }
 
 /// Map common file extension aliases to ripgrep type names.
@@ -235,7 +288,8 @@ fn bre_to_pcre_raw(pattern: &str) -> String {
 
 /// Escape bare `{` characters that are not part of valid PCRE quantifiers (`{n}`, `{n,}`, `{n,m}`).
 /// Called as a fallback when the translated pattern fails regex validation.
-fn escape_bare_braces(pattern: &str) -> String { // changed: fix bare { that break PCRE (e.g. "Plan {")
+fn escape_bare_braces(pattern: &str) -> String {
+    // changed: fix bare { that break PCRE (e.g. "Plan {")
     let chars: Vec<char> = pattern.chars().collect();
     let mut result = String::with_capacity(pattern.len() + 8);
     let mut i = 0;
@@ -490,7 +544,10 @@ mod tests {
     fn test_bre_to_pcre_escapes_bare_brace() {
         // "Plan {" — the { is NOT a quantifier, must become \{
         let r = bre_to_pcre("Plan {");
-        assert!(Regex::new(&r).is_ok(), "escaped pattern must be valid regex: {r}");
+        assert!(
+            Regex::new(&r).is_ok(),
+            "escaped pattern must be valid regex: {r}"
+        );
         assert!(r.contains("\\{"), "bare {{ should be escaped: {r}");
     }
 
@@ -499,7 +556,10 @@ mod tests {
         // "run_plan\|MemorySubcommand\|Plan {" — the real failure case
         let r = bre_to_pcre(r"run_plan\|MemorySubcommand\|Plan {");
         assert!(Regex::new(&r).is_ok(), "must compile: {r}");
-        assert!(r.contains("run_plan|MemorySubcommand|"), "alternation preserved: {r}");
+        assert!(
+            r.contains("run_plan|MemorySubcommand|"),
+            "alternation preserved: {r}"
+        );
     }
 
     #[test]
@@ -515,5 +575,42 @@ mod tests {
         // Struct literal syntax in code searches
         let r = bre_to_pcre("Foo { bar }");
         assert!(Regex::new(&r).is_ok(), "must compile: {r}");
+    }
+
+    // changed: hint_literal_parens detects unescaped ( ) that are PCRE groups
+    #[test]
+    fn test_hint_literal_parens_detects_unescaped() {
+        // Pattern like #\[cfg(test)\] has unescaped ( ) — should hint
+        let hint = hint_literal_parens(r"#\[cfg(test)\]");
+        assert!(hint.is_some(), "should detect unescaped parens");
+        let hint = hint.unwrap();
+        assert!(hint.contains("\\("), "should show escaped form");
+        assert!(
+            hint.contains(r"#\[cfg\(test\)\]"),
+            "escaped suggestion correct"
+        );
+    }
+
+    #[test]
+    fn test_hint_literal_parens_no_parens() {
+        // Pattern with only escaped parens or no parens — no hint
+        assert!(hint_literal_parens(r"#\[cfg\(test\)\]").is_none());
+        assert!(hint_literal_parens(r"\d+\.\w+").is_none());
+        assert!(hint_literal_parens("fn foo").is_none());
+    }
+
+    #[test]
+    fn test_escape_literal_parens_basic() {
+        assert_eq!(escape_literal_parens(r"cfg(test)"), r"cfg\(test\)");
+        assert_eq!(
+            escape_literal_parens(r"#\[cfg(test)\]"),
+            r"#\[cfg\(test\)\]"
+        );
+    }
+
+    #[test]
+    fn test_escape_literal_parens_already_escaped() {
+        // Already-escaped \( must not be double-escaped
+        assert_eq!(escape_literal_parens(r"\(test\)"), r"\(test\)");
     }
 }

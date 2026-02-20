@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::cache::{epoch_secs, open_mem_db, with_retry};
+use super::cache::{epoch_secs, with_db, with_retry};
 use super::intent::TaskIntent;
 
 // ── Public types ───────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ pub struct EpisodeEvent {
 // ── Episode lifecycle ──────────────────────────────────────────────────────────
 
 /// Start a new episode. Returns the `session_id` (16-char hex).
-#[allow(dead_code)] // changed: memory layer API, wired up via mod.rs in future
+#[allow(dead_code)] // L1: Episode lifecycle API — will be wired into run_explore/run_plan for session tracking (PRD §8.1 planned integration)
 pub fn start_episode(
     project_id: &str,
     task_text: &str,
@@ -81,75 +81,81 @@ fn start_episode_inner(
     query_type: &str,
     token_budget: Option<i64>,
 ) -> Result<String> {
-    let conn = open_mem_db()?;
     let now = epoch_secs(std::time::SystemTime::now()) as i64;
     let session_id = {
         let raw = format!("{}|{}|{}", project_id, task_text, now);
         format!("{:016x}", xxhash_rust::xxh3::xxh3_64(raw.as_bytes()))
     };
-    conn.execute(
-        "INSERT OR IGNORE INTO episodes
-             (session_id, project_id, task_text, task_fingerprint, query_type, started_at, token_budget)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            session_id,
-            project_id,
-            task_text,
-            intent.task_fingerprint,
-            query_type,
-            now,
-            token_budget,
-        ],
-    )
-    .context("Failed to insert episode")?;
-    Ok(session_id)
+    with_db(|conn| {
+        // C1: pooled connection
+        conn.execute(
+            "INSERT OR IGNORE INTO episodes
+                 (session_id, project_id, task_text, task_fingerprint, query_type, started_at, token_budget)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id,
+                project_id,
+                task_text,
+                intent.task_fingerprint,
+                query_type,
+                now,
+                token_budget,
+            ],
+        )
+        .context("Failed to insert episode")?;
+        Ok(session_id.clone())
+    })
 }
 
 /// Record a single event within a session. Also updates `task_file_affinity` for file events.
-#[allow(dead_code)] // changed: memory layer API, wired up via mod.rs in future
+#[allow(dead_code)] // L1: Episode event API — will be wired into run_explore/run_plan for file-access tracking and affinity scoring (PRD §8.1 planned integration)
 pub fn record_episode_event(event: &EpisodeEvent) -> Result<()> {
     with_retry(3, || record_episode_event_inner(event))
 }
 
 fn record_episode_event_inner(event: &EpisodeEvent) -> Result<()> {
-    let conn = open_mem_db()?;
-    let now = epoch_secs(std::time::SystemTime::now()) as i64;
-    conn.execute(
-        "INSERT INTO episode_events
-             (session_id, event_type, file_path, symbol, payload_json, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            event.session_id,
-            event.event_type.to_string(),
-            event.file_path,
-            event.symbol,
-            event.payload_json,
-            now,
-        ],
-    )
-    .context("Failed to insert episode_event")?;
+    with_db(|conn| {
+        // C1: pooled connection
+        let now = epoch_secs(std::time::SystemTime::now()) as i64;
+        conn.execute(
+            "INSERT INTO episode_events
+                 (session_id, event_type, file_path, symbol, payload_json, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.session_id,
+                event.event_type.to_string(),
+                event.file_path,
+                event.symbol,
+                event.payload_json,
+                now,
+            ],
+        )
+        .context("Failed to insert episode_event")?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Purge episodes older than `retention_days`. Returns count of deleted episodes.
 pub fn purge_episodes(retention_days: i64) -> Result<usize> {
-    let conn = open_mem_db()?;
-    let cutoff = epoch_secs(std::time::SystemTime::now()) as i64 - retention_days * 86_400;
-    let deleted = conn
-        .execute(
-            "DELETE FROM episodes WHERE started_at < ?1",
-            params![cutoff],
+    with_db(|conn| {
+        // C1: pooled connection
+        let cutoff = epoch_secs(std::time::SystemTime::now()) as i64 - retention_days * 86_400;
+        let deleted = conn
+            .execute(
+                "DELETE FROM episodes WHERE started_at < ?1",
+                params![cutoff],
+            )
+            .context("Failed to purge old episodes")?;
+        // Cascade-delete orphaned events (no FK in SQLite by default)
+        conn.execute(
+            "DELETE FROM episode_events
+             WHERE session_id NOT IN (SELECT session_id FROM episodes)",
+            [],
         )
-        .context("Failed to purge old episodes")?;
-    // Cascade-delete orphaned events (no FK in SQLite by default)
-    conn.execute(
-        "DELETE FROM episode_events
-         WHERE session_id NOT IN (SELECT session_id FROM episodes)",
-        [],
-    )
-    .context("Failed to purge orphaned episode_events")?;
-    Ok(deleted)
+        .context("Failed to purge orphaned episode_events")?;
+        Ok(deleted)
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

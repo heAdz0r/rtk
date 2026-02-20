@@ -1,6 +1,6 @@
 [package]
 name = "rtk"
-version = "0.21.1-fork.14"
+version = "0.21.1-fork.18"
 edition = "2021"
 authors = ["Patrick Szymkowiak"]
 description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
@@ -34,6 +34,7 @@ memchr = "2"
 rayon = "1" # parallel iterators for memory layer hot paths
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 notify = "6" # E3.1: event-driven FS watcher (kqueue/inotify/ReadDirectoryChangesW)
+aho-corasick = "1" # M2: multi-pattern string matching for call graph O(F*L+S)
 
 [dev-dependencies]
 

@@ -72,6 +72,40 @@ pub(super) fn open_mem_db() -> Result<Connection> {
     Ok(conn)
 }
 
+// C1: Thread-local connection pool — avoids repeated open/PRAGMA/schema-init per call.
+// Invalidates when mem_db_path() changes (test isolation via THREAD_DB_PATH still works).
+thread_local! {
+    static CACHED_CONN: std::cell::RefCell<Option<(PathBuf, Connection)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// C1: Execute a closure with a pooled database connection.
+/// Reuses the thread-local connection if the DB path hasn't changed;
+/// otherwise opens a fresh connection (and caches it for next call).
+pub(super) fn with_db<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T>,
+{
+    CACHED_CONN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let current_path = mem_db_path();
+
+        // Invalidate cached connection if path changed (test isolation)
+        let needs_new = match slot.as_ref() {
+            Some((cached_path, _)) => *cached_path != current_path,
+            None => true,
+        };
+
+        if needs_new {
+            let conn = open_mem_db()?;
+            *slot = Some((current_path, conn));
+        }
+
+        let (_, conn) = slot.as_ref().unwrap();
+        f(conn)
+    })
+}
+
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -121,6 +155,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
              ON events(project_id, event_type);
          CREATE INDEX IF NOT EXISTS idx_artifacts_version
              ON artifacts(project_id, artifact_version);
+         CREATE INDEX IF NOT EXISTS idx_edges_to_id
+             ON artifact_edges(to_id); -- L3: index for cascade invalidation lookups
          CREATE TABLE IF NOT EXISTS episodes (
             session_id       TEXT    PRIMARY KEY,
             project_id       TEXT    NOT NULL,
@@ -180,35 +216,36 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
 pub(super) fn load_artifact(project_root: &Path) -> Result<Option<ProjectArtifact>> {
     let project_id = project_cache_key(project_root);
-    let conn = open_mem_db()?;
+    with_db(|conn| {
+        // C1: pooled connection
+        let row: Option<(String, u32)> = conn
+            .query_row(
+                "SELECT content_json, artifact_version FROM artifacts WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("Failed to query artifact from mem.db")?;
 
-    let row: Option<(String, u32)> = conn
-        .query_row(
-            "SELECT content_json, artifact_version FROM artifacts WHERE project_id = ?1",
-            params![project_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .context("Failed to query artifact from mem.db")?;
+        let Some((content_json, version)) = row else {
+            return Ok(None);
+        };
 
-    let Some((content_json, version)) = row else {
-        return Ok(None);
-    };
+        // Bump last_accessed_at on every successful load
+        let now = epoch_secs(SystemTime::now()) as i64;
+        let _ = conn.execute(
+            "UPDATE projects SET last_accessed_at = ?1 WHERE project_id = ?2",
+            params![now, project_id],
+        );
 
-    // Bump last_accessed_at on every successful load
-    let now = epoch_secs(SystemTime::now()) as i64;
-    let _ = conn.execute(
-        "UPDATE projects SET last_accessed_at = ?1 WHERE project_id = ?2",
-        params![now, project_id],
-    );
+        if version != ARTIFACT_VERSION {
+            return Ok(None); // stale schema — caller will trigger full rebuild
+        }
 
-    if version != ARTIFACT_VERSION {
-        return Ok(None); // stale schema — caller will trigger full rebuild
-    }
-
-    let artifact: ProjectArtifact =
-        serde_json::from_str(&content_json).context("Failed to parse artifact JSON from mem.db")?;
-    Ok(Some(artifact))
+        let artifact: ProjectArtifact = serde_json::from_str(&content_json)
+            .context("Failed to parse artifact JSON from mem.db")?;
+        Ok(Some(artifact))
+    })
 }
 
 pub(super) fn store_artifact(artifact: &ProjectArtifact) -> Result<()> {
@@ -217,29 +254,31 @@ pub(super) fn store_artifact(artifact: &ProjectArtifact) -> Result<()> {
 }
 
 fn store_artifact_inner(artifact: &ProjectArtifact) -> Result<()> {
-    let conn = open_mem_db()?;
-    let now = epoch_secs(SystemTime::now()) as i64;
     let content_json =
         serde_json::to_string(artifact).context("Failed to serialise artifact to JSON")?;
+    with_db(|conn| {
+        // C1: pooled connection
+        let now = epoch_secs(SystemTime::now()) as i64;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO projects
-             (project_id, root_path, created_at, last_accessed_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![artifact.project_id, artifact.project_root, now, now],
-    )
-    .context("Failed to upsert project in mem.db")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO projects
+                 (project_id, root_path, created_at, last_accessed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![artifact.project_id, artifact.project_root, now, now],
+        )
+        .context("Failed to upsert project in mem.db")?;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO artifacts
-             (project_id, artifact_version, content_json, updated_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![artifact.project_id, ARTIFACT_VERSION, content_json, now],
-    )
-    .context("Failed to upsert artifact in mem.db")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO artifacts
+                 (project_id, artifact_version, content_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![artifact.project_id, ARTIFACT_VERSION, content_json, now],
+        )
+        .context("Failed to upsert artifact in mem.db")?;
 
-    prune_cache(&conn, super::mem_config().cache_max_projects)?;
-    Ok(())
+        prune_cache(conn, super::mem_config().cache_max_projects)?;
+        Ok(())
+    })
 }
 
 /// Delete cached artifact for `project_root`. Returns true if a row was removed.
@@ -251,22 +290,23 @@ pub(super) fn delete_artifact(project_root: &Path) -> Result<bool> {
 
 fn delete_artifact_inner(project_root: &Path) -> Result<bool> {
     let project_id = project_cache_key(project_root);
-    let conn = open_mem_db()?;
+    with_db(|conn| {
+        // C1: pooled connection
+        let deleted = conn
+            .execute(
+                "DELETE FROM artifacts WHERE project_id = ?1",
+                params![project_id],
+            )
+            .context("Failed to delete artifact from mem.db")?;
 
-    let deleted = conn
-        .execute(
-            "DELETE FROM artifacts WHERE project_id = ?1",
+        conn.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
             params![project_id],
         )
-        .context("Failed to delete artifact from mem.db")?;
+        .context("Failed to delete project from mem.db")?;
 
-    conn.execute(
-        "DELETE FROM projects WHERE project_id = ?1",
-        params![project_id],
-    )
-    .context("Failed to delete project from mem.db")?;
-
-    Ok(deleted > 0)
+        Ok(deleted > 0)
+    })
 }
 
 /// P1: Retry wrapper for SQLite operations that may fail with SQLITE_BUSY
@@ -323,33 +363,37 @@ fn prune_cache(conn: &Connection, max_projects: usize) -> Result<()> {
 
 /// Record a cache event (hit, miss, stale_rebuild, dirty_rebuild, refreshed) for analytics.
 pub(super) fn record_cache_event(project_id: &str, event: &str) -> Result<()> {
-    let conn = open_mem_db()?;
-    let now = epoch_secs(SystemTime::now()) as i64;
-    conn.execute(
-        "INSERT INTO cache_stats (project_id, event, timestamp) VALUES (?1, ?2, ?3)",
-        params![project_id, event, now],
-    )
-    .context("Failed to record cache_stats event")?;
-    Ok(())
+    with_db(|conn| {
+        // C1: pooled connection
+        let now = epoch_secs(SystemTime::now()) as i64;
+        conn.execute(
+            "INSERT INTO cache_stats (project_id, event, timestamp) VALUES (?1, ?2, ?3)",
+            params![project_id, event, now],
+        )
+        .context("Failed to record cache_stats event")?;
+        Ok(())
+    })
 }
 
 /// Query aggregate cache_stats for a project. Returns Vec<(event, count)>.
 pub(super) fn query_cache_stats(project_id: &str) -> Result<Vec<(String, i64)>> {
-    let conn = open_mem_db()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT event, COUNT(*) as cnt FROM cache_stats
+    with_db(|conn| {
+        // C1: pooled connection
+        let mut stmt = conn
+            .prepare(
+                "SELECT event, COUNT(*) as cnt FROM cache_stats
              WHERE project_id = ?1 GROUP BY event ORDER BY cnt DESC",
-        )
-        .context("Failed to prepare cache_stats query")?;
-    let rows = stmt
-        .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .context("Failed to query cache_stats")?;
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row.context("Failed to read cache_stats row")?);
-    }
-    Ok(result)
+            )
+            .context("Failed to prepare cache_stats query")?;
+        let rows = stmt
+            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("Failed to query cache_stats")?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("Failed to read cache_stats row")?);
+        }
+        Ok(result)
+    }) // C1: end with_db
 }
 
 // ── E3.2: artifact_edges for cascade invalidation ───────────────────────────
@@ -369,55 +413,57 @@ pub struct MemoryGainStats {
 
 /// Query memory gain stats for a project: event count + artifact byte sizes. // T3
 pub fn get_memory_gain_stats(project_id: &str) -> Result<Option<MemoryGainStats>> {
-    let conn = open_mem_db()?;
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM cache_stats WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    with_db(|conn| {
+        // C1: pooled connection
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cache_stats WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
-    if count == 0 {
-        return Ok(None);
-    }
+        if count == 0 {
+            return Ok(None);
+        }
 
-    // Load artifact for byte sizes
-    let artifact_json: Option<String> = conn
-        .query_row(
-            "SELECT content_json FROM artifacts WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("Failed to query artifact")?;
+        // Load artifact for byte sizes
+        let artifact_json: Option<String> = conn
+            .query_row(
+                "SELECT content_json FROM artifacts WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query artifact")?;
 
-    // Use artifact total_bytes as raw; estimate compact context via file count heuristic
-    let (raw_bytes, context_bytes): (u64, u64) = if let Some(json) = artifact_json {
-        if let Ok(artifact) = serde_json::from_str::<super::ProjectArtifact>(&json) {
-            let raw = artifact.total_bytes;
-            // Compact context: roughly 30 bytes per file entry (path + summary line)
-            let compact: u64 = artifact.file_count as u64 * 80;
-            (raw, compact.min(raw))
+        // Use artifact total_bytes as raw; estimate compact context via file count heuristic
+        let (raw_bytes, context_bytes): (u64, u64) = if let Some(json) = artifact_json {
+            if let Ok(artifact) = serde_json::from_str::<super::ProjectArtifact>(&json) {
+                let raw = artifact.total_bytes;
+                // Compact context: roughly 30 bytes per file entry (path + summary line)
+                let compact: u64 = artifact.file_count as u64 * 80;
+                (raw, compact.min(raw))
+            } else {
+                (0u64, 0u64)
+            }
         } else {
             (0u64, 0u64)
-        }
-    } else {
-        (0u64, 0u64)
-    };
+        };
 
-    let savings_pct = if raw_bytes > 0 {
-        raw_bytes.saturating_sub(context_bytes) as f64 / raw_bytes as f64 * 100.0
-    } else {
-        0.0
-    };
+        let savings_pct = if raw_bytes > 0 {
+            raw_bytes.saturating_sub(context_bytes) as f64 / raw_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
 
-    Ok(Some(MemoryGainStats {
-        hook_fires: count as u64,
-        raw_bytes,
-        context_bytes,
-        savings_pct,
-    }))
+        Ok(Some(MemoryGainStats {
+            hook_fires: count as u64,
+            raw_bytes,
+            context_bytes,
+            savings_pct,
+        }))
+    })
 }
 
 /// Store import edges for a project: from_id = importing file, to_id = imported module.
@@ -426,56 +472,60 @@ pub(super) fn store_artifact_edges(
     project_id: &str,
     edges: &[(String, String)], // (from_file, to_module)
 ) -> Result<()> {
-    let conn = open_mem_db()?;
-    // Clear old edges for this project
-    conn.execute(
-        "DELETE FROM artifact_edges WHERE from_id LIKE ?1",
-        params![format!("{}:%", project_id)],
-    )
-    .context("Failed to clear old artifact_edges")?;
-
-    // Insert new edges (prefix from_id with project_id for namespacing)
-    let mut stmt = conn
-        .prepare(
-            "INSERT OR IGNORE INTO artifact_edges (from_id, to_id, edge_type)
-             VALUES (?1, ?2, 'imports')",
+    with_db(|conn| {
+        // C1: pooled connection
+        // Clear old edges for this project
+        conn.execute(
+            "DELETE FROM artifact_edges WHERE from_id LIKE ?1",
+            params![format!("{}:%", project_id)],
         )
-        .context("Failed to prepare artifact_edges insert")?;
+        .context("Failed to clear old artifact_edges")?;
 
-    for (from_file, to_module) in edges {
-        let from_key = format!("{}:{}", project_id, from_file);
-        let _ = stmt.execute(params![from_key, to_module]);
-    }
-    Ok(())
+        // Insert new edges (prefix from_id with project_id for namespacing)
+        let mut stmt = conn
+            .prepare(
+                "INSERT OR IGNORE INTO artifact_edges (from_id, to_id, edge_type)
+                 VALUES (?1, ?2, 'imports')",
+            )
+            .context("Failed to prepare artifact_edges insert")?;
+
+        for (from_file, to_module) in edges {
+            let from_key = format!("{}:{}", project_id, from_file);
+            let _ = stmt.execute(params![from_key, to_module]);
+        }
+        Ok(())
+    })
 }
 
 /// Find files that import a given module (for cascade invalidation).
 /// Returns the rel_path portion of from_id entries that import `module_name`.
 pub(super) fn get_dependents(project_id: &str, module_name: &str) -> Result<Vec<String>> {
-    let conn = open_mem_db()?;
     let prefix = format!("{}:", project_id);
-    let mut stmt = conn
-        .prepare(
-            "SELECT from_id FROM artifact_edges
-             WHERE to_id = ?1 AND from_id LIKE ?2",
-        )
-        .context("Failed to prepare dependents query")?;
+    with_db(|conn| {
+        // C1: pooled connection
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_id FROM artifact_edges
+                 WHERE to_id = ?1 AND from_id LIKE ?2",
+            )
+            .context("Failed to prepare dependents query")?;
 
-    let rows = stmt
-        .query_map(params![module_name, format!("{}%", prefix)], |row| {
-            row.get::<_, String>(0)
-        })
-        .context("Failed to query dependents")?;
+        let rows = stmt
+            .query_map(params![module_name, format!("{}%", prefix)], |row| {
+                row.get::<_, String>(0)
+            })
+            .context("Failed to query dependents")?;
 
-    let mut result = Vec::new();
-    for row in rows {
-        let from_id = row.context("Failed to read dependent row")?;
-        // Strip project_id: prefix to get rel_path
-        if let Some(rel) = from_id.strip_prefix(&prefix) {
-            result.push(rel.to_string());
+        let mut result = Vec::new();
+        for row in rows {
+            let from_id = row.context("Failed to read dependent row")?;
+            // Strip project_id: prefix to get rel_path
+            if let Some(rel) = from_id.strip_prefix(&prefix) {
+                result.push(rel.to_string());
+            }
         }
-    }
-    Ok(result)
+        Ok(result)
+    })
 }
 
 // ── Staleness check ──────────────────────────────────────────────────────────
@@ -519,15 +569,17 @@ pub(super) fn record_event(
     event_type: &str,
     duration_ms: Option<u64>,
 ) -> Result<()> {
-    let conn = open_mem_db()?;
-    let now = epoch_secs(SystemTime::now()) as i64;
-    conn.execute(
-        "INSERT INTO events (project_id, event_type, timestamp, duration_ms)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![project_id, event_type, now, duration_ms.map(|d| d as i64)],
-    )
-    .context("Failed to record event")?;
-    Ok(())
+    with_db(|conn| {
+        // C1: pooled connection
+        let now = epoch_secs(SystemTime::now()) as i64;
+        conn.execute(
+            "INSERT INTO events (project_id, event_type, timestamp, duration_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, event_type, now, duration_ms.map(|d| d as i64)],
+        )
+        .context("Failed to record event")?;
+        Ok(())
+    })
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────

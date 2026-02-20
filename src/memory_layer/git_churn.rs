@@ -119,6 +119,7 @@ fn build_freq_map(repo_root: &Path) -> Result<HashMap<String, u32>> {
             "--all",
             "--format=", // empty commit header → only file names
             "--name-only",
+            "--since=6 months ago", // M3: bound git log scan for large repos
         ])
         .stdout(Stdio::piped())
         .spawn()

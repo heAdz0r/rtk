@@ -40,6 +40,20 @@ pub fn expand_at_ref(val: &str) -> Result<std::borrow::Cow<'_, str>> {
     Ok(std::borrow::Cow::Owned(file_content))
 }
 
+/// Expand `@filename` references in BatchOp field values. // changed: @file support in batch JSON fields
+/// Like expand_at_ref but disallows @- (stdin may already be consumed by --plan @-).
+fn expand_batch_field(val: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let Some(path) = val.strip_prefix('@') else {
+        return Ok(std::borrow::Cow::Borrowed(val));
+    };
+    if path == "-" {
+        anyhow::bail!("@- is not supported in batch op fields; use @/path/to/file instead");
+    }
+    let file_content = fs::read_to_string(path)
+        .with_context(|| format!("@file ref: failed to read {:?}", path))?;
+    Ok(std::borrow::Cow::Owned(file_content))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ConfigFormat {
     Auto,
@@ -856,7 +870,8 @@ pub fn run_batch(
             Ok(count) => {
                 applied += count;
                 if params.verbose > 0 && params.output == OutputMode::Concise {
-                    println!("[{}/{}] OK {} {}", i + 1, total, op.op, op.file.display()); // changed: stdout to avoid stderr/stdout split duplication
+                    println!("[{}/{}] OK {} {}", i + 1, total, op.op, op.file.display());
+                    // changed: stdout to avoid stderr/stdout split duplication
                 }
             }
             Err(e) => {
@@ -998,14 +1013,18 @@ enum BatchApplyResult {
 fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyResult> {
     match op.op.as_str() {
         "replace" => {
-            let from = op
+            let from_raw = op
                 .from
                 .as_deref()
                 .with_context(|| "batch replace: missing 'from' field")?;
-            let to = op
+            let to_raw = op
                 .to
                 .as_deref()
                 .with_context(|| "batch replace: missing 'to' field")?;
+            let from_cow = expand_batch_field(from_raw)?; // changed: expand @file refs in batch fields
+            let to_cow = expand_batch_field(to_raw)?; // changed: expand @file refs in batch fields
+            let from = from_cow.as_ref();
+            let to = to_cow.as_ref();
             if from.is_empty() {
                 bail!("batch replace: 'from' must be non-empty");
             }
@@ -1031,14 +1050,18 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
             Ok(BatchApplyResult::Applied { updated, count })
         }
         "patch" => {
-            let old = op
+            let old_raw = op
                 .old
                 .as_deref()
                 .with_context(|| "batch patch: missing 'old' field")?;
-            let new = op
+            let new_raw = op
                 .new
                 .as_deref()
                 .with_context(|| "batch patch: missing 'new' field")?;
+            let old_cow = expand_batch_field(old_raw)?; // changed: expand @file refs in batch fields
+            let new_cow = expand_batch_field(new_raw)?; // changed: expand @file refs in batch fields
+            let old = old_cow.as_ref();
+            let new = new_cow.as_ref();
             if old.is_empty() {
                 // changed: allow empty 'old' when file is also empty (new file creation via patch)
                 if content.is_empty() {
@@ -1121,7 +1144,7 @@ fn apply_batch_op_in_memory(op: &BatchOp, content: &str) -> Result<BatchApplyRes
         "create" => {
             // Accept 'content' or 'new' field (new is more intuitive when converting from patch ops)
             let content_str = op.content.as_deref().or(op.new.as_deref()).unwrap_or(""); // changed: 'new' as alias
-            // Idempotent: file already has exactly the desired content
+                                                                                         // Idempotent: file already has exactly the desired content
             if content == content_str {
                 return Ok(BatchApplyResult::Noop);
             }

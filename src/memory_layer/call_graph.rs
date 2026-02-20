@@ -8,6 +8,7 @@
 //! Pure-data: build_from_content() enables unit testing without disk I/O.
 //! Disk-IO path: build() reads file content via std::fs.
 
+use aho_corasick::AhoCorasick; // M2: multi-pattern matching
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -38,24 +39,61 @@ impl CallGraph {
     }
 
     /// Build from pre-loaded content map (path → source text).
-    /// Used in unit tests and for performance (avoid re-reading already loaded files).
+    /// M2: Uses Aho-Corasick automaton for O(F*L + S) instead of O(F*S) scanning.
     pub fn build_from_content(
         all_symbols: &[(String, Vec<String>)],
         content_map: &HashMap<String, String>,
     ) -> Self {
-        // Collect all unique symbol names across all files
-        let all_known: HashSet<&str> = all_symbols
+        // Collect all unique symbol names (>= 3 chars) across all files
+        let all_known: Vec<String> = all_symbols
             .iter()
-            .flat_map(|(_, syms)| syms.iter().map(|s| s.as_str()))
+            .flat_map(|(_, syms)| syms.iter().cloned())
+            .filter(|s| s.len() >= 3)
+            .collect::<HashSet<String>>()
+            .into_iter()
             .collect();
+
+        if all_known.is_empty() || content_map.is_empty() {
+            return Self {
+                caller_index: HashMap::new(),
+            };
+        }
+
+        // M2: Build AC patterns: "symbol(" and "symbol::" for each known symbol
+        let mut patterns: Vec<String> = Vec::with_capacity(all_known.len() * 2);
+        let mut pattern_to_symbol: Vec<usize> = Vec::with_capacity(all_known.len() * 2);
+        for (idx, sym) in all_known.iter().enumerate() {
+            patterns.push(format!("{sym}("));
+            pattern_to_symbol.push(idx);
+            patterns.push(format!("{sym}::"));
+            pattern_to_symbol.push(idx);
+        }
+
+        let ac = match AhoCorasick::new(&patterns) {
+            Ok(ac) => ac,
+            Err(_) => {
+                // Fallback: empty graph if AC build fails (shouldn't happen)
+                return Self {
+                    caller_index: HashMap::new(),
+                };
+            }
+        };
 
         let mut caller_index: HashMap<String, Vec<String>> = HashMap::new();
 
         for (caller_path, content) in content_map {
-            for symbol in &all_known {
-                if has_call_site(content, symbol) {
+            // M2: Single-pass scan — collect which symbols have matches in this file
+            let mut matched_symbols: HashSet<usize> = HashSet::new();
+            for mat in ac.find_iter(content) {
+                matched_symbols.insert(pattern_to_symbol[mat.pattern().as_usize()]);
+            }
+
+            // Only run is_only_definition check for matched (file, symbol) pairs
+            for sym_idx in matched_symbols {
+                let symbol = &all_known[sym_idx];
+                if !is_only_definition(content, symbol) {
                     caller_index
-                        .entry(symbol.to_string())
+                        .entry(symbol.clone())
                         .or_default()
                         .push(caller_path.clone());
                 }

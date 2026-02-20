@@ -52,8 +52,9 @@ struct PlanRequest {
     /// Max tokens to include. 0 = use default (12000).
     #[serde(default)]
     token_budget: u32,
-    /// Output format: "json" or "text"
+    /// Output format: reserved for future use (HTTP API always returns JSON; text format is CLI-only)
     #[serde(default = "default_format")]
+    #[allow(dead_code)]
     format: String,
     /// PRD: force legacy pipeline (default: false)
     #[serde(default)]
@@ -307,9 +308,13 @@ fn handle_plan_context(body: &[u8]) -> Result<String> {
     let req: PlanRequest =
         serde_json::from_slice(body).context("Invalid JSON in plan-context request")?;
     let project = std::path::PathBuf::from(&req.project_root);
-    // Trace fields (pipeline_version, semantic_backend_used, etc.) are always present in graph-first response
-    let result =
+    let mut result =
         super::plan_context_graph_first(&project, &req.task, req.token_budget, req.legacy)?;
+    // CHANGED: when trace=false (default), strip verbose decision_trace to save tokens
+    if !req.trace {
+        result.decision_trace.clear();
+    }
+    // format field is accepted but HTTP API always returns JSON (text format is CLI-only)
     serde_json::to_string(&result).context("Failed to serialize plan-context response")
 }
 
