@@ -191,6 +191,11 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         &filtered,
     );
 
+    // upstream sync: propagate linter exit code (#207)
+    if !output.status.success() {
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
     Ok(())
 }
 
