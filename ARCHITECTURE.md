@@ -176,7 +176,7 @@ Database: ~/.local/share/rtk/history.db
 
 ## Module Organization
 
-### Complete Module Map (67 Modules)
+### Complete Module Map (68 Modules)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -276,7 +276,7 @@ SHARED            utils.rs          Helpers                N/A        ✓
                   rgai_arg_tests    (test-only)            N/A        ✓
 ```
 
-**Total: 67 modules** (auto-synced from src/main.rs)
+**Total: 68 modules** (auto-synced from src/main.rs)
 
 ### Module Count Breakdown
 
