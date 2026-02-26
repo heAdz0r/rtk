@@ -1,5 +1,5 @@
-use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
+use std::sync::OnceLock; // fix #12: OnceLock replaces lazy_static
 
 /// A rule mapping a shell command pattern to its RTK equivalent.
 struct RtkRule {
@@ -54,13 +54,13 @@ const PATTERNS: &[&str] = &[
     r"^(?:[^[:space:]]+/)?cargo\s+(?:\+[^[:space:]]+\s+)?(build|test|clippy|check|fmt|install|nextest|run)(\s|$)",
     r"^(?:[^[:space:]]+/)?(grepai|rgai)\s+search(\s|$)",
     r"^(?:[^[:space:]]+/)?(rgai)\s+",
-    r"^go\s+(test|build|vet)(\s|$)",
+    r"^go\s+(test|build|vet|run)(\s|$)",
     r"^pnpm\s+(list|ls|outdated|install)",
     r"^npm\s+(run|exec)",
     r"^bun\s+([^\s]+)(\s|$)",
     r"^npx\s+",
-    r"^(cat|head)\s+",
-    r"^(rg|grep)\s+",
+    r"^(cat|head|tail)\s+",
+    r"^(?:[^[:space:]]+/)?(rg|grep)\s+",
     r"^ls(\s|$)",
     r"^tree(\s|$)",
     r"^find\s+",
@@ -80,6 +80,9 @@ const PATTERNS: &[&str] = &[
     r"^curl\s+",
     r"^wget\s+",
     r"^ssh\s+", // added: ssh command detection for discover
+    r"^lsof(\s|$)",
+    r"^ps\s+",
+    r"^diff\s+",
 ];
 
 const RULES: &[RtkRule] = &[
@@ -155,7 +158,7 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk go",
         category: "Build",
         savings_pct: 80.0,
-        subcmd_savings: &[("test", 90.0)],
+        subcmd_savings: &[("test", 90.0), ("run", 70.0)],
         subcmd_status: &[],
     },
     RtkRule {
@@ -352,6 +355,27 @@ const RULES: &[RtkRule] = &[
         subcmd_savings: &[],
         subcmd_status: &[],
     },
+    RtkRule {
+        rtk_cmd: "rtk lsof",
+        category: "Network",
+        savings_pct: 90.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk ps",
+        category: "Infra",
+        savings_pct: 80.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk diff",
+        category: "Files",
+        savings_pct: 70.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
 ];
 
 /// Commands to ignore (shell builtins, trivial, already rtk).
@@ -400,26 +424,36 @@ const IGNORED_PREFIXES: &[&str] = &[
     "then ",
     "else\n",
     "else ",
-    "fi",
     "do\n",
     "do ",
-    "done",
     "for ",
     "while ",
     "if ",
     "case ",
 ];
 
-const IGNORED_EXACT: &[&str] = &["cd", "echo", "true", "false", "wait", "pwd", "bash", "sh"];
+const IGNORED_EXACT: &[&str] = &["cd", "echo", "true", "false", "wait", "pwd", "bash", "sh", "fi", "done"]; // fix #246: moved from IGNORED_PREFIXES to prevent shadowing find/done-prefix cmds
 
-lazy_static! {
-    static ref REGEX_SET: RegexSet = RegexSet::new(PATTERNS).expect("invalid regex patterns");
-    static ref COMPILED: Vec<Regex> = PATTERNS
-        .iter()
-        .map(|p| Regex::new(p).expect("invalid regex"))
-        .collect();
-    static ref ENV_PREFIX: Regex =
-        Regex::new(r"^(?:sudo\s+|env\s+|[A-Z_][A-Z0-9_]*=[^\s]*\s+)+").unwrap();
+fn regex_set() -> &'static RegexSet { // fix #12: OnceLock accessor
+    static INST: OnceLock<RegexSet> = OnceLock::new();
+    INST.get_or_init(|| RegexSet::new(PATTERNS).expect("invalid regex patterns"))
+}
+
+fn compiled() -> &'static Vec<Regex> { // fix #12: OnceLock accessor
+    static INST: OnceLock<Vec<Regex>> = OnceLock::new();
+    INST.get_or_init(|| {
+        PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).expect("invalid regex"))
+            .collect()
+    })
+}
+
+fn env_prefix() -> &'static Regex { // fix #12: OnceLock accessor
+    static INST: OnceLock<Regex> = OnceLock::new();
+    INST.get_or_init(|| {
+        Regex::new(r"^(?:sudo\s+|env\s+|[A-Z_][A-Z0-9_]*=[^\s]*\s+)+").unwrap()
+    })
 }
 
 /// Classify a single (already-split) command.
@@ -457,7 +491,7 @@ pub fn classify_command(cmd: &str) -> Classification {
     }
 
     // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped = ENV_PREFIX.replace(trimmed, "");
+    let stripped = env_prefix().replace(trimmed, ""); // fix #12: use accessor fn
     let cmd_clean = stripped.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
@@ -482,12 +516,12 @@ pub fn classify_command(cmd: &str) -> Classification {
     }
 
     // Fast check with RegexSet — take the last (most specific) match
-    let matches: Vec<usize> = REGEX_SET.matches(cmd_clean).into_iter().collect();
+    let matches: Vec<usize> = regex_set().matches(cmd_clean).into_iter().collect(); // fix #12
     if let Some(&idx) = matches.last() {
         let rule = &RULES[idx];
 
         // Extract subcommand for savings override and status detection
-        let (savings, status) = if let Some(caps) = COMPILED[idx].captures(cmd_clean) {
+        let (savings, status) = if let Some(caps) = compiled()[idx].captures(cmd_clean) { // fix #12
             if let Some(sub) = caps.get(1) {
                 let subcmd = sub.as_str();
                 // Check if this subcommand has a special status
@@ -1082,11 +1116,15 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_tail_file_unsupported() {
+    fn test_classify_tail_file_supported() {
+        // tail is now rewritten to rtk read --max-lines N
         assert_eq!(
             classify_command("tail -20 src/main.rs"),
-            Classification::Unsupported {
-                base_command: "tail".to_string(),
+            Classification::Supported {
+                rtk_equivalent: "rtk read",
+                category: "Files",
+                estimated_savings_pct: 60.0,
+                status: RtkStatus::Existing,
             }
         );
     }
@@ -1405,5 +1443,25 @@ mod tests {
                 other => panic!("gh {subcmd} should be Supported, got {other:?}"),
             }
         }
+    }
+
+    // fix #246: regression tests — fi/done must not shadow find commands
+    #[test]
+    fn test_classify_find_not_shadowed_by_fi() {
+        // Before fix: "find".starts_with("fi") == true → Ignored. Now must be Supported.
+        match classify_command("find . -name foo") {
+            Classification::Supported { .. } => {}
+            other => panic!("find should be Supported (not shadowed by fi), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_bare_fi_ignored() {
+        assert_eq!(classify_command("fi"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_bare_done_ignored() {
+        assert_eq!(classify_command("done"), Classification::Ignored);
     }
 }

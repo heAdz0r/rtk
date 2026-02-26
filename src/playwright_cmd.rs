@@ -9,7 +9,7 @@ use crate::parser::{
     ParseResult, TestFailure, TestResult, TokenFormatter,
 };
 
-/// Playwright JSON output structures (tool-specific format)
+/// Playwright JSON output structures — fix #193: corrected to match real Playwright output format
 #[derive(Debug, Deserialize)]
 struct PlaywrightJsonOutput {
     #[serde(rename = "stats")]
@@ -27,35 +27,45 @@ struct PlaywrightStats {
     #[serde(rename = "skipped")]
     skipped: usize,
     #[serde(rename = "duration", default)]
-    duration: u64,
+    duration: f64, // fix #193: Playwright emits float (e.g. 3519.703), not u64
 }
 
 #[derive(Debug, Deserialize)]
 struct PlaywrightSuite {
     title: String,
-    #[serde(rename = "tests")]
-    tests: Vec<PlaywrightTest>,
+    #[serde(rename = "specs", default)]
+    specs: Vec<PlaywrightSpec>, // fix #193: real format uses "specs", not "tests"
     #[serde(rename = "suites", default)]
     suites: Vec<PlaywrightSuite>,
 }
 
+// fix #193: spec has ok: bool + tests (per-browser executions)
 #[derive(Debug, Deserialize)]
-struct PlaywrightTest {
+struct PlaywrightSpec {
     title: String,
+    #[serde(rename = "ok")]
+    ok: bool,
+    #[serde(rename = "tests", default)]
+    tests: Vec<PlaywrightExecution>,
+}
+
+// fix #193: per-browser execution with results array
+#[derive(Debug, Deserialize)]
+struct PlaywrightExecution {
     #[serde(rename = "status")]
     status: String,
-    #[serde(rename = "results")]
-    results: Vec<PlaywrightTestResult>,
+    #[serde(rename = "results", default)]
+    results: Vec<PlaywrightAttempt>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PlaywrightTestResult {
+struct PlaywrightAttempt {
     #[serde(rename = "status")]
     status: String,
-    #[serde(rename = "error")]
-    error: Option<PlaywrightError>,
+    #[serde(rename = "errors", default)]
+    errors: Vec<PlaywrightError>, // fix #193: array, not Option<single>
     #[serde(rename = "duration", default)]
-    duration: u64,
+    duration: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +92,7 @@ impl OutputParser for PlaywrightParser {
                     passed: json.stats.expected,
                     failed: json.stats.unexpected,
                     skipped: json.stats.skipped,
-                    duration_ms: Some(json.stats.duration),
+                    duration_ms: Some(json.stats.duration as u64), // fix #193: f64 → u64
                     failures,
                 };
 
@@ -104,26 +114,30 @@ impl OutputParser for PlaywrightParser {
     }
 }
 
-/// Recursively collect test results from suites
+/// Recursively collect test results from suites — fix #193: uses specs/ok/errors structure
 fn collect_test_results(
     suites: &[PlaywrightSuite],
     total: &mut usize,
     failures: &mut Vec<TestFailure>,
 ) {
     for suite in suites {
-        for test in &suite.tests {
+        // fix #193: iterate specs (not tests); each spec = one test case
+        for spec in &suite.specs {
             *total += 1;
 
-            if test.status == "failed" || test.status == "timedOut" {
-                let error_msg = test
-                    .results
-                    .first()
-                    .and_then(|r| r.error.as_ref())
+            if !spec.ok {
+                // Collect error message from first failed attempt in any browser run
+                let error_msg = spec
+                    .tests
+                    .iter()
+                    .flat_map(|exec| exec.results.iter())
+                    .flat_map(|attempt| attempt.errors.iter()) // fix #193: errors array
+                    .next()
                     .map(|e| e.message.clone())
                     .unwrap_or_else(|| "Unknown error".to_string());
 
                 failures.push(TestFailure {
-                    test_name: test.title.clone(),
+                    test_name: spec.title.clone(),
                     file_path: suite.title.clone(),
                     error_message: error_msg,
                     stack_trace: None,
@@ -221,11 +235,20 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 
     let mut cmd = package_manager_exec("playwright");
 
-    // Add JSON reporter for structured output
-    cmd.arg("--reporter=json");
-
-    for arg in args {
+    // fix #193: --reporter=json must come AFTER the subcommand (e.g. "playwright test --reporter=json")
+    // Playwright rejects flags before the subcommand.
+    let mut inserted_reporter = false;
+    for (i, arg) in args.iter().enumerate() {
         cmd.arg(arg);
+        if i == 0 && !arg.starts_with("-") && !inserted_reporter {
+            // First positional arg is the subcommand — insert reporter flag right after
+            cmd.arg("--reporter=json");
+            inserted_reporter = true;
+        }
+    }
+    if !inserted_reporter {
+        // No subcommand provided, append at end
+        cmd.arg("--reporter=json");
     }
 
     if verbose > 0 {
@@ -284,23 +307,29 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 mod tests {
     use super::*;
 
+    // fix #193: updated to use real Playwright JSON format (specs, ok, errors array, f64 duration)
     #[test]
-    fn test_playwright_parser_json() {
+    fn test_playwright_parser_json_real_format() {
         let json = r#"{
             "stats": {
-                "expected": 3,
+                "expected": 1,
                 "unexpected": 0,
                 "skipped": 0,
-                "duration": 7300
+                "duration": 3519.703
             },
             "suites": [
                 {
                     "title": "auth/login.spec.ts",
-                    "tests": [
+                    "specs": [
                         {
                             "title": "should login",
-                            "status": "passed",
-                            "results": [{"status": "passed", "duration": 2300}]
+                            "ok": true,
+                            "tests": [
+                                {
+                                    "status": "passed",
+                                    "results": [{"status": "passed", "errors": [], "duration": 2300.0}]
+                                }
+                            ]
                         }
                     ],
                     "suites": []
@@ -309,13 +338,46 @@ mod tests {
         }"#;
 
         let result = PlaywrightParser::parse(json);
-        assert_eq!(result.tier(), 1);
+        assert_eq!(result.tier(), 1, "Should be Full JSON parse");
         assert!(result.is_ok());
 
         let data = result.unwrap();
-        assert_eq!(data.passed, 3);
+        assert_eq!(data.passed, 1);
         assert_eq!(data.failed, 0);
-        assert_eq!(data.duration_ms, Some(7300));
+        assert_eq!(data.total, 1);
+        assert_eq!(data.duration_ms, Some(3519)); // f64 3519.703 cast to u64
+    }
+
+    // fix #193: verify f64 duration does not cause deserialization failure
+    #[test]
+    fn test_playwright_float_duration_parsed() {
+        let json = r#"{
+            "stats": {"expected": 0, "unexpected": 1, "skipped": 0, "duration": 12345.678},
+            "suites": [{
+                "title": "suite",
+                "specs": [{
+                    "title": "failing test",
+                    "ok": false,
+                    "tests": [{
+                        "status": "failed",
+                        "results": [{
+                            "status": "failed",
+                            "errors": [{"message": "Expected true to be false"}],
+                            "duration": 500.0
+                        }]
+                    }]
+                }],
+                "suites": []
+            }]
+        }"#;
+
+        let result = PlaywrightParser::parse(json);
+        assert_eq!(result.tier(), 1);
+        let data = result.unwrap();
+        assert_eq!(data.failed, 1);
+        assert_eq!(data.failures.len(), 1);
+        assert_eq!(data.failures[0].error_message, "Expected true to be false");
+        assert_eq!(data.duration_ms, Some(12345));
     }
 
     #[test]

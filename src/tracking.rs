@@ -316,6 +316,22 @@ impl Tracker {
             [],
         );
 
+        // fix #200: parse_failures table for fallback analytics
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS parse_failures (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                raw_command TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                fallback_succeeded INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -410,6 +426,11 @@ impl Tracker {
         let cutoff = Utc::now() - chrono::Duration::days(HISTORY_DAYS);
         self.conn.execute(
             "DELETE FROM commands WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        // fix #200: also clean up old parse failures
+        self.conn.execute(
+            "DELETE FROM parse_failures WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
         Ok(())
@@ -832,6 +853,83 @@ impl Tracker {
 
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// fix #200: Record a parse failure for analytics.
+    pub fn record_parse_failure(
+        &self,
+        raw_command: &str,
+        error_message: &str,
+        fallback_succeeded: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Utc::now().to_rfc3339(),
+                raw_command,
+                error_message,
+                fallback_succeeded as i32,
+            ],
+        )?;
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// fix #200: Get parse failure summary for `rtk gain --failures`.
+    pub fn get_parse_failure_summary(&self) -> Result<ParseFailureSummary> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM parse_failures", [], |row| row.get(0))?;
+
+        let succeeded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM parse_failures WHERE fallback_succeeded = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let recovery_rate = if total > 0 {
+            (succeeded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT raw_command, COUNT(*) as cnt
+             FROM parse_failures
+             GROUP BY raw_command
+             ORDER BY cnt DESC
+             LIMIT 10",
+        )?;
+        let top_commands = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, raw_command, fallback_succeeded
+             FROM parse_failures
+             ORDER BY timestamp DESC
+             LIMIT 10",
+        )?;
+        let recent = stmt
+            .query_map([], |row| {
+                Ok(ParseFailureRecord {
+                    timestamp: row.get(0)?,
+                    raw_command: row.get(1)?,
+                    fallback_succeeded: row.get::<_, i32>(2)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(ParseFailureSummary {
+            total: total as usize,
+            recovery_rate,
+            top_commands,
+            recent,
+        })
+    }
+
 }
 
 fn get_db_path() -> Result<PathBuf> {
@@ -893,6 +991,29 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// timer.track("ls -la", "rtk ls", &input, &output);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+/// fix #200: single parse failure record for analytics display.
+pub struct ParseFailureRecord {
+    pub timestamp: String,
+    pub raw_command: String,
+    pub fallback_succeeded: bool,
+}
+
+/// fix #200: aggregated summary returned by get_parse_failure_summary().
+pub struct ParseFailureSummary {
+    pub total: usize,
+    pub recovery_rate: f64,
+    pub top_commands: Vec<(String, usize)>,
+    pub recent: Vec<ParseFailureRecord>,
+}
+
+/// fix #200: record a parse failure silently (ignores errors, safe to call from fallback path).
+pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, fallback_succeeded: bool) {
+    if let Ok(tracker) = Tracker::new() {
+        let _ = tracker.record_parse_failure(raw_command, error_message, fallback_succeeded);
+    }
+}
+
+
 pub struct TimedExecution {
     start: Instant,
 }

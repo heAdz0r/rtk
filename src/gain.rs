@@ -1,7 +1,11 @@
+use crate::cc_economics::{WEIGHT_CACHE_CREATE, WEIGHT_CACHE_READ, WEIGHT_OUTPUT}; // cache compounding
+use crate::ccusage::{self, Granularity}; // cache compounding: weighted CPT
 use crate::display_helpers::{format_duration, print_period_table};
 use crate::memory_layer::get_memory_gain_stats; // T3
+use crate::session_stats::{self, CacheCompoundingSavings}; // cache compounding
 use crate::tracking::{DayStats, MonthStats, Tracker, WeekStats};
-use crate::utils::format_tokens;
+use crate::tracking::ParseFailureSummary; // fix #200
+use crate::utils::{format_tokens, format_usd}; // added format_usd for cache compounding
 use anyhow::{Context, Result};
 use colored::Colorize; // added: terminal colors
 use serde::Serialize;
@@ -19,9 +23,16 @@ pub fn run(
     monthly: bool,
     all: bool,
     format: &str,
+    failures: bool, // fix #200: show parse failure log
     _verbose: u8,
 ) -> Result<()> {
     let tracker = Tracker::new().context("Failed to initialize tracking database")?;
+
+    // fix #200: show parse failure log and exit early
+    if failures {
+        return show_failures(&tracker);
+    }
+
     let project_scope = resolve_project_scope(project)?; // added: resolve project path
 
     // Handle export formats
@@ -205,6 +216,9 @@ pub fn run(
             println!("{}", "─".repeat(table_width));
             println!();
         }
+
+        // cache compounding: show effective savings accounting for prompt cache thrashing
+        print_cache_compounding(summary.total_saved);
 
         if graph && !summary.by_day.is_empty() {
             println!("{}", styled("Daily Savings (last 30 days)", true)); // added: styled header
@@ -418,6 +432,90 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
+/// Compute weighted input cost-per-token from ccusage monthly data.
+fn get_weighted_input_cpt() -> Option<f64> {
+    let cc_monthly = ccusage::fetch(Granularity::Monthly).ok()??;
+    let mut total_cost = 0.0f64;
+    let mut weighted_units = 0.0f64;
+    for period in &cc_monthly {
+        total_cost += period.metrics.total_cost;
+        weighted_units += period.metrics.input_tokens as f64
+            + WEIGHT_OUTPUT * period.metrics.output_tokens as f64
+            + WEIGHT_CACHE_CREATE * period.metrics.cache_creation_tokens as f64
+            + WEIGHT_CACHE_READ * period.metrics.cache_read_tokens as f64;
+    }
+    if weighted_units > 0.0 {
+        Some(total_cost / weighted_units)
+    } else {
+        None
+    }
+}
+
+/// Compute cache compounding savings: scans sessions + applies multiplier.
+fn compute_cache_compounding(total_saved: usize) -> Option<CacheCompoundingSavings> {
+    let stats = session_stats::compute_session_stats(90).ok()?;
+    let cpt = get_weighted_input_cpt();
+    Some(session_stats::compute_compounding(total_saved, stats, cpt))
+}
+
+/// Print cache compounding section showing effective savings beyond direct token reduction.
+fn print_cache_compounding(total_saved: usize) {
+    let compounding = match compute_cache_compounding(total_saved) {
+        Some(c) => c,
+        None => return,
+    };
+
+    println!("{}", styled("Cache Compounding Effect", true));
+    println!("──────────────────────────────────────────────────────────────");
+
+    print_kpi("Direct savings", format_tokens(compounding.direct_saved));
+
+    let turns_label = if compounding.stats.is_estimated {
+        format!(
+            "~{:.0} (model estimate)",
+            compounding.stats.avg_turns_per_session
+        )
+    } else {
+        format!(
+            "{:.0} (from {} sessions)",
+            compounding.stats.avg_turns_per_session, compounding.stats.sessions_analyzed
+        )
+    };
+    print_kpi("Avg session turns", turns_label);
+    print_kpi(
+        "Avg remaining",
+        format!("{:.0}", compounding.stats.avg_remaining_turns),
+    );
+    print_kpi(
+        "Cache multiplier",
+        format!(
+            "{:.2}x  (1.25 + 0.1 x {:.0})",
+            compounding.multiplier, compounding.stats.avg_remaining_turns
+        ),
+    );
+
+    let effective_str = match compounding.dollar_savings {
+        Some(dollars) => format!(
+            "{} tokens  ({})",
+            format_tokens(compounding.effective_saved),
+            format_usd(dollars)
+        ),
+        None => format!("{} tokens", format_tokens(compounding.effective_saved)),
+    };
+
+    println!("  ┌─────────────────────────────────────────────────────────┐");
+    println!("  │ Effective savings:   {:<35}│", effective_str);
+    println!("  └─────────────────────────────────────────────────────────┘");
+
+    println!("How: Saved tokens avoid 1.25x cache write + 0.1x per");
+    println!("subsequent turn. Longer sessions = bigger multiplier.");
+
+    if compounding.dollar_savings.is_none() {
+        println!("Tip: Install ccusage (npm i -g ccusage) for dollar amounts.");
+    }
+    println!();
+}
+
 fn print_ascii_graph(data: &[(String, usize)]) {
     if data.is_empty() {
         return;
@@ -473,6 +571,8 @@ fn print_monthly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
 struct ExportData {
     summary: ExportSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cache_compounding: Option<CacheCompoundingSavings>, // cache compounding effect
+    #[serde(skip_serializing_if = "Option::is_none")]
     daily: Option<Vec<DayStats>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     weekly: Option<Vec<WeekStats>>,
@@ -513,6 +613,7 @@ fn export_json(
             total_time_ms: summary.total_time_ms,
             avg_time_ms: summary.avg_time_ms,
         },
+        cache_compounding: compute_cache_compounding(summary.total_saved), // cache compounding
         daily: if all || daily {
             Some(tracker.get_all_days_filtered(project_scope)?) // changed: use filtered
         } else {
@@ -604,6 +705,50 @@ fn export_csv(
                 month.avg_time_ms
             );
         }
+    }
+
+    Ok(())
+}
+
+/// fix #200: display parse failure log for `rtk gain --failures`
+fn show_failures(tracker: &Tracker) -> Result<()> {
+    let summary = tracker
+        .get_parse_failure_summary()
+        .context("Failed to load parse failure data")?;
+
+    if summary.total == 0 {
+        println!("No parse failures recorded.");
+        println!("This means all commands parsed successfully (or fallback has not triggered yet).");
+        return Ok(());
+    }
+
+    println!("{}", styled("RTK Parse Failures", true));
+    println!("{}", "═".repeat(60));
+    println!();
+    print_kpi("Total failures", summary.total.to_string());
+    print_kpi("Recovery rate", format!("{:.1}%", summary.recovery_rate));
+    println!();
+
+    if !summary.top_commands.is_empty() {
+        println!("{}", styled("Top Commands (by frequency)", true));
+        println!("{}", "─".repeat(60));
+        for (cmd, count) in &summary.top_commands {
+            let cmd_display = if cmd.len() > 50 { format!("{}...", &cmd[..47]) } else { cmd.clone() };
+            println!("  {:>4}x  {}", count, cmd_display);
+        }
+        println!();
+    }
+
+    if !summary.recent.is_empty() {
+        println!("{}", styled("Recent Failures (last 10)", true));
+        println!("{}", "─".repeat(60));
+        for rec in &summary.recent {
+            let ts_short = if rec.timestamp.len() >= 16 { &rec.timestamp[..16] } else { &rec.timestamp };
+            let status = if rec.fallback_succeeded { "ok" } else { "FAIL" };
+            let cmd_display = if rec.raw_command.len() > 40 { format!("{}...", &rec.raw_command[..37]) } else { rec.raw_command.clone() };
+            println!("  {} [{}] {}", ts_short, status, cmd_display);
+        }
+        println!();
     }
 
     Ok(())
