@@ -4,17 +4,29 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::process::Command;
 
-#[allow(clippy::too_many_arguments)] // changed: 8 args by design, GrepOptions refactor is future work
-pub fn run(
-    pattern: &str,
-    path: &str,
-    max_line_len: usize,
-    max_results: usize,
-    context_only: bool,
-    file_type: Option<&str>,
-    extra_args: &[String],
-    verbose: u8,
-) -> Result<()> {
+/// Options for grep filtering, replacing the 8-argument signature. // fix #14: GrepOptions struct
+pub struct GrepOptions<'a> {
+    pub pattern: &'a str,
+    pub path: &'a str,
+    pub max_line_len: usize,
+    pub max_results: usize,
+    pub context_only: bool,
+    pub file_type: Option<&'a str>,
+    pub extra_args: &'a [String],
+    pub verbose: u8,
+}
+
+pub fn run(opts: GrepOptions<'_>) -> Result<()> {
+    let GrepOptions {
+        pattern,
+        path,
+        max_line_len,
+        max_results,
+        context_only,
+        file_type,
+        extra_args,
+        verbose,
+    } = opts;
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
@@ -56,11 +68,16 @@ pub fn run(
     // Bug 1: rg exit 2 = regex parse error — stderr was silently swallowed, showed "0 results"
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     if output.status.code() == Some(2) {
-        let msg = format!(
+        // fix: on regex error, show hint with auto-escaped suggestion so LLM can self-correct
+        let mut msg = format!(
             "❌ rg regex error for '{}': {}",
             rg_pattern,
             stderr_str.trim()
         );
+        if let Some(hint) = hint_literal_parens(&rg_pattern) {
+            msg.push('\n');
+            msg.push_str(&hint);
+        }
         println!("{}", msg);
         timer.track(
             &format!("grep -rn '{}' {}", pattern, path),
@@ -107,7 +124,7 @@ pub fn run(
         return Ok(());
     }
 
-    let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::with_capacity(64); // H5: pre-alloc avoids rehash for typical grep results
     let mut total = 0;
 
     for line in stdout.lines() {
@@ -235,8 +252,8 @@ fn format_passthrough_output(rg_stdout: &str, mode: &str) -> String {
 
 /// Translate extra_args before passing to rg:
 /// - Strip rtk-read-only flags (--from, --to, --level) + consume their value; hint to stderr
-/// - Translate native Grep tool output_mode: -o files_with_matches → --files-with-matches,
-///   -o count → --count, -o content → skip (default behaviour)
+/// - Translate native Grep tool output_mode (short: -o mode; long: --output_mode mode; inline: --output_mode=mode)
+///   → --files-with-matches / --count / skip(content)
 /// - Strip -r/--recursive (rg is recursive by default)
 /// - Translate --include=PAT / --include PAT → --glob=PAT
 // changed: extracted from inline loop in run() for testability + output_mode compat
@@ -247,12 +264,19 @@ fn translate_extra_args(extra_args: &[String]) -> Vec<String> {
         if arg == "-r" || arg == "--recursive" {
             continue; // rg is recursive by default
         }
+        if arg == "--compact" {
+            continue; // rtk grep is compact by default — ignore rtk-specific flag
+        }
         if arg == "--from" || arg == "--to" || arg == "--level" {
             // consume the paired value if it does not start with "-"
             if iter.peek().map(|a| !a.starts_with('-')).unwrap_or(false) {
                 iter.next();
             }
             eprintln!("hint: '{}' is an rtk read flag — use: rtk read <file> --level none --from N --to M", arg);
+            continue;
+        }
+        if arg == "-l" {
+            result.push("--files-with-matches".to_string()); // changed: -l → --files-with-matches (grep/rg compat)
             continue;
         }
         if arg == "-o" {
@@ -270,6 +294,37 @@ fn translate_extra_args(extra_args: &[String]) -> Vec<String> {
                     iter.next(); // -o content = default behaviour, skip silently
                 }
                 _ => result.push(arg.clone()), // bare -o (rg only-matching), pass through
+            }
+            continue;
+        }
+        // changed: handle --output_mode / --output-mode long form (native Grep tool lands here when multiple paths precede the flag)
+        if arg == "--output_mode" || arg == "--output-mode" {
+            match iter.peek().map(|s| s.as_str()) {
+                Some("files_with_matches") => {
+                    iter.next();
+                    result.push("--files-with-matches".to_string());
+                }
+                Some("count") => {
+                    iter.next();
+                    result.push("--count".to_string());
+                }
+                Some("content") => {
+                    iter.next();
+                }
+                _ => result.push(arg.clone()),
+            }
+            continue;
+        }
+        // changed: handle --output_mode=value / --output-mode=value inline = form
+        if let Some(mode) = arg
+            .strip_prefix("--output_mode=")
+            .or_else(|| arg.strip_prefix("--output-mode="))
+        {
+            match mode {
+                "files_with_matches" => result.push("--files-with-matches".to_string()),
+                "count" => result.push("--count".to_string()),
+                "content" => {}
+                _ => result.push(arg.clone()),
             }
             continue;
         }
@@ -369,12 +424,21 @@ fn normalize_file_type(ft: &str) -> &str {
 ///   `\x` `\u` `\U` `\p` `\P` `\0`-`\9`
 fn bre_to_pcre(pattern: &str) -> String {
     let translated = bre_to_pcre_raw(pattern);
-    // changed: validate translated pattern; if invalid, escape bare braces that aren't valid quantifiers
-    if Regex::new(&translated).is_err() {
-        escape_bare_braces(&translated)
-    } else {
-        translated
+    if Regex::new(&translated).is_ok() {
+        return translated;
     }
+    // fallback 1: escape bare braces (e.g. "Plan {")
+    let brace_fixed = escape_bare_braces(&translated);
+    if Regex::new(&brace_fixed).is_ok() {
+        return brace_fixed;
+    }
+    // fallback 2: escape bare parens (e.g. "\.Search(ctx") — fix: unescaped ( causes rg exit-code 2
+    let paren_fixed = escape_literal_parens(&brace_fixed);
+    if Regex::new(&paren_fixed).is_ok() {
+        return paren_fixed;
+    }
+    // last resort: full literal escape — never gives rg an invalid regex
+    regex::escape(pattern)
 }
 
 /// Raw BRE→PCRE translation (no validation).
@@ -613,6 +677,13 @@ mod tests {
         assert!(result.contains('0'), "got: {result}");
     }
 
+    // changed: -l → --files-with-matches (grep compat, -l was conflicting with --max-len)
+    #[test]
+    fn test_translate_l_flag_files_with_matches() {
+        let args = vec!["-l".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--files-with-matches"]);
+    }
+
     // changed: -o files_with_matches → rg --files-with-matches (native Grep tool output_mode compat)
     #[test]
     fn test_translate_output_mode_files_with_matches() {
@@ -683,6 +754,13 @@ mod tests {
     #[test]
     fn test_translate_recursive_stripped() {
         let args = vec!["-r".to_string(), "-i".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["-i"]);
+    }
+
+    #[test]
+    fn test_translate_compact_stripped() {
+        // --compact is rtk-specific, must not be forwarded to rg
+        let args = vec!["--compact".to_string(), "-i".to_string()];
         assert_eq!(translate_extra_args(&args), vec!["-i"]);
     }
 
@@ -787,12 +865,16 @@ mod tests {
         assert_eq!(bre_to_pcre(r"#\[tokio"), r"#\[tokio"); // \[ = literal [, keep
     }
 
-    // bre_to_pcre: trailing bare backslash preserved (rg will report its own error)
+    // fix: trailing bare backslash is invalid regex — bre_to_pcre now produces valid output via last-resort regex::escape
     #[test]
     fn test_bre_to_pcre_trailing_backslash() {
-        // trailing backslash: use raw literal to avoid Rust string escape ambiguity
         let result = bre_to_pcre(r"foo\");
-        assert_eq!(result, r"foo\");
+        // old behavior: returned invalid "foo\" and let rg fail with exit-code 2
+        // new behavior: fallback to regex::escape → valid regex matching literal foo\
+        assert!(
+            Regex::new(&result).is_ok(),
+            "trailing backslash must produce valid regex via fallback: {result}"
+        );
     }
 
     // changed: bare { not a quantifier must be escaped so rg doesn't fail
@@ -868,5 +950,102 @@ mod tests {
     fn test_escape_literal_parens_already_escaped() {
         // Already-escaped \( must not be double-escaped
         assert_eq!(escape_literal_parens(r"\(test\)"), r"\(test\)");
+    }
+
+    #[test]
+    fn test_translate_output_mode_long_form_files_with_matches() {
+        let args = vec![
+            "--output_mode".to_string(),
+            "files_with_matches".to_string(),
+        ];
+        assert_eq!(translate_extra_args(&args), vec!["--files-with-matches"]);
+    }
+
+    #[test]
+    fn test_translate_output_mode_long_form_count() {
+        let args = vec!["--output_mode".to_string(), "count".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--count"]);
+    }
+
+    #[test]
+    fn test_translate_output_mode_long_form_content_skipped() {
+        let args = vec!["--output_mode".to_string(), "content".to_string()];
+        assert!(translate_extra_args(&args).is_empty());
+    }
+
+    #[test]
+    fn test_translate_output_mode_dash_form() {
+        let args = vec![
+            "--output-mode".to_string(),
+            "files_with_matches".to_string(),
+        ];
+        assert_eq!(translate_extra_args(&args), vec!["--files-with-matches"]);
+    }
+
+    #[test]
+    fn test_translate_output_mode_inline_eq_files_with_matches() {
+        let args = vec!["--output_mode=files_with_matches".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--files-with-matches"]);
+    }
+
+    #[test]
+    fn test_translate_output_mode_inline_eq_count() {
+        let args = vec!["--output_mode=count".to_string()];
+        assert_eq!(translate_extra_args(&args), vec!["--count"]);
+    }
+
+    #[test]
+    fn test_translate_output_mode_inline_eq_content_skipped() {
+        let args = vec!["--output_mode=content".to_string()];
+        assert!(translate_extra_args(&args).is_empty());
+    }
+
+    #[test]
+    fn test_translate_extra_paths_with_output_mode() {
+        let args = vec![
+            "reranker/".to_string(),
+            "raptor/".to_string(),
+            "--output_mode".to_string(),
+            "files_with_matches".to_string(),
+        ];
+        assert_eq!(
+            translate_extra_args(&args),
+            vec!["reranker/", "raptor/", "--files-with-matches"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod regex_retry_tests {
+    use super::*;
+
+    // RED: unescaped ( in pattern must produce valid regex after bre_to_pcre
+    #[test]
+    fn test_bre_to_pcre_escapes_unescaped_open_paren() {
+        let r = bre_to_pcre(r"\.Search(ctx");
+        assert!(
+            Regex::new(&r).is_ok(),
+            "unescaped ( must be auto-escaped to produce valid regex, got: {r}"
+        );
+        assert!(r.contains(r"\("), "( should be escaped in: {r}");
+    }
+
+    // RED: unescaped ) causes same issue
+    #[test]
+    fn test_bre_to_pcre_escapes_unescaped_close_paren() {
+        let r = bre_to_pcre(r"foo)bar");
+        assert!(
+            Regex::new(&r).is_ok(),
+            "unescaped ) must be auto-escaped: {r}"
+        );
+    }
+
+    // GREEN guard: already-escaped parens must not be double-escaped
+    #[test]
+    fn test_bre_to_pcre_no_double_escape_parens() {
+        let r = bre_to_pcre(r"cfg\(test\)");
+        assert!(Regex::new(&r).is_ok(), "must stay valid: {r}");
+        // should not gain extra backslashes
+        assert!(!r.contains(r"\\("), "no double-escape: {r}");
     }
 }

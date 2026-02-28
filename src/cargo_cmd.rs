@@ -1249,11 +1249,26 @@ error: aborting due to 2 previous errors
 "#;
         let result = filter_cargo_test(output);
         // Must show error codes, not just a count
-        assert!(result.contains("E0425"), "Expected error code E0425, got: {}", result);
-        assert!(result.contains("E0061"), "Expected error code E0061, got: {}", result);
-        assert!(result.contains("cargo test:"), "Expected cargo test: prefix, got: {}", result);
+        assert!(
+            result.contains("E0425"),
+            "Expected error code E0425, got: {}",
+            result
+        );
+        assert!(
+            result.contains("E0061"),
+            "Expected error code E0061, got: {}",
+            result
+        );
+        assert!(
+            result.contains("cargo test:"),
+            "Expected cargo test: prefix, got: {}",
+            result
+        );
         // Must NOT reduce to just a count summary
-        assert!(!result.contains("cargo test: completed"), "Should not show 'completed' on compile failure");
+        assert!(
+            !result.contains("cargo test: completed"),
+            "Should not show 'completed' on compile failure"
+        );
     }
 
     #[test]

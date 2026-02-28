@@ -355,10 +355,22 @@ rtk git add . && rtk git commit -m "msg" && rtk git push
 
 ## Precise File Reads
 
-For exact parity with native file reads (without filtering), use:
+**Auto-level — never add `--level` manually (auto-selected by extension and range):**
+- code file, no range → auto `minimal` (strips blanks/comments, saves 40-70%)
+- any file, with `--from`/`--to` → auto `none` (edit mode, full context)
+- config/data (`.json .yaml .toml .env .lock`) → auto `none`
 
 ```bash
-rtk read <file> --level none --from <N> --to <M>
+# ✓ CORRECT — omit --level entirely
+rtk read <file>                               # auto: minimal for code, none for config
+rtk read <file> --from <N> --to <M>          # auto: none (edit range, full content)
+
+# ✗ WRONG — don't add --level none without a range on code files
+rtk read src/App.tsx --level none            # defeats token savings, hook rewrites it
+rtk read src/App.tsx --level none --from 10 --to 50  # OK: range justifies none
+
+# ✗ WRONG — never use python3 open() to read files
+python3 -c "open('src/App.tsx').read()"     # use: rtk read src/App.tsx
 ```
 
 ## Safe File Writes
@@ -371,12 +383,14 @@ Use `rtk write` for atomicity and idempotency, not primarily for token savings (
 | Retry-safe / idempotent | `rtk write patch/replace` — noop if already applied |
 | Structured config | `rtk write set` — type-safe JSON/TOML key update |
 | Single trivial edit | `rtk write patch/replace` |
+| **Create NEW file** | `rtk write file` — atomic, idempotent, refuses overwrite |
 
 ```bash
 rtk write batch --plan '[{"op":"patch","file":"a.rs","old":"x","new":"y"},...]'  # multi-file
 rtk write replace <file> --from <old> --to <new> [--all]
 rtk write patch <file> --old "<block>" --new "<block>" [--all]
 rtk write set <file.{json|toml}> --key a.b --value <value>
+rtk write file <new-file> --content @/tmp/content.txt  # create new file (atomic)
 ```
 
 ## Tabular Files (CSV/TSV)
@@ -451,12 +465,13 @@ rtk prisma              # Prisma without ASCII art (88%)
 ### Files & Search (60-85% savings)
 ```bash
 rtk ls <path>           # Tree format, compact (65%)
-rtk read <file>         # Code/text read with filtering; CSV/TSV -> compact digest
-rtk read <file> --level none --from <N> --to <M>  # Exact line-range read (no filtering)
-rtk write batch --plan '[...]'  # Multi-file atomic batch (prefer for 2+ files)
+rtk read <file>                               # Code/docs → minimal (structure, no blanks)
+rtk read <file> --level none --from <N> --to <M>  # Edit mode: exact line range, full content
+rtk write batch --plan '[...]'                # Multi-file atomic batch (prefer for 2+ files)
 rtk write replace <file> --from old --to new [--all]  # Atomic text replace
 rtk write patch <file> --old "<block>" --new "<block>" [--all]  # Atomic block patch (idempotent)
 rtk write set <file> --key a.b --value v --format json|toml  # Atomic structured update
+rtk write file <new-file> --content @/tmp/f  # Create NEW file (atomic, idempotent)
 rtk rgai <query>        # Semantic search ranked by relevance (85%)
 rtk grep <pattern>      # Exact/regex search (internal rg -> grep fallback)
 rtk find <pattern>      # Find grouped by directory (70%)

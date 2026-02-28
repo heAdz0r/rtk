@@ -59,10 +59,22 @@ rtk git add . && rtk git commit -m "msg" && rtk git push
 
 ## Precise File Reads
 
-For exact parity with native file reads (without filtering), use:
+**Auto-level — never add `--level` manually (auto-selected by extension and range):**
+- code file, no range → auto `minimal` (strips blanks/comments, saves 40-70%)
+- any file, with `--from`/`--to` → auto `none` (edit mode, full context)
+- config/data (`.json .yaml .toml .env .lock`) → auto `none`
 
 ```bash
-rtk read <file> --level none --from <N> --to <M>
+# ✓ CORRECT — omit --level entirely
+rtk read <file>                               # auto: minimal for code, none for config
+rtk read <file> --from <N> --to <M>          # auto: none (edit range, full content)
+
+# ✗ WRONG — don't add --level none without a range on code files
+rtk read src/App.tsx --level none            # defeats token savings, hook rewrites it
+rtk read src/App.tsx --level none --from 10 --to 50  # OK: range justifies none
+
+# ✗ WRONG — never use python3 open() to read files
+python3 -c "open('src/App.tsx').read()"     # use: rtk read src/App.tsx
 ```
 
 ## Safe File Writes
@@ -75,12 +87,14 @@ Use `rtk write` for atomicity and idempotency, not primarily for token savings (
 | Retry-safe / idempotent | `rtk write patch/replace` — noop if already applied |
 | Structured config | `rtk write set` — type-safe JSON/TOML key update |
 | Single trivial edit | `rtk write patch/replace` |
+| **Create NEW file** | `rtk write file` — atomic, idempotent, refuses overwrite |
 
 ```bash
 rtk write batch --plan '[{"op":"patch","file":"a.rs","old":"x","new":"y"},...]'  # multi-file
 rtk write replace <file> --from <old> --to <new> [--all]
 rtk write patch <file> --old "<block>" --new "<block>" [--all]
 rtk write set <file.{json|toml}> --key a.b --value <value>
+rtk write file <new-file> --content @/tmp/content.txt  # create new file (atomic)
 ```
 
 ## Tabular Files (CSV/TSV)
@@ -155,12 +169,13 @@ rtk prisma              # Prisma without ASCII art (88%)
 ### Files & Search (60-85% savings)
 ```bash
 rtk ls <path>           # Tree format, compact (65%)
-rtk read <file>         # Code/text read with filtering; CSV/TSV -> compact digest
-rtk read <file> --level none --from <N> --to <M>  # Exact line-range read (no filtering)
-rtk write batch --plan '[...]'  # Multi-file atomic batch (prefer for 2+ files)
+rtk read <file>                               # Code/docs → minimal (structure, no blanks)
+rtk read <file> --level none --from <N> --to <M>  # Edit mode: exact line range, full content
+rtk write batch --plan '[...]'                # Multi-file atomic batch (prefer for 2+ files)
 rtk write replace <file> --from old --to new [--all]  # Atomic text replace
 rtk write patch <file> --old "<block>" --new "<block>" [--all]  # Atomic block patch (idempotent)
 rtk write set <file> --key a.b --value v --format json|toml  # Atomic structured update
+rtk write file <new-file> --content @/tmp/f  # Create NEW file (atomic, idempotent)
 rtk rgai <query>        # Semantic search ranked by relevance (85%)
 rtk grep <pattern>      # Exact/regex search (internal rg -> grep fallback)
 rtk find <pattern>      # Find grouped by directory (70%)
@@ -424,7 +439,6 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
                         || command.contains("rtk-block-native-write.sh")
                         || command.contains("rtk-block-task.sh")
                         || command.contains("rtk-block-task.sh")
-                    
                     {
                         return false; // Remove this RTK entry
                     }
@@ -497,7 +511,7 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
         "rtk-block-native-read.sh",
         "rtk-block-native-write.sh",
         "rtk-block-task.sh",
-        "rtk-block-task.sh", 
+        "rtk-block-task.sh",
     ] {
         let hook_path = claude_dir.join("hooks").join(hook_name);
         if hook_path.exists() {
@@ -674,7 +688,9 @@ fn patch_settings_json(
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
     atomic_write(&settings_path, &serialized)?;
 
-    println!("\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write block + Task block)");
+    println!(
+        "\n  settings.json: hooks added (Bash rewrite + Grep/Read/Edit/Write block + Task block)"
+    );
     if settings_path.with_extension("json.bak").exists() {
         println!(
             "  Backup: {}",
@@ -920,8 +936,7 @@ fn any_rtk_hook_present(root: &serde_json::Value) -> (bool, bool, bool, bool, bo
         has_matcher_with_file(pre_tool_use_array, "Edit", "rtk-block-native-write.sh");
     let has_block_write =
         has_matcher_with_file(pre_tool_use_array, "Write", "rtk-block-native-write.sh");
-    let has_block_task =
-        has_matcher_with_file(pre_tool_use_array, "Task", "rtk-block-task.sh");
+    let has_block_task = has_matcher_with_file(pre_tool_use_array, "Task", "rtk-block-task.sh");
 
     (
         has_rewrite,
@@ -1455,7 +1470,7 @@ fn cleanup_project_local_hooks(verbose: u8) -> Result<bool> {
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
             "rtk-block-task.sh",
-            "rtk-block-task.sh", 
+            "rtk-block-task.sh",
         ] {
             let local_hook = local_hooks_dir.join(hook_name);
             if local_hook.exists() {
@@ -1693,7 +1708,7 @@ pub fn show_config() -> Result<()> {
             "rtk-block-native-read.sh",
             "rtk-block-native-write.sh",
             "rtk-block-task.sh",
-            "rtk-block-task.sh", 
+            "rtk-block-task.sh",
         ] {
             if local_hooks_dir.join(hook_name).exists() {
                 local_dupes.push(*hook_name);
@@ -2071,7 +2086,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
-            "/Users/test/.claude/hooks/rtk-block-task.sh", 
+            "/Users/test/.claude/hooks/rtk-block-task.sh",
         ));
     }
 
@@ -2093,7 +2108,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
-            "/Users/test/.claude/hooks/rtk-block-task.sh", 
+            "/Users/test/.claude/hooks/rtk-block-task.sh",
         ));
     }
 
@@ -2133,7 +2148,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
-            "/Users/test/.claude/hooks/rtk-block-task.sh", 
+            "/Users/test/.claude/hooks/rtk-block-task.sh",
         ));
     }
 
@@ -2154,7 +2169,7 @@ More notes
             "/Users/test/.claude/hooks/rtk-block-native-grep.sh",
             "/Users/test/.claude/hooks/rtk-block-native-read.sh",
             "/Users/test/.claude/hooks/rtk-block-native-write.sh",
-            "/Users/test/.claude/hooks/rtk-block-task.sh", 
+            "/Users/test/.claude/hooks/rtk-block-task.sh",
         ));
     }
 
@@ -2176,7 +2191,7 @@ More notes
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, true, true, true, true, true) 
+            (true, true, true, true, true, true)
         );
     }
 
@@ -2191,7 +2206,7 @@ More notes
         });
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (true, false, false, false, false, false) 
+            (true, false, false, false, false, false)
         );
     }
 
@@ -2200,7 +2215,7 @@ More notes
         let json_content = serde_json::json!({});
         assert_eq!(
             any_rtk_hook_present(&json_content),
-            (false, false, false, false, false, false) 
+            (false, false, false, false, false, false)
         );
     }
 
@@ -2305,14 +2320,20 @@ More notes
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_tool_use.len(), 7); // existing + rewrite + grep + read + edit + write + task
 
-        assert_eq!(pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap(), "/some/other/hook.sh");
+        assert_eq!(
+            pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/some/other/hook.sh"
+        );
         assert_eq!(pre_tool_use[1]["matcher"], "Bash");
         assert_eq!(pre_tool_use[2]["matcher"], "Grep");
         assert_eq!(pre_tool_use[3]["matcher"], "Read");
         assert_eq!(pre_tool_use[4]["matcher"], "Edit");
         assert_eq!(pre_tool_use[5]["matcher"], "Write");
         assert_eq!(pre_tool_use[6]["matcher"], "Task");
-        assert_eq!(pre_tool_use[6]["hooks"][0]["command"].as_str().unwrap(), block_task);
+        assert_eq!(
+            pre_tool_use[6]["hooks"][0]["command"].as_str().unwrap(),
+            block_task
+        );
     }
 
     #[test]

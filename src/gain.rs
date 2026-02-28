@@ -3,8 +3,8 @@ use crate::ccusage::{self, Granularity}; // cache compounding: weighted CPT
 use crate::display_helpers::{format_duration, print_period_table};
 use crate::memory_layer::get_memory_gain_stats; // T3
 use crate::session_stats::{self, CacheCompoundingSavings}; // cache compounding
-use crate::tracking::{DayStats, MonthStats, Tracker, WeekStats};
 use crate::tracking::ParseFailureSummary; // fix #200
+use crate::tracking::{DayStats, MonthStats, Tracker, WeekStats};
 use crate::utils::{format_tokens, format_usd}; // added format_usd for cache compounding
 use anyhow::{Context, Result};
 use colored::Colorize; // added: terminal colors
@@ -718,7 +718,9 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
 
     if summary.total == 0 {
         println!("No parse failures recorded.");
-        println!("This means all commands parsed successfully (or fallback has not triggered yet).");
+        println!(
+            "This means all commands parsed successfully (or fallback has not triggered yet)."
+        );
         return Ok(());
     }
 
@@ -733,7 +735,11 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
         println!("{}", styled("Top Commands (by frequency)", true));
         println!("{}", "─".repeat(60));
         for (cmd, count) in &summary.top_commands {
-            let cmd_display = if cmd.len() > 50 { format!("{}...", &cmd[..47]) } else { cmd.clone() };
+            let cmd_display = if cmd.len() > 50 {
+                format!("{}...", &cmd[..47])
+            } else {
+                cmd.clone()
+            };
             println!("  {:>4}x  {}", count, cmd_display);
         }
         println!();
@@ -743,9 +749,17 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
         println!("{}", styled("Recent Failures (last 10)", true));
         println!("{}", "─".repeat(60));
         for rec in &summary.recent {
-            let ts_short = if rec.timestamp.len() >= 16 { &rec.timestamp[..16] } else { &rec.timestamp };
+            let ts_short = if rec.timestamp.len() >= 16 {
+                &rec.timestamp[..16]
+            } else {
+                &rec.timestamp
+            };
             let status = if rec.fallback_succeeded { "ok" } else { "FAIL" };
-            let cmd_display = if rec.raw_command.len() > 40 { format!("{}...", &rec.raw_command[..37]) } else { rec.raw_command.clone() };
+            let cmd_display = if rec.raw_command.len() > 40 {
+                format!("{}...", &rec.raw_command[..37])
+            } else {
+                rec.raw_command.clone()
+            };
             println!("  {} [{}] {}", ts_short, status, cmd_display);
         }
         println!();

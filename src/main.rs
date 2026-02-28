@@ -1407,10 +1407,81 @@ fn smart_read_level(path: &std::path::Path) -> crate::filter::FilterLevel {
 }
 
 /// fix #200: RTK-only subcommands that should never fall back to raw execution.
+/// Expanded: RTK-exclusive commands where system fallback is dangerous or wrong.
 const RTK_META_COMMANDS: &[&str] = &[
-    "gain", "discover", "learn", "init", "config", "proxy",
-    "hook-audit", "cc-economics",
+    "gain",
+    "discover",
+    "learn",
+    "init",
+    "config",
+    "proxy",
+    "hook-audit",
+    "cc-economics",
+    // RTK-exclusive — no system equivalent or system cmd is dangerously different // changed
+    "write",   // system write(1) sends terminal messages — very dangerous // changed
+    "read",    // bash `read` reads from stdin — completely wrong // changed
+    "rgai",    // no system equivalent // changed
+    "memory",  // no system equivalent // changed
+    "smart",   // no system equivalent // changed
+    "summary", // no system equivalent // changed
 ];
+
+/// Print contextual fix hints when a write subcommand fails to parse. // changed
+fn print_write_hint(args: &[String]) {
+    // changed
+    let sub = args.get(1).map(|s| s.as_str()).unwrap_or(""); // changed
+    eprintln!(); // changed
+    match sub {
+        // changed
+        "file" => {
+            // changed
+            eprintln!("  note: 'write file' creates NEW files only."); // changed
+            eprintln!("        to modify existing files use 'write patch' or 'write replace':"); // changed
+            eprintln!(); // changed
+            eprintln!("    rtk write replace <file> --from <old> --to <new>"); // changed
+            eprintln!("    rtk write patch   <file> --old <block> --new <block>");
+            // changed
+        } // changed
+        "patch" | "replace" => {
+            // changed
+            eprintln!("  hint: shell metacharacters break inline --old/--new."); // changed
+            eprintln!("        use @file refs via heredoc instead:"); // changed
+            eprintln!(); // changed
+            eprintln!("    rtk write file /tmp/rtk_old.txt --content @- << 'EOF'"); // changed
+            eprintln!("    ...exact old block verbatim..."); // changed
+            eprintln!("    EOF"); // changed
+            eprintln!("    rtk write file /tmp/rtk_new.txt --content @- << 'EOF'"); // changed
+            eprintln!("    ...new block..."); // changed
+            eprintln!("    EOF"); // changed
+            eprintln!("    rtk write patch <file> --old @/tmp/rtk_old.txt --new @/tmp/rtk_new.txt"); // changed
+            eprintln!(); // changed
+            eprintln!("  hint: if you get ERR_NO_MATCH, get exact bytes first:"); // changed
+            eprintln!("    rtk read <file> --from <N> --to <M>   # copy verbatim into temp files");
+            // changed
+        } // changed
+        "batch" => {
+            // changed
+            eprintln!("  hint: use @file refs inside the JSON plan for complex content:"); // changed
+            eprintln!(); // changed
+            eprintln!(r#"    rtk write batch --plan '["#); // changed
+            eprintln!(
+                r#"      {{"op":"patch","file":"src/lib.rs","old":"@/tmp/old.txt","new":"@/tmp/new.txt"}}"#
+            ); // changed
+            eprintln!(r#"    ]'"#); // changed
+        } // changed
+        _ => {
+            // changed
+            eprintln!("  hint: for multi-line content with special chars, use @file refs:"); // changed
+            eprintln!(); // changed
+            eprintln!("    rtk write file /tmp/rtk_old.txt --content @- << 'EOF'"); // changed
+            eprintln!("    ...old block..."); // changed
+            eprintln!("    EOF"); // changed
+            eprintln!("    rtk write patch <file> --old @/tmp/rtk_old.txt --new @/tmp/rtk_new.txt");
+            // changed
+        } // changed
+    } // changed
+    eprintln!(); // changed
+} // changed
 
 /// fix #200: execute raw command when Clap parse fails (graceful fallback).
 fn run_fallback(parse_error: clap::Error) -> Result<()> {
@@ -1421,11 +1492,20 @@ fn run_fallback(parse_error: clap::Error) -> Result<()> {
     }
 
     // RTK meta-commands must never fall back — show Clap error directly.
+    // For write subcommands, also print contextual hints before the Clap error. // changed
     if RTK_META_COMMANDS.contains(&args[0].as_str()) {
+        if args[0] == "write" {
+            // changed
+            print_write_hint(&args); // changed
+        } // changed
         parse_error.exit();
     }
 
-    eprintln!("[rtk: parse failed, running raw]");
+    // changed: name the raw command explicitly so agent sees what will run
+    eprintln!(
+        "[rtk: parse failed, running `{}` raw — use `rtk proxy` to silence this]",
+        args[0]
+    ); // changed
 
     let raw_command = args.join(" ");
     let error_message = utils::strip_ansi(&parse_error.to_string());
@@ -1456,7 +1536,6 @@ fn run_fallback(parse_error: clap::Error) -> Result<()> {
 
     Ok(())
 }
-
 
 fn main() -> Result<()> {
     // fix #200: graceful fallback when Clap cannot parse the command
@@ -1648,34 +1727,82 @@ fn main() -> Result<()> {
 
             match command {
                 GitCommands::Diff { args } => {
-                    git::run(git::GitCommand::Diff, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Diff,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Log { args } => {
                     git::run(git::GitCommand::Log, &args, None, cli.verbose, &global_args)?;
                 }
                 GitCommands::Status { args } => {
-                    git::run(git::GitCommand::Status, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Status,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Show { args } => {
-                    git::run(git::GitCommand::Show, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Show,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Add { args } => {
                     git::run(git::GitCommand::Add, &args, None, cli.verbose, &global_args)?;
                 }
                 GitCommands::Commit { message } => {
-                    git::run(git::GitCommand::Commit { message }, &[], None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Commit { message },
+                        &[],
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Push { args } => {
-                    git::run(git::GitCommand::Push, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Push,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Pull { args } => {
-                    git::run(git::GitCommand::Pull, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Pull,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Branch { args } => {
-                    git::run(git::GitCommand::Branch, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Branch,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Fetch { args } => {
-                    git::run(git::GitCommand::Fetch, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Fetch,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Stash { subcommand, args } => {
                     git::run(
@@ -1687,7 +1814,13 @@ fn main() -> Result<()> {
                     )?;
                 }
                 GitCommands::Worktree { args } => {
-                    git::run(git::GitCommand::Worktree, &args, None, cli.verbose, &global_args)?;
+                    git::run(
+                        git::GitCommand::Worktree,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
                 }
                 GitCommands::Other(args) => {
                     git::run_passthrough(&args, cli.verbose, &global_args)?;
@@ -2010,7 +2143,8 @@ fn main() -> Result<()> {
                 all_extra_args.insert(0, mode);
                 all_extra_args.insert(0, "-o".to_string());
             }
-            grep_cmd::run(grep_cmd::GrepOptions { // fix #14: struct call site
+            grep_cmd::run(grep_cmd::GrepOptions {
+                // fix #14: struct call site
                 pattern: &pattern,
                 path: &path,
                 max_line_len: max_len,
@@ -2545,7 +2679,9 @@ fn main() -> Result<()> {
                     let mut buf = [0u8; 8192];
                     loop {
                         let n = reader.read(&mut buf)?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         out.write_all(&buf[..n])?;
                         out.flush()?;
                         let chunk = String::from_utf8_lossy(&buf[..n]);
@@ -2566,7 +2702,9 @@ fn main() -> Result<()> {
                     let mut buf = [0u8; 8192];
                     loop {
                         let n = reader.read(&mut buf)?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         err.write_all(&buf[..n])?;
                         err.flush()?;
                         let chunk = String::from_utf8_lossy(&buf[..n]);
@@ -2761,7 +2899,11 @@ mod rgai_arg_tests {
     #[test]
     fn test_git_no_pager_parses() {
         let result = Cli::try_parse_from(["rtk", "git", "--no-pager", "log", "--oneline"]);
-        assert!(result.is_ok(), "rtk git --no-pager log should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "rtk git --no-pager log should parse: {:?}",
+            result.err()
+        );
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Git { no_pager, .. } => assert!(no_pager, "--no-pager should be true"),
@@ -2773,7 +2915,11 @@ mod rgai_arg_tests {
     #[test]
     fn test_git_capital_c_parses() {
         let result = Cli::try_parse_from(["rtk", "git", "-C", "/tmp", "status"]);
-        assert!(result.is_ok(), "rtk git -C /tmp status should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "rtk git -C /tmp status should parse: {:?}",
+            result.err()
+        );
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Git { directory, .. } => {
@@ -2786,10 +2932,13 @@ mod rgai_arg_tests {
 
     #[test]
     fn test_git_no_optional_locks_parses() {
-        let result = Cli::try_parse_from([
-            "rtk", "git", "--no-pager", "--no-optional-locks", "status",
-        ]);
-        assert!(result.is_ok(), "combined global flags should parse: {:?}", result.err());
+        let result =
+            Cli::try_parse_from(["rtk", "git", "--no-pager", "--no-optional-locks", "status"]);
+        assert!(
+            result.is_ok(),
+            "combined global flags should parse: {:?}",
+            result.err()
+        );
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Git {
@@ -2808,7 +2957,11 @@ mod rgai_arg_tests {
     #[test]
     fn test_git_git_dir_parses() {
         let result = Cli::try_parse_from(["rtk", "git", "--git-dir=/tmp/.git", "status"]);
-        assert!(result.is_ok(), "git --git-dir should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "git --git-dir should parse: {:?}",
+            result.err()
+        );
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Git { git_dir, .. } => {
@@ -2818,6 +2971,4 @@ mod rgai_arg_tests {
             }
         }
     }
-
 }
-

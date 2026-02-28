@@ -1,4 +1,5 @@
 // E0.1: Indexing/scanning extracted from mod.rs
+use aho_corasick; // CR-07: multi-pattern search для find_cascade_dependents
 use anyhow::{Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*; // parallel iterators for memory layer hot paths
@@ -246,7 +247,11 @@ fn module_stems_for_path(rel_path: &str) -> Vec<String> {
 }
 
 /// E3.2: Find files in `previous_map` that import any of the `changed_paths`.
-/// Uses suffix-matching of module stems against import strings (language-agnostic heuristic).
+/// Uses Aho-Corasick multi-pattern search for O(N*M*(I+S)) instead of O(N*M*S*L).
+///
+/// CR-07: заменяем O(N×M×S×L) nested contains() на AhoCorasick.
+/// Один проход AhoCorasick по строке импорта находит все stems одновременно —
+/// O(|import| + |stems|) вместо O(|import| × |stems|) для каждой пары.
 fn find_cascade_dependents(
     changed_paths: &HashSet<String>,
     previous_map: &HashMap<String, FileArtifact>,
@@ -260,16 +265,39 @@ fn find_cascade_dependents(
         return HashSet::new();
     }
 
-    // parallel: each file is independent — par_iter replaces sequential loop
+    // CR-07: строим AhoCorasick один раз до par_iter — O(S) construction,
+    // затем каждый поиск по import-строке O(|import| + matches) вместо O(|import|×S).
+    let ac = match aho_corasick::AhoCorasick::new(&changed_stems) {
+        Ok(ac) => ac,
+        Err(_) => {
+            // fallback: оригинальный алгоритм если AhoCorasick не смог собраться
+            return previous_map
+                .par_iter()
+                .filter(|(rel_path, _)| !changed_paths.contains(*rel_path))
+                .filter_map(|(rel_path, artifact)| {
+                    let is_dependent = artifact.imports.iter().any(|import| {
+                        !import.starts_with("self:")
+                            && changed_stems
+                                .iter()
+                                .any(|stem| import.contains(stem.as_str()))
+                    });
+                    if is_dependent {
+                        Some(rel_path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+    };
+
+    // parallel: каждый файл независим — par_iter + AhoCorasick::is_match() (thread-safe)
     previous_map
         .par_iter()
         .filter(|(rel_path, _)| !changed_paths.contains(*rel_path))
         .filter_map(|(rel_path, artifact)| {
             let is_dependent = artifact.imports.iter().any(|import| {
-                !import.starts_with("self:")
-                    && changed_stems
-                        .iter()
-                        .any(|stem| import.contains(stem.as_str()))
+                !import.starts_with("self:") && ac.is_match(import) // CR-07: O(|import|) per check
             });
             if is_dependent {
                 Some(rel_path.clone())
@@ -323,20 +351,20 @@ fn build_incremental_files(
         reused: bool,
     }
 
-    let raw: Vec<Result<FileEntry>> = current_files
+    let raw: Vec<Result<Option<FileEntry>>> = current_files
         .par_iter()
-        .map(|(rel_path, meta)| -> Result<FileEntry> {
+        .map(|(rel_path, meta)| -> Result<Option<FileEntry>> {
             match previous_map.get(rel_path) {
                 Some(previous) => {
                     let metadata_match =
                         previous.size == meta.size && previous.mtime_ns == meta.mtime_ns;
                     // E3.2: also force rehash if this file is a cascade dependent
                     if metadata_match && !force_rehash && !cascade_paths.contains(rel_path) {
-                        return Ok(FileEntry {
+                        return Ok(Some(FileEntry {
                             artifact: previous.clone(),
                             delta: None,
                             reused: true,
-                        });
+                        })); // wrapped in Some
                     }
 
                     let current_hash = hash_file(&meta.abs_path)
@@ -346,11 +374,11 @@ fn build_incremental_files(
                         let mut kept = previous.clone();
                         kept.size = meta.size;
                         kept.mtime_ns = meta.mtime_ns;
-                        return Ok(FileEntry {
+                        return Ok(Some(FileEntry {
                             artifact: kept,
                             delta: None,
                             reused: false,
-                        });
+                        })); // wrapped in Some
                     }
 
                     let mut next = previous.clone();
@@ -370,19 +398,31 @@ fn build_incremental_files(
                         old_hash: Some(format_hash(previous.hash)),
                         new_hash: Some(format_hash(current_hash)),
                     };
-                    Ok(FileEntry {
+                    Ok(Some(FileEntry {
                         artifact: next,
                         delta: Some(delta),
                         reused: false,
-                    })
+                    })) // wrapped in Some
                 }
                 None => {
-                    let current_hash = hash_file(&meta.abs_path).with_context(|| {
-                        format!(
-                            "Failed to hash newly discovered file {}",
-                            meta.abs_path.display()
-                        )
-                    })?;
+                    // Race condition guard: temp files (e.g. atomic writes by Qdrant)
+                    // may disappear between FS discovery and hashing. Skip silently.
+                    let current_hash = match hash_file(&meta.abs_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                                if io_err.kind() == std::io::ErrorKind::NotFound {
+                                    return Ok(None); // transient temp file — skip
+                                }
+                            }
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "Failed to hash newly discovered file {}",
+                                    meta.abs_path.display()
+                                )
+                            });
+                        }
+                    };
                     let analysis =
                         extractor::analyze_file(&meta.abs_path, meta.size, current_hash)?;
                     let artifact = FileArtifact {
@@ -402,11 +442,12 @@ fn build_incremental_files(
                         old_hash: None,
                         new_hash: Some(format_hash(current_hash)),
                     };
-                    Ok(FileEntry {
+                    Ok(Some(FileEntry {
+                        // wrapped in Some
                         artifact,
                         delta: Some(delta),
                         reused: false,
-                    })
+                    }))
                 }
             }
         })
@@ -426,7 +467,7 @@ fn build_incremental_files(
     let mut total_bytes: u64 = 0;
 
     for entry_result in raw {
-        let entry = entry_result?;
+        let Some(entry) = entry_result? else { continue }; // skip None (transient files)
         total_bytes = total_bytes.saturating_add(entry.artifact.size);
         if entry.reused {
             scan_stats.reused_entries += 1;

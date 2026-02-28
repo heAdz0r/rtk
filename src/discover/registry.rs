@@ -432,14 +432,18 @@ const IGNORED_PREFIXES: &[&str] = &[
     "case ",
 ];
 
-const IGNORED_EXACT: &[&str] = &["cd", "echo", "true", "false", "wait", "pwd", "bash", "sh", "fi", "done"]; // fix #246: moved from IGNORED_PREFIXES to prevent shadowing find/done-prefix cmds
+const IGNORED_EXACT: &[&str] = &[
+    "cd", "echo", "true", "false", "wait", "pwd", "bash", "sh", "fi", "done",
+]; // fix #246: moved from IGNORED_PREFIXES to prevent shadowing find/done-prefix cmds
 
-fn regex_set() -> &'static RegexSet { // fix #12: OnceLock accessor
+fn regex_set() -> &'static RegexSet {
+    // fix #12: OnceLock accessor
     static INST: OnceLock<RegexSet> = OnceLock::new();
     INST.get_or_init(|| RegexSet::new(PATTERNS).expect("invalid regex patterns"))
 }
 
-fn compiled() -> &'static Vec<Regex> { // fix #12: OnceLock accessor
+fn compiled() -> &'static Vec<Regex> {
+    // fix #12: OnceLock accessor
     static INST: OnceLock<Vec<Regex>> = OnceLock::new();
     INST.get_or_init(|| {
         PATTERNS
@@ -449,11 +453,10 @@ fn compiled() -> &'static Vec<Regex> { // fix #12: OnceLock accessor
     })
 }
 
-fn env_prefix() -> &'static Regex { // fix #12: OnceLock accessor
+fn env_prefix() -> &'static Regex {
+    // fix #12: OnceLock accessor
     static INST: OnceLock<Regex> = OnceLock::new();
-    INST.get_or_init(|| {
-        Regex::new(r"^(?:sudo\s+|env\s+|[A-Z_][A-Z0-9_]*=[^\s]*\s+)+").unwrap()
-    })
+    INST.get_or_init(|| Regex::new(r"^(?:sudo\s+|env\s+|[A-Z_][A-Z0-9_]*=[^\s]*\s+)+").unwrap())
 }
 
 /// Classify a single (already-split) command.
@@ -521,7 +524,8 @@ pub fn classify_command(cmd: &str) -> Classification {
         let rule = &RULES[idx];
 
         // Extract subcommand for savings override and status detection
-        let (savings, status) = if let Some(caps) = compiled()[idx].captures(cmd_clean) { // fix #12
+        let (savings, status) = if let Some(caps) = compiled()[idx].captures(cmd_clean) {
+            // fix #12
             if let Some(sub) = caps.get(1) {
                 let subcmd = sub.as_str();
                 // Check if this subcommand has a special status

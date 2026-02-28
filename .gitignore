@@ -44,3 +44,9 @@ claudedocs
 
 # Claude Code local settings (user-specific)
 .claude/settings.local.json
+
+# RTK write lock files (temp, never commit)
+*.rtk-lock
+
+# Generated search indices
+data/

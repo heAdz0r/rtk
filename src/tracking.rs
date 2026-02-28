@@ -36,17 +36,24 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::OnceLock; // H4: project_path cache
 use std::time::Instant;
 
 // ── Project path helpers ── // added: project-scoped tracking support
 
 /// Get the canonical project path string for the current working directory.
-fn current_project_path_string() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default()
+/// H4: cached — CWD is fixed for the lifetime of the rtk process (2 syscalls → 0).
+fn current_project_path_string() -> &'static str {
+    static PROJECT_PATH: OnceLock<String> = OnceLock::new();
+    PROJECT_PATH
+        .get_or_init(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.canonicalize().ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .as_str()
 }
 
 /// Build SQL filter params for project-scoped queries.
@@ -59,6 +66,17 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
             Some(format!("{}{}*", p, std::path::MAIN_SEPARATOR)), // changed: GLOB pattern with * wildcard
         ),
         None => (None, None),
+    }
+}
+
+/// CR-08: возвращает WHERE-фрагмент для вставки в SQL-строку.
+/// Два отдельных SQL-литерала позволяют SQLite кешировать и оптимизировать
+/// их независимо: global — полный scan без фильтра, scoped — index seek по project_path.
+fn project_where_clause(scoped: bool) -> &'static str {
+    if scoped {
+        " WHERE (project_path = ?1 OR project_path GLOB ?2)"
+    } else {
+        ""
     }
 }
 
@@ -465,36 +483,40 @@ impl Tracker {
     /// or any subdirectory (prefix match with path separator).
     pub fn get_summary_filtered(&self, project_path: Option<&str>) -> Result<GainSummary> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut total_commands = 0usize;
-        let mut total_input = 0usize;
-        let mut total_output = 0usize;
-        let mut total_saved = 0usize;
-        let mut total_time_ms = 0u64;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        // CR-01 + CR-08: одна агрегирующая SQL-строка; два отдельных SQL-литерала
+        // позволяют SQLite кешировать global и scoped варианты с разными планами выполнения.
+        let agg_mapper = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, i64>(0)? as usize,
                 row.get::<_, i64>(1)? as usize,
                 row.get::<_, i64>(2)? as usize,
-                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as u64,
             ))
-        })?;
-
-        for row in rows {
-            let (input, output, saved, time_ms) = row?;
-            total_commands += 1;
-            total_input += input;
-            total_output += output;
-            total_saved += saved;
-            total_time_ms += time_ms;
-        }
+        };
+        let (total_commands, total_input, total_output, total_saved, total_time_ms): (
+            usize,
+            usize,
+            usize,
+            usize,
+            u64,
+        ) = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self.conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(saved_tokens),0), COALESCE(SUM(exec_time_ms),0)
+                 FROM commands WHERE (project_path = ?1 OR project_path GLOB ?2)", // CR-08: index-friendly
+                params![exact, glob],
+                agg_mapper,
+            )?,
+            _ => self.conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(saved_tokens),0), COALESCE(SUM(exec_time_ms),0)
+                 FROM commands", // CR-08: global — чистый full scan без nullable OR
+                [],
+                agg_mapper,
+            )?,
+        };
 
         let avg_savings_pct = if total_input > 0 {
             (total_saved as f64 / total_input as f64) * 100.0
@@ -508,8 +530,15 @@ impl Tracker {
             0
         };
 
-        let by_command = self.get_by_command(project_path)?; // added: pass project filter
-        let by_day = self.get_by_day(project_path)?; // added: pass project filter
+        // CR-03: BEGIN DEFERRED гарантирует что get_by_command + get_by_day видят
+        // один snapshot и разделяют горячий B-tree page cache — без повторного I/O.
+        // rayon::join невозможен (Connection не Sync); read tx — минимальный overhead.
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let by_command = self.get_by_command(project_path);
+        let by_day = self.get_by_day(project_path);
+        let _ = self.conn.execute_batch("COMMIT"); // readonly tx — всегда успешен
+        let by_command = by_command?; // added: pass project filter
+        let by_day = by_day?; // added: pass project filter
 
         Ok(GainSummary {
             total_commands,
@@ -529,17 +558,7 @@ impl Tracker {
         project_path: Option<&str>, // added
     ) -> Result<Vec<(String, usize, usize, f64, u64)>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY rtk_cmd
-             ORDER BY SUM(saved_tokens) DESC
-             LIMIT 10", // added: project filter in WHERE
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        let cmd_mapper = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -547,9 +566,29 @@ impl Tracker {
                 row.get::<_, f64>(3)?,
                 row.get::<_, f64>(4)? as u64,
             ))
-        })?;
-
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        };
+        // CR-08: два отдельных SQL-текста → SQLite кеширует и оптимизирует независимо
+        let rows: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+                     FROM commands WHERE (project_path = ?1 OR project_path GLOB ?2)
+                     GROUP BY rtk_cmd ORDER BY SUM(saved_tokens) DESC LIMIT 10",
+                )?
+                .query_map(params![exact, glob], cmd_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+                     FROM commands
+                     GROUP BY rtk_cmd ORDER BY SUM(saved_tokens) DESC LIMIT 10",
+                )?
+                .query_map([], cmd_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
     }
 
     fn get_by_day(
@@ -557,21 +596,29 @@ impl Tracker {
         project_path: Option<&str>, // added
     ) -> Result<Vec<(String, usize)>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT DATE(timestamp), SUM(saved_tokens)
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY DATE(timestamp)
-             ORDER BY DATE(timestamp) DESC
-             LIMIT 30", // added: project filter in WHERE
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        let day_mapper = |row: &rusqlite::Row<'_>| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-        })?;
-
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        };
+        // CR-08: два отдельных SQL-текста → SQLite кеширует и оптимизирует независимо
+        let mut result: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp), SUM(saved_tokens) FROM commands
+                     WHERE (project_path = ?1 OR project_path GLOB ?2)
+                     GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC LIMIT 30",
+                )?
+                .query_map(params![exact, glob], day_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp), SUM(saved_tokens) FROM commands
+                     GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC LIMIT 30",
+                )?
+                .query_map([], day_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         result.reverse();
         Ok(result)
     }
@@ -601,22 +648,7 @@ impl Tracker {
     /// Get daily statistics filtered by project path. // added
     pub fn get_all_days_filtered(&self, project_path: Option<&str>) -> Result<Vec<DayStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                DATE(timestamp) as date,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY DATE(timestamp)
-             ORDER BY DATE(timestamp) DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        let day_stats_mapper = |row: &rusqlite::Row<'_>| {
             let input = row.get::<_, i64>(2)? as usize;
             let saved = row.get::<_, i64>(4)? as usize;
             let commands = row.get::<_, i64>(1)? as usize;
@@ -631,7 +663,6 @@ impl Tracker {
             } else {
                 0
             };
-
             Ok(DayStats {
                 date: row.get(0)?,
                 commands,
@@ -642,9 +673,32 @@ impl Tracker {
                 total_time_ms: total_time,
                 avg_time_ms,
             })
-        })?;
-
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        };
+        // CR-08: два SQL-литерала — SQLite оптимизирует global и scoped независимо
+        let mut result: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp) as date, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands WHERE (project_path = ?1 OR project_path GLOB ?2)
+                 GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC",
+                )?
+                .query_map(params![exact, glob], day_stats_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp) as date, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands
+                 GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC",
+                )?
+                .query_map([], day_stats_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         result.reverse();
         Ok(result)
     }
@@ -674,23 +728,7 @@ impl Tracker {
     /// Get weekly statistics filtered by project path. // added
     pub fn get_by_week_filtered(&self, project_path: Option<&str>) -> Result<Vec<WeekStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                DATE(timestamp, 'weekday 0', '-6 days') as week_start,
-                DATE(timestamp, 'weekday 0') as week_end,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY week_start
-             ORDER BY week_start DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        let week_mapper = |row: &rusqlite::Row<'_>| {
             let input = row.get::<_, i64>(3)? as usize;
             let saved = row.get::<_, i64>(5)? as usize;
             let commands = row.get::<_, i64>(2)? as usize;
@@ -705,7 +743,6 @@ impl Tracker {
             } else {
                 0
             };
-
             Ok(WeekStats {
                 week_start: row.get(0)?,
                 week_end: row.get(1)?,
@@ -717,9 +754,34 @@ impl Tracker {
                 total_time_ms: total_time,
                 avg_time_ms,
             })
-        })?;
-
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        };
+        // CR-08: два SQL-литерала — SQLite оптимизирует global и scoped независимо
+        let mut result: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp,'weekday 0','-6 days') as week_start,
+                        DATE(timestamp,'weekday 0') as week_end, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands WHERE (project_path = ?1 OR project_path GLOB ?2)
+                 GROUP BY week_start ORDER BY week_start DESC",
+                )?
+                .query_map(params![exact, glob], week_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT DATE(timestamp,'weekday 0','-6 days') as week_start,
+                        DATE(timestamp,'weekday 0') as week_end, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands
+                 GROUP BY week_start ORDER BY week_start DESC",
+                )?
+                .query_map([], week_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         result.reverse();
         Ok(result)
     }
@@ -749,22 +811,7 @@ impl Tracker {
     /// Get monthly statistics filtered by project path. // added
     pub fn get_by_month_filtered(&self, project_path: Option<&str>) -> Result<Vec<MonthStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                strftime('%Y-%m', timestamp) as month,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY month
-             ORDER BY month DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
+        let month_mapper = |row: &rusqlite::Row<'_>| {
             let input = row.get::<_, i64>(2)? as usize;
             let saved = row.get::<_, i64>(4)? as usize;
             let commands = row.get::<_, i64>(1)? as usize;
@@ -779,7 +826,6 @@ impl Tracker {
             } else {
                 0
             };
-
             Ok(MonthStats {
                 month: row.get(0)?,
                 commands,
@@ -790,9 +836,32 @@ impl Tracker {
                 total_time_ms: total_time,
                 avg_time_ms,
             })
-        })?;
-
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        };
+        // CR-08: два SQL-литерала — SQLite оптимизирует global и scoped независимо
+        let mut result: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT strftime('%Y-%m', timestamp) as month, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands WHERE (project_path = ?1 OR project_path GLOB ?2)
+                 GROUP BY month ORDER BY month DESC",
+                )?
+                .query_map(params![exact, glob], month_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT strftime('%Y-%m', timestamp) as month, COUNT(*) as commands,
+                        SUM(input_tokens) as input, SUM(output_tokens) as output,
+                        SUM(saved_tokens) as saved, SUM(exec_time_ms) as total_time
+                 FROM commands
+                 GROUP BY month ORDER BY month DESC",
+                )?
+                .query_map([], month_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         result.reverse();
         Ok(result)
     }
@@ -829,29 +898,37 @@ impl Tracker {
         project_path: Option<&str>,
     ) -> Result<Vec<CommandRecord>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT timestamp, rtk_cmd, saved_tokens, savings_pct
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             ORDER BY timestamp DESC
-             LIMIT ?3", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(
-            params![project_exact, project_glob, limit as i64], // added: project params
-            |row| {
-                Ok(CommandRecord {
-                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    rtk_cmd: row.get(1)?,
-                    saved_tokens: row.get::<_, i64>(2)? as usize,
-                    savings_pct: row.get(3)?,
-                })
-            },
-        )?;
-
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let rec_mapper = |row: &rusqlite::Row<'_>| {
+            Ok(CommandRecord {
+                timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                rtk_cmd: row.get(1)?,
+                saved_tokens: row.get::<_, i64>(2)? as usize,
+                savings_pct: row.get(3)?,
+            })
+        };
+        // CR-08: два SQL-литерала — SQLite оптимизирует global и scoped независимо
+        let rows: Vec<_> = match (project_exact.as_deref(), project_glob.as_deref()) {
+            (Some(exact), Some(glob)) => self
+                .conn
+                .prepare_cached(
+                    "SELECT timestamp, rtk_cmd, saved_tokens, savings_pct FROM commands
+                 WHERE (project_path = ?1 OR project_path GLOB ?2)
+                 ORDER BY timestamp DESC LIMIT ?3",
+                )?
+                .query_map(params![exact, glob, limit as i64], rec_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => self
+                .conn
+                .prepare_cached(
+                    "SELECT timestamp, rtk_cmd, saved_tokens, savings_pct FROM commands
+                 ORDER BY timestamp DESC LIMIT ?1",
+                )?
+                .query_map(params![limit as i64], rec_mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
     }
 
     /// fix #200: Record a parse failure for analytics.
@@ -871,20 +948,17 @@ impl Tracker {
                 fallback_succeeded as i32,
             ],
         )?;
-        self.cleanup_old()?;
+        self.maybe_cleanup_old()?; // CR-04: rate-limited, не запускает DELETE на каждый вызов
         Ok(())
     }
 
     /// fix #200: Get parse failure summary for `rtk gain --failures`.
     pub fn get_parse_failure_summary(&self) -> Result<ParseFailureSummary> {
-        let total: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM parse_failures", [], |row| row.get(0))?;
-
-        let succeeded: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM parse_failures WHERE fallback_succeeded = 1",
+        // CR-05: один scan вместо двух отдельных COUNT(*)
+        let (total, succeeded): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(fallback_succeeded), 0) FROM parse_failures",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
         let recovery_rate = if total > 0 {
@@ -893,7 +967,7 @@ impl Tracker {
             0.0
         };
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT raw_command, COUNT(*) as cnt
              FROM parse_failures
              GROUP BY raw_command
@@ -906,7 +980,7 @@ impl Tracker {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT timestamp, raw_command, fallback_succeeded
              FROM parse_failures
              ORDER BY timestamp DESC
@@ -929,7 +1003,6 @@ impl Tracker {
             recent,
         })
     }
-
 }
 
 fn get_db_path() -> Result<PathBuf> {
@@ -1007,12 +1080,15 @@ pub struct ParseFailureSummary {
 }
 
 /// fix #200: record a parse failure silently (ignores errors, safe to call from fallback path).
-pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, fallback_succeeded: bool) {
+pub fn record_parse_failure_silent(
+    raw_command: &str,
+    error_message: &str,
+    fallback_succeeded: bool,
+) {
     if let Ok(tracker) = Tracker::new() {
         let _ = tracker.record_parse_failure(raw_command, error_message, fallback_succeeded);
     }
 }
-
 
 pub struct TimedExecution {
     start: Instant,

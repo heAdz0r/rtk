@@ -1108,7 +1108,6 @@ fn run_api(args: &[String], _verbose: u8) -> Result<()> {
     Ok(())
 }
 
-
 fn run_passthrough(cmd: &str, subcommand: &str, args: &[String]) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
@@ -1366,18 +1365,28 @@ mod tests {
     #[test]
     fn test_gh_view_passthrough_json_as_first_arg() {
         // gh pr view --json fields (no PR number, current branch)
-        assert!(should_passthrough_gh_view(&["--json".into(), "number,title".into()]));
+        assert!(should_passthrough_gh_view(&[
+            "--json".into(),
+            "number,title".into()
+        ]));
     }
 
     #[test]
     fn test_gh_view_passthrough_json_after_id() {
         // gh pr view 42 --json fields (user-supplied --json overrides rtk's)
-        assert!(should_passthrough_gh_view(&["42".into(), "--json".into(), "number".into()]));
+        assert!(should_passthrough_gh_view(&[
+            "42".into(),
+            "--json".into(),
+            "number".into()
+        ]));
     }
 
     #[test]
     fn test_gh_view_passthrough_log_failed() {
-        assert!(should_passthrough_gh_view(&["123".into(), "--log-failed".into()]));
+        assert!(should_passthrough_gh_view(&[
+            "123".into(),
+            "--log-failed".into()
+        ]));
     }
 
     #[test]

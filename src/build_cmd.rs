@@ -29,6 +29,7 @@ struct BuildPaths {
     release_bin: PathBuf,
     user_bin: PathBuf,
     usr_local_bin: PathBuf,
+    local_bin: PathBuf, // ~/.local/bin/rtk (wins in PATH on some systems)
 }
 
 pub fn run_sh(opts: BuildShOptions, verbose: u8) -> Result<()> {
@@ -59,6 +60,14 @@ pub fn run_sh(opts: BuildShOptions, verbose: u8) -> Result<()> {
             .arg("--release")
             .current_dir(&paths.root);
         run_checked(&mut command, "cargo build --release")?;
+        // Auto-cleanup: remove debug artifacts (not needed after release build)
+        let debug_dir = paths.root.join("target/debug");
+        if debug_dir.exists() {
+            match fs::remove_dir_all(&debug_dir) {
+                Ok(()) => log("clean -> target/debug"),
+                Err(e) => warn(&format!("clean target/debug failed: {}", e)),
+            }
+        }
     }
 
     if !paths.release_bin.exists() {
@@ -68,6 +77,17 @@ pub fn run_sh(opts: BuildShOptions, verbose: u8) -> Result<()> {
     if opts.install_user {
         log(&format!("install -> {}", paths.user_bin.display()));
         install_with_optional_sudo(&paths.release_bin, &paths.user_bin, false, opts.use_sudo)?;
+    }
+
+    // Also install to ~/.local/bin/rtk when the directory exists (it may precede ~/.cargo/bin in PATH)
+    if paths
+        .local_bin
+        .parent()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
+        log(&format!("install -> {}", paths.local_bin.display()));
+        install_with_optional_sudo(&paths.release_bin, &paths.local_bin, false, opts.use_sudo)?;
     }
 
     if opts.install_usr_local {
@@ -95,10 +115,11 @@ pub fn run_sh(opts: BuildShOptions, verbose: u8) -> Result<()> {
     }
 
     if opts.verify {
-        log("verification (4 binaries)");
+        log("verification (5 binaries)");
         verify_binary(&paths.debug_bin)?;
         verify_binary(&paths.release_bin)?;
         verify_binary(&paths.user_bin)?;
+        verify_binary(&paths.local_bin)?; // ~/.local/bin/rtk
         verify_binary(&paths.usr_local_bin)?;
     }
 
@@ -159,6 +180,7 @@ fn build_paths(root: PathBuf) -> Result<BuildPaths> {
         release_bin: root.join("target/release/rtk"),
         user_bin: home.join(".cargo/bin/rtk"),
         usr_local_bin: PathBuf::from("/usr/local/bin/rtk"),
+        local_bin: home.join(".local/bin/rtk"), // also install here if dir exists
         root,
     })
 }

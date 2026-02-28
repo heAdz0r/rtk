@@ -542,7 +542,7 @@ fn digest_json_config(content: &str, _level: FilterLevel) -> Result<String> {
                 }
                 serde_json::Value::String(s) => {
                     let display = if s.len() > 50 {
-                        format!("{}...", &s[..50])
+                        format!("{}...", s.chars().take(50).collect::<String>().as_str())
                     } else {
                         s.clone()
                     };

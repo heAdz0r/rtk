@@ -16,9 +16,9 @@ use crate::utils::{format_cpt, format_tokens, format_usd};
 
 // API pricing ratios (verified Feb 2026, consistent across Claude models <=200K context)
 // Source: https://docs.anthropic.com/en/docs/about-claude/models
-const WEIGHT_OUTPUT: f64 = 5.0; // Output = 5x input
-const WEIGHT_CACHE_CREATE: f64 = 1.25; // Cache write = 1.25x input
-const WEIGHT_CACHE_READ: f64 = 0.1; // Cache read = 0.1x input
+pub(crate) const WEIGHT_OUTPUT: f64 = 5.0; // Output = 5x input
+pub(crate) const WEIGHT_CACHE_CREATE: f64 = 1.25; // Cache write = 1.25x input
+pub(crate) const WEIGHT_CACHE_READ: f64 = 0.1; // Cache read = 0.1x input
 
 // ── Types ──
 

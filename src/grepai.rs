@@ -3,6 +3,13 @@ use serde::Deserialize; // added: for GrepaiHit JSON parsing
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock; // CR-03: binary-path cache
+use std::time::Duration; // CR-02: Instant не нужен после замены polling на channel
+
+/// Default timeout for grepai operations (seconds).
+/// Prevents infinite hangs when grepai backend (qdrant, ollama) is unreachable.
+const GREPAI_SEARCH_TIMEOUT_SECS: u64 = 30;
+const GREPAI_INIT_TIMEOUT_SECS: u64 = 60;
 
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh";
@@ -35,12 +42,20 @@ pub enum GrepaiState {
 }
 
 /// Search PATH + well-known locations for the grepai binary
+/// CR-03: cache binary discovery for the lifetime of the process
+/// The grepai binary does not move while rtk is running; `which` is ~10ms on macOS.
+static GREPAI_BINARY_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 pub fn find_grepai_binary() -> Option<PathBuf> {
-    find_grepai_binary_with_candidates(
-        find_grepai_binary_from_path(),
-        dirs::home_dir(),
-        PathBuf::from("/usr/local/bin/grepai"),
-    )
+    GREPAI_BINARY_CACHE
+        .get_or_init(|| {
+            find_grepai_binary_with_candidates(
+                find_grepai_binary_from_path(),
+                dirs::home_dir(),
+                PathBuf::from("/usr/local/bin/grepai"),
+            )
+        })
+        .clone() // CR-03: cheap clone of Option<PathBuf>
 }
 
 /// Detect grepai state: binary presence + project initialization
@@ -175,12 +190,18 @@ pub fn init_project(binary: &Path, project_path: &Path, verbose: u8) -> Result<(
         eprintln!("Initializing grepai in {}...", project_path.display());
     }
 
-    // grepai init with defaults
-    let output = Command::new(binary) // use full path to avoid hook rewriting
+    // grepai init with defaults (with timeout to prevent hangs)
+    let mut init_cmd = Command::new(binary); // use full path to avoid hook rewriting
+    init_cmd
         .args(["init", "--provider", "ollama", "--backend", "gob", "--yes"])
-        .current_dir(project_path)
-        .output()
-        .with_context(|| format!("Failed to run {} init", binary.display()))?;
+        .current_dir(project_path);
+
+    let output = match run_with_timeout(init_cmd, GREPAI_INIT_TIMEOUT_SECS)? {
+        Some(o) => o,
+        None => {
+            anyhow::bail!("grepai init timed out after {}s", GREPAI_INIT_TIMEOUT_SECS);
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -190,16 +211,24 @@ pub fn init_project(binary: &Path, project_path: &Path, verbose: u8) -> Result<(
         anyhow::bail!("grepai init failed: {}", stderr.trim());
     }
 
-    // Start background watcher
-    let watch_output = Command::new(binary)
+    // Start background watcher (with timeout)
+    let mut watch_cmd = Command::new(binary);
+    watch_cmd
         .args(["watch", "--background"])
-        .current_dir(project_path)
-        .output()
-        .with_context(|| format!("Failed to run {} watch --background", binary.display()))?;
+        .current_dir(project_path);
 
-    if !watch_output.status.success() && verbose > 0 {
-        let stderr = String::from_utf8_lossy(&watch_output.stderr);
-        eprintln!("grepai watch --background warning: {}", stderr.trim());
+    match run_with_timeout(watch_cmd, GREPAI_INIT_TIMEOUT_SECS)? {
+        Some(watch_output) => {
+            if !watch_output.status.success() && verbose > 0 {
+                let stderr = String::from_utf8_lossy(&watch_output.stderr);
+                eprintln!("grepai watch --background warning: {}", stderr.trim());
+            }
+        }
+        None => {
+            if verbose > 0 {
+                eprintln!("grepai watch --background timed out, skipping");
+            }
+        }
     }
 
     if verbose > 0 {
@@ -209,14 +238,92 @@ pub fn init_project(binary: &Path, project_path: &Path, verbose: u8) -> Result<(
     Ok(())
 }
 
+/// Run a Command with a timeout. Returns None if the process was killed due to timeout.
+/// Drains stdout/stderr in separate threads to avoid pipe deadlocks.
+///
+/// CR-02: заменили busy-wait polling (sleep 100ms) на mpsc::channel + recv_timeout.
+/// child.wait() вызывается в отдельном потоке — OS-уровневая блокировка без CPU waste.
+/// Для быстрых команд (<100ms) это экономит до 100ms лишней задержки per вызов.
+fn run_with_timeout(mut cmd: Command, timeout_secs: u64) -> Result<Option<std::process::Output>> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn process")?;
+
+    // Drain stdout/stderr in background threads to prevent pipe buffer deadlock
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout_pipe {
+            use std::io::Read;
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_pipe {
+            use std::io::Read;
+            let _ = err.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    // CR-02: child.wait() в отдельном потоке — OS-level блокировка без sleep-polling.
+    // PID захватываем до move, чтобы иметь возможность убить процесс при таймауте.
+    let child_pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::ExitStatus>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait()); // blocks until process exits — no CPU polling
+    });
+
+    let timeout = Duration::from_secs(timeout_secs);
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(status)) => {
+            // Процесс завершился в пределах таймаута
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            Ok(Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }))
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            // Таймаут — убиваем процесс по PID (child перемещён в поток, PID уже захвачен)
+            // После kill() stdout/stderr pipes закрываются, reader threads разблокируются.
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &child_pid.to_string()])
+                    .status();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &child_pid.to_string(), "/F"])
+                    .status();
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// Execute a grepai search and return its raw JSON output
 /// Always requests --json for consistent RTK filtering pipeline
+/// : optional --path prefix filter (v0.33.0+ backend pushdown)
 /// Returns Some(output) on success, None on failure (caller falls back to built-in)
 pub fn execute_search(
     binary: &Path,
     project_path: &Path,
     query: &str,
     max: usize,
+    path_filter: Option<&str>, // added: v0.33.0 --path backend pushdown
 ) -> Result<Option<String>> {
     let mut cmd = Command::new(binary); // use full path to avoid hook rewriting
     cmd.arg("search");
@@ -227,16 +334,29 @@ pub fn execute_search(
     // Max results
     cmd.args(["-n", &max.to_string()]);
 
+    // added: pass --path filter to grepai for subdirectory scoping (v0.33.0)
+    if let Some(path) = path_filter {
+        if path != "." && !path.is_empty() {
+            cmd.args(["--path", path]);
+        }
+    }
+
     // Query (must be last)
     cmd.arg(query);
 
-    let output = cmd.current_dir(project_path).output().with_context(|| {
-        format!(
-            "Failed to execute {} search in {}",
-            binary.display(),
-            project_path.display()
-        )
-    })?;
+    cmd.current_dir(project_path); // added: set cwd before spawn
+
+    let output = match run_with_timeout(cmd, GREPAI_SEARCH_TIMEOUT_SECS)? {
+        Some(o) => o,
+        None => {
+            // Timeout — grepai hung (unreachable backend, missing model, etc.)
+            eprintln!(
+                "rgai: grepai search timed out after {}s, falling back to built-in",
+                GREPAI_SEARCH_TIMEOUT_SECS
+            );
+            return Ok(None);
+        }
+    };
 
     if !output.status.success() {
         return Ok(None);
@@ -253,6 +373,7 @@ pub fn execute_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant; // локальный импорт для теста таймаута (Instant убран из prod-кода CR-02)
     use tempfile::TempDir;
 
     fn touch(path: &Path) {
@@ -399,5 +520,41 @@ mod tests {
             missing_global,
         );
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn run_with_timeout_returns_output_for_fast_command() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        let result = run_with_timeout(cmd, 5).unwrap();
+        assert!(result.is_some());
+        let output = result.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("hello"));
+    }
+
+    #[test]
+    fn run_with_timeout_kills_slow_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60"); // sleeps 60s, but timeout is 1s
+        let start = Instant::now();
+        let result = run_with_timeout(cmd, 1).unwrap();
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "should return None on timeout");
+        assert!(elapsed < Duration::from_secs(5), "should not wait full 60s");
+    }
+
+    #[test]
+    fn run_with_timeout_captures_stderr() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo err >&2; echo ok"]);
+        let result = run_with_timeout(cmd, 5).unwrap();
+        assert!(result.is_some());
+        let output = result.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("ok"));
+        assert!(stderr.contains("err"));
     }
 }

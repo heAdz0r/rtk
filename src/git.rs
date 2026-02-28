@@ -35,7 +35,13 @@ fn git_cmd(global_args: &[String]) -> Command {
     cmd
 }
 
-pub fn run(cmd: GitCommand, args: &[String], max_lines: Option<usize>, verbose: u8, global_args: &[String]) -> Result<()> {
+pub fn run(
+    cmd: GitCommand,
+    args: &[String],
+    max_lines: Option<usize>,
+    verbose: u8,
+    global_args: &[String],
+) -> Result<()> {
     let command_class = classify_git_command(&cmd, args);
     if verbose > 2 {
         eprintln!("git command class: {:?}", command_class);
@@ -52,7 +58,9 @@ pub fn run(cmd: GitCommand, args: &[String], max_lines: Option<usize>, verbose: 
         GitCommand::Pull => run_pull(args, verbose, global_args),
         GitCommand::Branch => run_branch(args, verbose, global_args),
         GitCommand::Fetch => run_fetch(args, verbose, global_args),
-        GitCommand::Stash { subcommand } => run_stash(subcommand.as_deref(), args, verbose, global_args),
+        GitCommand::Stash { subcommand } => {
+            run_stash(subcommand.as_deref(), args, verbose, global_args)
+        }
         GitCommand::Worktree => run_worktree(args, verbose, global_args),
     }
 }
@@ -126,7 +134,12 @@ fn exit_with_git_failure(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn run_diff(args: &[String], max_lines: Option<usize>, verbose: u8, global_args: &[String]) -> Result<()> {
+fn run_diff(
+    args: &[String],
+    max_lines: Option<usize>,
+    verbose: u8,
+    global_args: &[String],
+) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
     // Check if user wants stat output
@@ -213,7 +226,12 @@ fn run_diff(args: &[String], max_lines: Option<usize>, verbose: u8, global_args:
     Ok(())
 }
 
-fn run_show(args: &[String], max_lines: Option<usize>, verbose: u8, global_args: &[String]) -> Result<()> {
+fn run_show(
+    args: &[String],
+    max_lines: Option<usize>,
+    verbose: u8,
+    global_args: &[String],
+) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
     // If user wants --stat or --format only, pass through
@@ -331,7 +349,6 @@ fn is_blob_show_arg(arg: &str) -> bool {
     !arg.starts_with('-') && arg.contains(':')
 }
 
-
 pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     let mut result = Vec::new();
     let mut current_file = String::new();
@@ -398,7 +415,12 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     result.join("\n")
 }
 
-fn run_log(args: &[String], _max_lines: Option<usize>, verbose: u8, global_args: &[String]) -> Result<()> {
+fn run_log(
+    args: &[String],
+    _max_lines: Option<usize>,
+    verbose: u8,
+    global_args: &[String],
+) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = git_cmd(global_args);
@@ -1121,7 +1143,12 @@ fn run_fetch(args: &[String], verbose: u8, global_args: &[String]) -> Result<()>
     Ok(())
 }
 
-fn run_stash(subcommand: Option<&str>, args: &[String], verbose: u8, global_args: &[String]) -> Result<()> {
+fn run_stash(
+    subcommand: Option<&str>,
+    args: &[String],
+    verbose: u8,
+    global_args: &[String],
+) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
@@ -1712,5 +1739,4 @@ no changes added to commit (use "git add" and/or "git commit -a")
         ];
         let _cmd = git_cmd(&global);
     }
-
 }

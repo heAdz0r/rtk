@@ -457,6 +457,18 @@ assert_ok      "rtk write batch"               rtk write batch --plan "$BATCH_PL
 assert_contains "batch result b1"              "XXX" cat "$TMPWRITE/b1.txt"
 assert_contains "batch result b2"              "YYY" cat "$TMPWRITE/b2.txt"
 
+# write file / create (US-002) // changed: smoke tests for rtk write file alias
+assert_ok      "rtk write file (new)"          rtk write file "$TMPWRITE/newfile.txt" --content "hello from file"
+assert_contains "write file content"           "hello from file" cat "$TMPWRITE/newfile.txt"
+assert_ok      "rtk write file (idempotent)"   rtk write file "$TMPWRITE/newfile.txt" --content "hello from file"
+assert_ok      "rtk write create (alias)"      rtk write create "$TMPWRITE/createfile.txt" --content "create alias"
+assert_ok      "rtk write file --dry-run"      rtk write file "$TMPWRITE/dryfile.txt" --content "dry" --dry-run
+if rtk write file "$TMPWRITE/newfile.txt" --content "different content" >/dev/null 2>&1; then
+      FAIL=$((FAIL + 1)); FAILURES+=("rtk write file (no overwrite)"); printf "  ${RED}FAIL${NC}  rtk write file (no overwrite) — expected error\n"
+    else
+      PASS=$((PASS + 1)); printf "  ${GREEN}PASS${NC}  rtk write file (no overwrite)\n"
+    fi
+
 rm -rf "$TMPWRITE"
 
 # ══════════════════════════════════════════════════════

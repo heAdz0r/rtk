@@ -36,9 +36,18 @@ FIRST_CMD="$CMD"
 CMD_CLASS="unknown"
 FIRST_TOKEN=$(echo "$FIRST_CMD" | awk '{print $1}')
 
-# Skip if already using rtk
+# Skip if already using rtk — EXCEPT rtk read with explicit --level none (may need upgrade) // changed
 case "$FIRST_TOKEN" in
-  rtk|*/rtk) _rtk_audit_log "skip:already_rtk" "$CMD" "-" "$CMD_CLASS"; exit 0 ;;
+  rtk|*/rtk)
+    # Allow rtk read --level none (no range) to fall through for potential level upgrade (US-008)
+    if echo "$CMD" | grep -qE '^rtk[[:space:]]+read[[:space:]]' && \
+       echo "$CMD" | grep -q -- '--level none' && \
+       ! echo "$CMD" | grep -qE -- '--from[[:space:]]|--to[[:space:]]'; then
+      : # fall through to rewrite rules below
+    else
+      _rtk_audit_log "skip:already_rtk" "$CMD" "-" "$CMD_CLASS"; exit 0
+    fi
+    ;;
 esac
 
 # Skip commands with heredocs, variable assignments as the whole command, etc.
@@ -170,6 +179,20 @@ elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?rgai[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's|^([^[:space:]]*/)?rgai[[:space:]]+|rtk rgai |')"
 
 # --- File operations ---
+# rtk read --level none (no range) on code files → upgrade to --level minimal (US-008) // changed
+elif echo "$MATCH_CMD" | grep -qE '^rtk[[:space:]]+read[[:space:]]' && \
+     echo "$MATCH_CMD" | grep -q -- '--level none' && \
+     ! echo "$MATCH_CMD" | grep -qE -- '--from[[:space:]]|--to[[:space:]]|--max-lines[[:space:]]'; then
+  CMD_CLASS="read_only"
+  RTK_READ_FILE=$(echo "$MATCH_CMD" | sed -E 's/^rtk[[:space:]]+read[[:space:]]+([^[:space:]"-][^[:space:]]*).*/\1/')
+  RTK_READ_EXT=$(echo "${RTK_READ_FILE##*.}" | tr '[:upper:]' '[:lower:]')
+  case "$RTK_READ_EXT" in
+    go|rs|py|pyw|ts|tsx|js|jsx|mjs|cjs|java|rb|sh|bash|zsh|c|h|cpp|cc|cxx|hpp)
+      # Code file without range: override explicit --level none → --level minimal
+      REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/--level none/--level minimal/')"
+      ;;
+    # Config/data: leave --level none as-is
+  esac
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
   CMD_CLASS="read_only"
   CAT_ARGS=$(echo "$MATCH_CMD" | sed -E 's/^cat[[:space:]]*//')
@@ -177,18 +200,18 @@ elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
   if ! echo "$CAT_ARGS" | grep -qE '^-' && ! echo "$CAT_ARGS" | grep -qE ' '; then
     REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
   fi
-elif echo "$MATCH_CMD" | grep -qE '^(rg|grep)[[:space:]]+'; then
+elif echo "$MATCH_CMD" | grep -qE '^(.*/)?(rg|grep)[[:space:]]+'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(rg|grep) /rtk grep /')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's|^[^[:space:]]+ |rtk grep |')"
 elif echo "$MATCH_CMD" | grep -qE '^ls([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ls/rtk ls/')"
 elif echo "$MATCH_CMD" | grep -qE '^tree([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^tree/rtk tree/')"
-elif echo "$MATCH_CMD" | grep -qE '^find[[:space:]]+'; then
+elif echo "$MATCH_CMD" | grep -qE '^([^[:space:]]*/)?find[[:space:]]+'; then
   CMD_CLASS="read_only"
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^find /rtk find /')"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's|^[^[:space:]]+ |rtk find |')"
 elif echo "$MATCH_CMD" | grep -qE '^diff[[:space:]]+'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^diff /rtk diff /')"
@@ -205,6 +228,20 @@ elif echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+'; then
     FILE=$(echo "$MATCH_CMD" | sed -E 's/^head +--lines=[0-9]+ +(.+)$/\1/')
     REWRITTEN="${ENV_PREFIX}rtk read $FILE --max-lines $LINES"
   fi
+elif echo "$MATCH_CMD" | grep -qE '^tail[[:space:]]+'; then
+  # Transform: tail -N file → rtk read file --max-lines N (skip -f streaming)
+  if echo "$MATCH_CMD" | grep -qE '^tail[[:space:]]+-[0-9]+[[:space:]]+[^[:space:]]+$'; then
+    CMD_CLASS="read_only"
+    LINES=$(echo "$MATCH_CMD" | sed -E 's/^tail +-([0-9]+) +(.+)$/\1/')
+    FILE=$(echo "$MATCH_CMD" | sed -E 's/^tail +-[0-9]+ +(.+)$/\1/')
+    REWRITTEN="${ENV_PREFIX}rtk read $FILE --max-lines $LINES"
+  elif echo "$MATCH_CMD" | grep -qE '^tail[[:space:]]+--lines=[0-9]+[[:space:]]+[^[:space:]]+$'; then
+    CMD_CLASS="read_only"
+    LINES=$(echo "$MATCH_CMD" | sed -E 's/^tail +--lines=([0-9]+) +(.+)$/\1/')
+    FILE=$(echo "$MATCH_CMD" | sed -E 's/^tail +--lines=([0-9]+) +(.+)$/\2/')
+    REWRITTEN="${ENV_PREFIX}rtk read $FILE --max-lines $LINES"
+  fi
+  # else: tail -f or other streaming patterns → no rewrite (passthrough)
 
 # --- Safe writes ---
 elif echo "$MATCH_CMD" | grep -qE '^write[[:space:]]+(replace|patch|set)([[:space:]]|$)'; then
@@ -254,6 +291,15 @@ elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+test([[:space:]]|$)'; then
 elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+run[[:space:]]+'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^npm run /rtk npm /')"
+elif echo "$MATCH_CMD" | grep -qE '^bunx[[:space:]]+tsc([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^bunx[[:space:]]+tsc/rtk tsc/')"
+elif echo "$MATCH_CMD" | grep -qE '^bunx[[:space:]]+vite([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^bunx[[:space:]]+vite/rtk npx vite/')"
+elif echo "$MATCH_CMD" | grep -qE '^bunx[[:space:]]+'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^bunx[[:space:]]+/rtk bun x /')"
 elif echo "$MATCH_CMD" | grep -qE '^bun[[:space:]]+'; then
   BUN_SUBCMD=$(echo "$MATCH_CMD" | awk '{print $2}')
   case "$BUN_SUBCMD" in
@@ -336,6 +382,12 @@ elif echo "$MATCH_CMD" | grep -qE '^curl[[:space:]]+'; then
 elif echo "$MATCH_CMD" | grep -qE '^wget[[:space:]]+'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^wget /rtk wget /')"
+elif echo "$MATCH_CMD" | grep -qE '^lsof([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^lsof/rtk lsof/')"
+elif echo "$MATCH_CMD" | grep -qE '^ps([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ps /rtk ps /')"
 
 # --- pnpm package management ---
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+(list|ls|outdated)([[:space:]]|$)'; then
@@ -369,6 +421,9 @@ elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+build([[:space:]]|$)'; then
 elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+vet([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go vet/rtk go vet/')"
+elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+run([[:space:]]|$)'; then
+  CMD_CLASS="read_only"
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go run/rtk go run/')"
 elif echo "$MATCH_CMD" | grep -qE '^golangci-lint([[:space:]]|$)'; then
   CMD_CLASS="read_only"
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^golangci-lint/rtk golangci-lint/')"

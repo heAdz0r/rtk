@@ -15,7 +15,7 @@ if [ "${RTK_ALLOW_NATIVE_WRITE:-0}" = "1" ] || [ "${RTK_BLOCK_NATIVE_WRITE:-1}" 
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "allow",
-    "permissionDecisionReason": "Native Edit/Write allowed by override. Prefer Bash: rtk write replace|patch|set|batch."
+    "permissionDecisionReason": "Native Edit/Write allowed by override. Prefer Bash: rtk write replace|patch|set|batch|create."
   }
 }
 EOF_JSON
@@ -27,7 +27,7 @@ cat <<'EOF_JSON'
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Native Edit/Write blocked by RTK policy. Use Bash: rtk write replace|patch|set|batch. Override: RTK_ALLOW_NATIVE_WRITE=1 (RTK_BLOCK_NATIVE_WRITE=0)."
+    "permissionDecisionReason": "Native Edit/Write blocked by RTK policy.\n  Modify existing file : rtk write replace|patch|set|batch\n  Create NEW file      : rtk write file <path> --content @/tmp/file\n  Override             : RTK_ALLOW_NATIVE_WRITE=1"
   }
 }
 EOF_JSON

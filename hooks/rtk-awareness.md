@@ -97,25 +97,21 @@ Prefer this over ad-hoc `sed -i` / `perl -pi` when the transformation fits these
 ### Complex content with shell metacharacters (`!`, `[`, `{`, `'`)
 
 Shell quoting breaks when content contains `!` (zsh extendedglob), `[`, `{`, or embedded single quotes.
-**Always use `@file` or `@-` (stdin) for multiline/complex patches:**
+**Use `rtk write file --content @-` with heredoc — no python3 needed:**
 
 ```bash
-# Write content to temp files, then reference with @file
-python3 -c "
-old = open('src/lib.rs').read()[start:end]  # or write literally
-open('/tmp/rtk_old.txt', 'w').write(old)
-open('/tmp/rtk_new.txt', 'w').write(new_code)
-"
-rtk write patch src/lib.rs --old @/tmp/rtk_old.txt --new @/tmp/rtk_new.txt
+# Create temp files via heredoc → rtk write file (never use python3 for this!)
+rm -f /tmp/rtk_old.txt /tmp/rtk_new.txt
 
-# Pipe batch plan via stdin (--plan @- supported)
-python3 -c "
-import json
-plan = [{'op':'patch','file':'src/lib.rs',
-         'old':open('/tmp/rtk_old.txt').read(),
-         'new':open('/tmp/rtk_new.txt').read()}]
-print(json.dumps(plan))
-" | rtk write batch --plan @-
+rtk write file /tmp/rtk_old.txt --content @- << 'EOF'
+old block with 'quotes' and !special {chars}
+EOF
+
+rtk write file /tmp/rtk_new.txt --content @- << 'EOF'
+new block with 'quotes' and !special {chars}
+EOF
+
+rtk write patch src/lib.rs --old @/tmp/rtk_old.txt --new @/tmp/rtk_new.txt
 
 # BatchOp @file refs inside JSON plan are also expanded
 rtk write batch --plan '[{"op":"patch","file":"src/lib.rs","old":"@/tmp/old.txt","new":"@/tmp/new.txt"}]'

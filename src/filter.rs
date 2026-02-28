@@ -237,14 +237,57 @@ lazy_static! {
 }
 
 impl FilterStrategy for AggressiveFilter {
+    /// H1: single-pass — merges MinimalFilter state-machine with AggressiveFilter logic.
+    /// Eliminates the double allocation: MinimalFilter→String→AggressiveFilter→String.
     fn filter(&self, content: &str, lang: &Language) -> String {
-        let minimal = MinimalFilter.filter(content, lang);
-        let mut result = String::with_capacity(minimal.len() / 2);
-        let mut brace_depth = 0;
+        let patterns = lang.comment_patterns();
+        let mut result = String::with_capacity(content.len() / 4); // aggressive: ~25% output
+        let mut in_block_comment = false;
+        let mut in_docstring = false;
+        let mut brace_depth: i32 = 0;
         let mut in_impl_body = false;
 
-        for line in minimal.lines() {
+        for line in content.lines() {
             let trimmed = line.trim();
+
+            // ── Inherited from MinimalFilter: block comment handling ──
+            if let (Some(start), Some(end)) = (patterns.block_start, patterns.block_end) {
+                if !in_docstring
+                    && trimmed.contains(start)
+                    && !trimmed.starts_with(patterns.doc_block_start.unwrap_or("###"))
+                {
+                    in_block_comment = true;
+                }
+                if in_block_comment {
+                    if trimmed.contains(end) {
+                        in_block_comment = false;
+                    }
+                    continue; // skip block comment lines
+                }
+            }
+
+            // ── Python docstrings: skip in aggressive mode ──
+            if *lang == Language::Python && trimmed.starts_with("\"\"\"") {
+                in_docstring = !in_docstring;
+                continue; // H1: aggressive skips docstring delimiters
+            }
+            if in_docstring {
+                continue;
+            }
+
+            // ── Line comments: skip entirely in aggressive mode ──
+            if let Some(line_comment) = patterns.line {
+                if trimmed.starts_with(line_comment) {
+                    continue;
+                }
+            }
+
+            // ── Empty lines: skip in aggressive mode ──
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // ── AggressiveFilter logic ──
 
             // Always keep imports
             if IMPORT_PATTERN.is_match(trimmed) {
@@ -270,7 +313,6 @@ impl FilterStrategy for AggressiveFilter {
                 brace_depth += open_braces as i32;
                 brace_depth -= close_braces as i32;
 
-                // Only keep the opening and closing braces
                 if brace_depth <= 1 && (trimmed == "{" || trimmed == "}" || trimmed.ends_with('{'))
                 {
                     result.push_str(line);

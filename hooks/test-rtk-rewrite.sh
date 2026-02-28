@@ -230,6 +230,14 @@ test_rewrite "go vet rewrite" \
   "go vet ./internal/domain/game/services/..." \
   "rtk go vet ./internal/domain/game/services/..."
 
+test_rewrite "go run rewrite" \
+  "go run ./cmd/serve" \
+  "rtk go run ./cmd/serve"
+
+test_rewrite "go run with flags" \
+  "go run ./cmd/index --config cfg.yaml" \
+  "rtk go run ./cmd/index --config cfg.yaml"
+
 echo ""
 
 # ---- SECTION 1.5: Mutating rewrites (opt-in) ----
@@ -349,6 +357,18 @@ test_rewrite "bun --version" \
   "bun --version 2>/dev/null" \
   "rtk bun --version 2>/dev/null"
 
+test_rewrite "bunx tsc rewrite" \
+  "bunx tsc --noEmit 2>&1" \
+  "rtk tsc --noEmit 2>&1"
+
+test_rewrite "bunx vite rewrite" \
+  "bunx vite build 2>&1" \
+  "rtk npx vite build 2>&1"
+
+test_rewrite "bunx generic passthrough" \
+  "bunx someother --flag" \
+  "rtk bun x someother --flag"
+
 test_rewrite "vue-tsc -b" \
   "vue-tsc -b" \
   "rtk npx vue-tsc -b"
@@ -384,6 +404,22 @@ test_rewrite "docker exec -it db psql" \
 test_rewrite "find rewrite" \
   "find . -name '*.ts'" \
   "rtk find . -name '*.ts'"
+
+test_rewrite "lsof port check rewrite" \
+  "lsof -i :8080 -i :3000" \
+  "rtk lsof -i :8080 -i :3000"
+
+test_rewrite "lsof no args" \
+  "lsof" \
+  "rtk lsof"
+
+test_rewrite "ps aux rewrite" \
+  "ps aux" \
+  "rtk ps aux"
+
+test_rewrite "ps -o flag rewrite" \
+  "ps -o pid,comm" \
+  "rtk ps -o pid,comm"
 
 test_rewrite "tree rewrite" \
   "tree src/" \
@@ -479,6 +515,14 @@ test_rewrite "python3 (no pattern)" \
   "python3 script.py" \
   ""
 
+test_rewrite "/usr/bin/grep absolute path rewrite" \
+  "/usr/bin/grep -n 'pattern' src/main.rs" \
+  "rtk grep -n 'pattern' src/main.rs"
+
+test_rewrite "/usr/bin/find absolute path rewrite" \
+  "/usr/bin/find . -name '*.go' -type f" \
+  "rtk find . -name '*.go' -type f"
+
 test_rewrite "pip absolute path rewrite" \
   "/Users/andrew/anaconda3/bin/pip install requests" \
   "rtk pip install requests"
@@ -491,9 +535,17 @@ test_rewrite "node (no pattern)" \
   "node -e 'console.log(1)'" \
   ""
 
-test_rewrite "tail (no safe rewrite)" \
-  "tail -20 package.json" \
+test_rewrite "tail -N file rewrite" \
+  "tail -20 /tmp/index.log" \
+  "rtk read /tmp/index.log --max-lines 20"
+
+test_rewrite "tail -f no rewrite (streaming)" \
+  "tail -f /tmp/server.log" \
   ""
+
+test_rewrite "tail -20 json file rewrite" \
+  "tail -20 package.json" \
+  "rtk read package.json --max-lines 20"
 
 echo ""
 

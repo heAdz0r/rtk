@@ -31,6 +31,7 @@ pub fn analyze_output(output: &str) -> DiagnosticSummary {
     static ABORT_ERRORS_RE: OnceLock<Regex> = OnceLock::new();
     static RUST_ARROW_RE: OnceLock<Regex> = OnceLock::new();
     static FILE_LOC_RE: OnceLock<Regex> = OnceLock::new();
+    static TS_ERR_RE: OnceLock<Regex> = OnceLock::new(); // changed: TypeScript error pattern
 
     let generated_warn_re = GENERATED_WARN_RE.get_or_init(|| {
         Regex::new(r"^warning: .* generated (\d+) warnings?$").expect("invalid GENERATED_WARN_RE")
@@ -38,6 +39,10 @@ pub fn analyze_output(output: &str) -> DiagnosticSummary {
     let abort_errors_re = ABORT_ERRORS_RE.get_or_init(|| {
         Regex::new(r"^error: aborting due to (\d+) previous errors?$")
             .expect("invalid ABORT_ERRORS_RE")
+    });
+    // TypeScript/vue-tsc: "src/App.tsx:12:3 - error TS2345: msg" // changed: TS error detection
+    let ts_err_re = TS_ERR_RE.get_or_init(|| {
+        Regex::new(r"^[A-Za-z0-9_./@-]+\.[a-z]+:\d+:\d+\s+-\s+error\s+(TS\d+):").expect("TS_ERR_RE")
     });
     let rust_arrow_re =
         RUST_ARROW_RE.get_or_init(|| Regex::new(r"^-->\s+(.+?):\d+(?::\d+)?$").expect("invalid"));
@@ -87,6 +92,16 @@ pub fn analyze_output(output: &str) -> DiagnosticSummary {
             pending = Some(Level::Warning);
             if let Some(file) = extract_inline_file(trimmed, rust_arrow_re, file_loc_re) {
                 warning_files.insert(file);
+            }
+            continue;
+        }
+
+        // TypeScript compiler error: "src/file.tsx:12:3 - error TS2345: ..." // changed
+        if ts_err_re.is_match(trimmed) {
+            errors_explicit += 1;
+            pending = Some(Level::Error);
+            if let Some(file) = extract_inline_file(trimmed, rust_arrow_re, file_loc_re) {
+                error_files.insert(file);
             }
             continue;
         }

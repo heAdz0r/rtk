@@ -22,15 +22,26 @@ use std::process::Command;
 /// assert_eq!(truncate("hi", 10), "hi");
 /// ```
 pub fn truncate(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        s.to_string()
-    } else if max_len < 3 {
-        // If max_len is too small, just return "..."
-        "...".to_string()
-    } else {
-        format!("{}...", s.chars().take(max_len - 3).collect::<String>())
+    // M1: single-pass via char_indices — avoids O(2N) double scan (chars().count() + chars().take())
+    if max_len < 3 {
+        return "...".to_string();
     }
+    let truncate_at = max_len - 3;
+    let mut cut_byte: Option<usize> = None; // byte position at (max_len - 3) chars
+    let mut n = 0usize;
+    for (byte_pos, _) in s.char_indices() {
+        if n == truncate_at {
+            cut_byte = Some(byte_pos);
+        }
+        n += 1;
+        if n > max_len {
+            // String exceeds max_len — truncate at cut_byte
+            let end = cut_byte.unwrap_or(s.len());
+            return format!("{}...", &s[..end]);
+        }
+    }
+    // n <= max_len — fits as-is
+    s.to_string()
 }
 
 /// Supprime les codes ANSI d'une chaîne (couleurs, styles).
@@ -169,6 +180,26 @@ pub fn ok_confirmation(action: &str, detail: &str) -> String {
         format!("ok {}", action)
     } else {
         format!("ok {} {}", action, detail)
+    }
+}
+
+/// Merge stdout and stderr into a single raw string for token tracking.
+/// Avoids trailing double-newline when stderr is empty.
+///
+/// # Examples
+/// ```
+/// use rtk::utils::make_raw;
+/// assert_eq!(make_raw("hello\n", ""), "hello\n");
+/// assert_eq!(make_raw("out\n", "err\n"), "out\n\nerr\n");
+/// ```
+pub fn make_raw(stdout: impl AsRef<str>, stderr: impl AsRef<str>) -> String {
+    // fix #18: AsRef<str> accepts Cow<str> and &str without explicit coercion
+    let stdout = stdout.as_ref();
+    let stderr = stderr.as_ref();
+    if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{}\n{}", stdout, stderr)
     }
 }
 
@@ -394,5 +425,22 @@ mod tests {
         let cjk = "你好世界测试字符串";
         let result = truncate(cjk, 6);
         assert!(result.ends_with("..."));
+    }
+
+    // tests for make_raw (#18)
+    #[test]
+    fn test_make_raw_empty_stderr() {
+        assert_eq!(make_raw("hello\n", ""), "hello\n");
+        assert_eq!(make_raw("hello\n", "   "), "hello\n"); // whitespace-only stderr
+    }
+
+    #[test]
+    fn test_make_raw_with_stderr() {
+        assert_eq!(make_raw("out\n", "err\n"), "out\n\nerr\n");
+    }
+
+    #[test]
+    fn test_make_raw_both_empty() {
+        assert_eq!(make_raw("", ""), "");
     }
 }

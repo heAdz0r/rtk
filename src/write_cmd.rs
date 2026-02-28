@@ -504,8 +504,10 @@ fn smart_no_match_hint(base: &str, flag: &str, pattern: &str) -> String {
 
     if pattern.contains('\n') {
         hints.push(format!(
-            // changed: hint for real embedded newlines (from multiline bash args)
-            "pattern for {} contains an embedded newline (multiline bash arg); flex-whitespace fallback is tried automatically, or use @file syntax",
+            // changed: accurate hint — flex already tried; @file does not fix content mismatch
+            "pattern for {} is multi-line; flex-whitespace fallback was already tried; \
+verify exact bytes with `rtk read <file>` and copy the block verbatim — \
+@file helps with shell-escaping but not content differences",
             flag
         ));
     }
@@ -1574,8 +1576,8 @@ mod tests {
     }
 
     #[test]
-    fn patch_multiline_bash_arg_hints_embedded_newline() {
-        // changed: NO_MATCH hint should mention embedded newline when flex also fails
+    fn patch_multiline_bash_arg_hints_multiline() {
+        // changed: NO_MATCH hint for multi-line patterns — updated assertion to match new hint text
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("flex_hint.rs");
         fs::write(&file, "completely different content\n").unwrap();
@@ -1591,8 +1593,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("NO_MATCH"));
         assert!(
-            msg.contains("embedded newline"),
-            "hint should mention embedded newline: {msg}"
+            msg.contains("multi-line"),
+            "hint should mention multi-line pattern: {msg}"
+        );
+        assert!(
+            msg.contains("rtk read"),
+            "hint should suggest rtk read to inspect file: {msg}"
+        );
+        assert!(
+            !msg.contains("@file syntax"),
+            "hint must NOT repeat @file suggestion (already tried): {msg}"
         );
     }
 
@@ -2141,5 +2151,64 @@ mod tests {
     fn expand_at_ref_missing_file_errors() {
         let result = expand_at_ref("@/tmp/__rtk_nonexistent_test_xyz.txt");
         assert!(result.is_err(), "missing @ref file should error");
+    }
+    // --- run_create / write file tests (US-002) --- // changed: new tests for create/file subcommand
+
+    #[test]
+    fn create_new_file_success() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new_file.txt");
+        run_create(&path, "hello world", tp(OutputMode::Concise)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn create_idempotent_same_content() {
+        // Second call with identical content must be a noop (exit 0, no error)
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("idem.txt");
+        run_create(&path, "same", tp(OutputMode::Concise)).unwrap();
+        run_create(&path, "same", tp(OutputMode::Concise)).unwrap(); // must not error
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "same");
+    }
+
+    #[test]
+    fn create_refuses_overwrite_different_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, "original").unwrap();
+        let result = run_create(&path, "different", tp(OutputMode::Concise));
+        assert!(
+            result.is_err(),
+            "create must refuse to overwrite with different content"
+        );
+    }
+
+    #[test]
+    fn create_dry_run_no_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dryrun.txt");
+        run_create(&path, "content", tp_dry(OutputMode::Concise)).unwrap();
+        assert!(!path.exists(), "dry_run must not create the file");
+    }
+
+    #[test]
+    fn create_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested/deep/file.txt");
+        run_create(&path, "data", tp(OutputMode::Concise)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "data");
+    }
+
+    #[test]
+    fn create_at_file_expansion() {
+        // @/tmp/file content expansion via expand_at_ref inside run_create
+        let dir = TempDir::new().unwrap();
+        let tmp_content = dir.path().join("content.txt");
+        std::fs::write(&tmp_content, "from @file").unwrap();
+        let at_ref = format!("@{}", tmp_content.display());
+        let dest = dir.path().join("dest.txt");
+        run_create(&dest, &at_ref, tp(OutputMode::Concise)).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "from @file");
     }
 }

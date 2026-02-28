@@ -27,6 +27,12 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 lazy_static! {
+    /// H3: O(1) stop-word lookup — replaces O(N) slice scan in build_query_model.
+    static ref STOP_WORDS_SET: std::collections::HashSet<&'static str> =
+        STOP_WORDS.iter().copied().collect();
+}
+
+lazy_static! {
     static ref SYMBOL_DEF_RE: Regex = Regex::new(
         r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|def|class|struct|enum|trait|interface|impl|type)\s+[A-Za-z_][A-Za-z0-9_]*"
     )
@@ -163,6 +169,7 @@ pub fn run(
                     snippets_per_file,
                     file_type,
                     max_file_bytes,
+                    max_results, // C1: pass limit for early-exit
                     verbose,
                 )?,
                 "builtin",
@@ -177,6 +184,7 @@ pub fn run(
                 snippets_per_file,
                 file_type,
                 max_file_bytes,
+                max_results, // C1: pass limit for early-exit
                 verbose,
             )?,
             "builtin",
@@ -454,8 +462,15 @@ fn try_grepai_delegation(
     };
 
     // CHANGED: helper to get raw JSON from grepai (always --json)
+    // added: compute path_filter from requested_path for --path pushdown (v0.33.0)
+    let path_filter: Option<&str> = if requested_path != "." && !requested_path.is_empty() {
+        // added: --path pushdown
+        Some(requested_path)
+    } else {
+        None
+    };
     let get_raw = |binary: &Path| -> Result<Option<String>> {
-        match grepai::execute_search(binary, project_dir, query, max) {
+        match grepai::execute_search(binary, project_dir, query, max, path_filter) {
             Ok(output) => Ok(output),
             Err(e) => {
                 if verbose > 0 {
@@ -929,6 +944,7 @@ fn search_project(
     snippets_per_file: usize,
     file_type: Option<&str>,
     max_file_bytes: usize,
+    max_results: usize, // C1: early-exit limit — collect at most max_results * 3 candidates
     _verbose: u8,
 ) -> Result<SearchOutcome> {
     let mut outcome = SearchOutcome::default();
@@ -997,6 +1013,10 @@ fn search_project(
             snippets_per_file,
         ) {
             outcome.hits.push(hit);
+            // C1: early-exit — 3x candidates is enough to sort and pick best max_results
+            if max_results > 0 && outcome.hits.len() >= max_results.saturating_mul(3).max(30) {
+                break;
+            }
         }
     }
 
@@ -1281,7 +1301,8 @@ fn build_query_model(query: &str) -> QueryModel {
     let mut seen = HashSet::new();
 
     for token in split_terms(&phrase) {
-        if token.len() < 2 || STOP_WORDS.contains(&token.as_str()) {
+        if token.len() < 2 || STOP_WORDS_SET.contains(token.as_str()) {
+            // H3: O(1) via HashSet
             continue;
         }
         push_unique(&mut terms, &mut seen, &token);
@@ -1557,7 +1578,7 @@ pub fn log_info(msg: &str) {
         .unwrap();
 
         let query = build_query_model("refresh token session");
-        let outcome = search_project(&query, root, 0, 2, None, 256 * 1024, 0).unwrap();
+        let outcome = search_project(&query, root, 0, 2, None, 256 * 1024, 10, 0).unwrap(); // C1: added max_results param
 
         assert!(!outcome.hits.is_empty());
         assert_eq!(outcome.hits[0].path, "src/auth.rs");

@@ -56,7 +56,7 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
+    let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
 
     let exit_code = output // upstream sync: tee integration
         .status
@@ -111,7 +111,7 @@ pub fn run_build(args: &[String], verbose: u8) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
+    let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
 
     let exit_code = output // upstream sync: tee integration
         .status
@@ -165,7 +165,7 @@ pub fn run_vet(args: &[String], verbose: u8) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
+    let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
 
     let exit_code = output // upstream sync: tee integration
         .status
@@ -199,6 +199,79 @@ pub fn run_vet(args: &[String], verbose: u8) -> Result<()> {
     Ok(())
 }
 
+pub fn run_run(args: &[String], verbose: u8) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("go run: requires a package path or file");
+    }
+
+    let timer = tracking::TimedExecution::start();
+
+    let mut cmd = Command::new("go");
+    cmd.arg("run");
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    if verbose > 0 {
+        eprintln!("Running: go run {}", args.join(" "));
+    }
+
+    let output = cmd
+        .output()
+        .context("Failed to run go run. Is Go installed?")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
+
+    let exit_code = output
+        .status
+        .code()
+        .unwrap_or(if output.status.success() { 0 } else { 1 });
+
+    let filtered = if output.status.success() {
+        // On success: suppress noisy startup lines, show meaningful output
+        let lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(10)
+            .collect();
+        if lines.is_empty() {
+            "✓ go run: ok".to_string()
+        } else {
+            lines.join("\n")
+        }
+    } else {
+        // On failure: show build errors (reuse go build filter logic)
+        let errors = filter_go_build(&raw);
+        if errors.contains("✓") {
+            // filter_go_build returned success despite non-zero exit — show raw stderr
+            stderr.trim().to_string()
+        } else {
+            errors
+        }
+    };
+
+    if let Some(hint) = crate::tee::tee_and_hint(&raw, "go_run", exit_code) {
+        println!("{}\n{}", filtered, hint);
+    } else {
+        println!("{}", filtered);
+    }
+
+    timer.track(
+        &format!("go run {}", args.join(" ")),
+        &format!("rtk go run {}", args.join(" ")),
+        &raw,
+        &filtered,
+    );
+
+    if !output.status.success() {
+        std::process::exit(exit_code);
+    }
+
+    Ok(())
+}
+
 pub fn run_other(args: &[OsString], verbose: u8) -> Result<()> {
     if args.is_empty() {
         anyhow::bail!("go: no subcommand specified");
@@ -224,7 +297,7 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
+    let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
 
     print!("{}", stdout);
     eprint!("{}", stderr);
@@ -327,7 +400,9 @@ fn filter_go_test_json(output: &str) -> String {
     result.push_str("═══════════════════════════════════════\n");
 
     // Show failed tests grouped by package
-    for (package, pkg_result) in packages.iter() {
+    let mut pkg_list: Vec<_> = packages.iter().collect(); // fix #6: sort for deterministic output
+    pkg_list.sort_by_key(|(name, _)| *name);
+    for (package, pkg_result) in pkg_list {
         if pkg_result.fail == 0 {
             continue;
         }
@@ -528,5 +603,31 @@ utils.go:15:5: unreachable code"#;
         assert_eq!(compact_package_name("github.com/user/repo/pkg"), "pkg");
         assert_eq!(compact_package_name("example.com/foo"), "foo");
         assert_eq!(compact_package_name("simple"), "simple");
+    }
+
+    #[test]
+    // renamed #10: was test_run_run_success_with_output
+    fn test_filter_go_build_empty_is_success() {
+        // Simulate successful go run output: first 10 non-empty lines shown
+        let stdout = "server started on :8080\nlistening...\n";
+        let stderr = "";
+        let raw = crate::utils::make_raw(&stdout, &stderr); // fix #18: no double \n
+                                                            // filter_go_build would return success for empty stderr+stdout
+                                                            // Here we test the success branch logic via filter_go_build
+        let result = filter_go_build(&raw);
+        assert!(result.contains("✓"), "empty output should show success");
+    }
+
+    #[test]
+    // renamed #10: was test_run_run_build_error_filter
+    fn test_filter_go_build_errors_from_run_output() {
+        // Simulate go run compilation failure
+        let output = r#"# example.com/cmd/serve
+cmd/serve/main.go:42:5: undefined: missingFunc
+cmd/serve/main.go:50:2: cannot use x (type int) as type string"#;
+        let result = filter_go_build(output);
+        assert!(result.contains("2 errors"));
+        assert!(result.contains("undefined: missingFunc"));
+        assert!(result.contains("cannot use x"));
     }
 }

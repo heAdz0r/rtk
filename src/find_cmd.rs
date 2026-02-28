@@ -61,11 +61,9 @@ fn has_native_find_flags(args: &[String]) -> bool {
 
 /// Native find flags that RTK cannot handle correctly.
 const UNSUPPORTED_FIND_FLAGS: &[&str] = &[
-    "-not", "!", "-or", "-o", "-and", "-a",
-    "-exec", "-execdir", "-delete", "-print0",
-    "-newer", "-perm", "-size", "-mtime", "-mmin",
-    "-atime", "-amin", "-ctime", "-cmin", "-empty",
-    "-link", "-regex", "-iregex",
+    "-not", "!", "-or", "-o", "-and", "-a", "-exec", "-execdir", "-delete", "-print0", "-newer",
+    "-perm", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-empty", "-link",
+    "-regex", "-iregex",
 ];
 
 fn has_unsupported_find_flags(args: &[String]) -> bool {
@@ -208,13 +206,20 @@ fn run_with_opts(
     let effective_pattern = if pattern == "." { "*" } else { pattern };
 
     if verbose > 0 {
-        eprintln!("find: {} in {} (icase={})", effective_pattern, path, case_insensitive);
+        eprintln!(
+            "find: {} in {} (icase={})",
+            effective_pattern, path, case_insensitive
+        );
     }
 
     let want_dirs = file_type == "d";
 
     let mut builder = WalkBuilder::new(path);
-    builder.hidden(true).git_ignore(true).git_global(true).git_exclude(true);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true);
     if let Some(depth) = max_depth {
         builder.max_depth(Some(depth));
     }
@@ -231,8 +236,12 @@ fn run_with_opts(
         let ft = entry.file_type();
         let is_dir = ft.as_ref().is_some_and(|t| t.is_dir());
 
-        if want_dirs && !is_dir { continue; }
-        if !want_dirs && is_dir { continue; }
+        if want_dirs && !is_dir {
+            continue;
+        }
+        if !want_dirs && is_dir {
+            continue;
+        }
 
         let entry_path = entry.path();
         let name = match entry_path.file_name() {
@@ -245,7 +254,9 @@ fn run_with_opts(
         } else {
             glob_match(effective_pattern, &name)
         };
-        if !matched { continue; }
+        if !matched {
+            continue;
+        }
 
         let display_path = entry_path
             .strip_prefix(path)
@@ -284,12 +295,19 @@ fn run_display(
         return Ok(());
     }
 
-    let mut by_dir: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut by_dir: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for file in files {
         let p = std::path::Path::new(file);
-        let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+        let dir = p
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
         let dir = if dir.is_empty() { ".".to_string() } else { dir };
-        let filename = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        let filename = p
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
         by_dir.entry(dir).or_default().push(filename);
     }
 
@@ -303,22 +321,34 @@ fn run_display(
 
     let mut shown = 0;
     for dir in &dirs {
-        if shown >= max_results { break; }
+        if shown >= max_results {
+            break;
+        }
         let files_in_dir = &by_dir[dir];
-        let dir_display = if dir.len() > 50 { format!("...{}", &dir[dir.len()-47..]) } else { dir.clone() };
+        let dir_display = if dir.len() > 50 {
+            format!("...{}", &dir[dir.len() - 47..])
+        } else {
+            dir.clone()
+        };
         let remaining_budget = max_results - shown;
         if files_in_dir.len() <= remaining_budget {
             println!("{}/ {}", dir_display, files_in_dir.join(" "));
             shown += files_in_dir.len();
         } else {
-            let partial: Vec<_> = files_in_dir.iter().take(remaining_budget).cloned().collect();
+            let partial: Vec<_> = files_in_dir
+                .iter()
+                .take(remaining_budget)
+                .cloned()
+                .collect();
             println!("{}/ {}", dir_display, partial.join(" "));
             shown += partial.len();
             break;
         }
     }
 
-    if shown < total_files { println!("+{} more", total_files - shown); }
+    if shown < total_files {
+        println!("+{} more", total_files - shown);
+    }
 
     let summary = format!("{}F {}D", total_files, dirs_count);
     timer.track(
@@ -608,7 +638,13 @@ mod tests {
 
     #[test]
     fn test_parse_find_native_name_type() {
-        let args: Vec<String> = vec![".".into(), "-name".into(), "*.rs".into(), "-type".into(), "f".into()];
+        let args: Vec<String> = vec![
+            ".".into(),
+            "-name".into(),
+            "*.rs".into(),
+            "-type".into(),
+            "f".into(),
+        ];
         let parsed = parse_find_args(&args).unwrap();
         assert_eq!(parsed.pattern, "*.rs");
         assert_eq!(parsed.file_type, "f");
@@ -624,7 +660,13 @@ mod tests {
 
     #[test]
     fn test_parse_find_native_maxdepth() {
-        let args: Vec<String> = vec![".".into(), "-name".into(), "*.toml".into(), "-maxdepth".into(), "2".into()];
+        let args: Vec<String> = vec![
+            ".".into(),
+            "-name".into(),
+            "*.toml".into(),
+            "-maxdepth".into(),
+            "2".into(),
+        ];
         let parsed = parse_find_args(&args).unwrap();
         assert_eq!(parsed.max_depth, Some(2));
     }
@@ -632,7 +674,13 @@ mod tests {
     #[test]
     fn test_parse_find_unsupported_flags_error() {
         // -exec and -not should return Err, not silently pass
-        let args: Vec<String> = vec![".".into(), "-name".into(), "*.rs".into(), "-exec".into(), "echo".into()];
+        let args: Vec<String> = vec![
+            ".".into(),
+            "-name".into(),
+            "*.rs".into(),
+            "-exec".into(),
+            "echo".into(),
+        ];
         assert!(parse_find_args(&args).is_err());
         let args2: Vec<String> = vec!["-not".into(), "-name".into(), "*.rs".into()];
         assert!(parse_find_args(&args2).is_err());
