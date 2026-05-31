@@ -515,6 +515,79 @@ fn filter_log_output(output: &str, limit: usize) -> String {
     capped.join("\n").trim().to_string()
 }
 
+// upstream v0.39: extract in-progress state from plain git status output
+fn extract_state_header(raw: &str) -> Option<String> {
+    const ANCHORS: &[&str] = &[
+        "rebase in progress",
+        "You are currently rebasing",
+        "You are currently editing",
+        "You are currently splitting",
+        "You are currently cherry-picking",
+        "You are currently reverting",
+        "You are currently bisecting",
+        "You are in the middle of",
+        "You are in a sparse checkout",
+        "All conflicts fixed but you are still merging",
+        "You have unmerged paths",
+        "Last command done",
+        "Next command to do",
+        "No commands remaining",
+    ];
+
+    const STOPPERS: &[&str] = &[
+        "Changes to be committed:",
+        "Changes not staged for commit:",
+        "Untracked files:",
+        "Unmerged paths:",
+        "no changes added to commit",
+        "nothing to commit",
+        "nothing added to commit",
+    ];
+
+    let mut found = false;
+    let mut out: Vec<String> = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        let stripped = trimmed.trim_start();
+
+        if STOPPERS.iter().any(|s| stripped.starts_with(s)) {
+            break;
+        }
+
+        if stripped.starts_with("On branch ")
+            || stripped.starts_with("HEAD detached")
+            || stripped.starts_with("Your branch ")
+        {
+            continue;
+        }
+
+        if stripped.starts_with("(use \"git add")
+            || stripped.starts_with("(use \"git restore")
+        {
+            continue;
+        }
+
+        if !found && ANCHORS.iter().any(|a| stripped.contains(a)) {
+            found = true;
+        }
+
+        if found {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(format!("⚡ {}", out.join("\n⚡ ")))
+    }
+}
+
 /// Format porcelain output into compact RTK status display
 fn format_status_output(porcelain: &str) -> String {
     let lines: Vec<&str> = porcelain.lines().collect();
@@ -696,18 +769,23 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<()
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    let formatted = if !stderr.is_empty() && stderr.contains("not a git repository") {
+    let mut formatted = if !stderr.is_empty() && stderr.contains("not a git repository") {
         "Not a git repository".to_string()
     } else {
         format_status_output(&stdout)
     };
+
+    // upstream v0.39: surface in-progress state (rebase/merge/cherry-pick/bisect)
+    if let Some(state) = extract_state_header(&raw_output) {
+        formatted = format!("{}\n{}", state, formatted);
+    }
 
     println!("{}", formatted);
 
     // Track for statistics
     timer.track("git status", "rtk git status", &raw_output, &formatted);
 
-    Ok(())
+    return Ok(());
 }
 
 fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<()> {
@@ -855,16 +933,31 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<()> 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw = format!("{}{}", stdout, stderr);
 
+    // upstream v0.41: noise-skipping prefixes for git push progress lines
+    const GIT_PUSH_NOISE_PREFIXES: &[&str] = &[
+        "Enumerating objects:",
+        "Counting objects:",
+        "Compressing objects:",
+        "Writing objects:",
+        "Delta compression using",
+        "Total ",
+    ];
+
     if output.status.success() {
         let compact = if stderr.contains("Everything up-to-date") {
             "ok (up-to-date)".to_string()
         } else {
             let mut result = String::new();
+            // upstream v0.41: filter noise lines before extracting ref info
             for line in stderr.lines() {
+                let trimmed = line.trim();
+                if GIT_PUSH_NOISE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+                    continue;
+                }
                 if line.contains("->") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 3 {
-                        result = format!("ok ✓ {}", parts[parts.len() - 1]);
+                        result = format!("ok {}", parts[parts.len() - 1]);
                         break;
                     }
                 }
@@ -872,7 +965,7 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<()> 
             if !result.is_empty() {
                 result
             } else {
-                "ok ✓".to_string()
+                "ok".to_string()
             }
         };
 

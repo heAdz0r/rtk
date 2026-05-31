@@ -60,6 +60,7 @@ mod symbols_regex; // PR-3: regex-based symbol extractor
 mod tee; // upstream sync: tee raw output to file for LLM re-read
 mod tracking;
 mod tree;
+mod truncate; // upstream v0.41: global caps for filter output limits
 mod tsc_cmd;
 mod utils;
 mod vitest_cmd;

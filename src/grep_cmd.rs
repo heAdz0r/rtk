@@ -43,7 +43,10 @@ pub fn run(opts: GrepOptions<'_>) -> Result<()> {
     };
 
     let mut rg_cmd = Command::new("rg");
-    rg_cmd.args(["-n", "--no-heading", &rg_pattern, path]);
+    // upstream v0.38: --no-ignore-vcs prevents false negatives from .gitignore'd files
+    // (ripgrep skips them by default, but grep's recursive mode doesn't — the mismatch
+    // causes AI agents to draw wrong conclusions about missing files)
+    rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
 
     if let Some(ft) = file_type {
         rg_cmd.arg("--type").arg(normalize_file_type(ft)); // fix: map extension aliases → rg type names

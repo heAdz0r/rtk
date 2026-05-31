@@ -159,19 +159,69 @@ pub fn tee_raw(raw: &str, command_slug: &str, exit_code: i32) -> Option<PathBuf>
     )
 }
 
+// upstream v0.41: extracted display_path for reuse in tail hints
+fn display_path(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(relative) = path.strip_prefix(&home) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
+}
+
 /// Format the hint line with ~ shorthand for home directory.
 fn format_hint(path: &std::path::Path) -> String {
-    let display = if let Some(home) = dirs::home_dir() {
-        if let Ok(relative) = path.strip_prefix(&home) {
-            format!("~/{}", relative.display())
-        } else {
-            path.display().to_string()
-        }
-    } else {
-        path.display().to_string()
-    };
+    format!("[full output: {}]", display_path(path))
+}
 
-    format!("[full output: {}]", display)
+// upstream v0.41: shared tee-path helper — used by both force_tee_hint and force_tee_tail_hint
+fn force_tee_path(content: &str, command_slug: &str) -> Option<PathBuf> {
+    if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
+        return None;
+    }
+
+    if content.is_empty() {
+        return None;
+    }
+
+    let config = Config::load().ok()?;
+
+    if !config.tee.enabled {
+        return None;
+    }
+
+    let tee_dir = get_tee_dir(&config)?;
+    let tee_dir = std::fs::create_dir_all(&tee_dir).ok().and(Some(tee_dir))?;
+
+    write_tee_file(
+        content,
+        command_slug,
+        &tee_dir,
+        config.tee.max_file_size,
+        config.tee.max_files,
+    )
+}
+
+// upstream v0.41: force tee regardless of exit code (used when filters truncate)
+/// Returns `[full output: ~/path]`, or None if tee is disabled/skipped.
+pub fn force_tee_hint(raw: &str, command_slug: &str) -> Option<String> {
+    let path = force_tee_path(raw, command_slug)?;
+    Some(format_hint(&path))
+}
+
+// upstream v0.41: tail hint — lets LLM skip already-seen head of truncated output
+/// Returns `[see remaining: tail -n +{line_offset} ~/path]`, or None if tee is disabled/skipped.
+pub fn force_tee_tail_hint(
+    content: &str,
+    command_slug: &str,
+    line_offset: usize,
+) -> Option<String> {
+    let path = force_tee_path(content, command_slug)?;
+    Some(format!(
+        "[see remaining: tail -n +{} {}]",
+        line_offset,
+        display_path(&path)
+    ))
 }
 
 /// Convenience: tee + format hint in one call.
@@ -397,5 +447,37 @@ directory = "/tmp/rtk-tee"
 
         let mode: TeeMode = serde_json::from_str(r#""never""#).unwrap();
         assert_eq!(mode, TeeMode::Never);
+    }
+
+    // upstream v0.41: force_tee_hint tests
+    #[test]
+    fn test_force_tee_hint_skip_empty() {
+        let hint = force_tee_hint("", "test_cmd");
+        assert!(hint.is_none(), "Should skip empty content");
+    }
+
+    #[test]
+    fn test_force_tee_hint_skip_rtk_tee_0() {
+        std::env::set_var("RTK_TEE", "0");
+        let hint = force_tee_hint("some output that would normally be tee'd", "test_cmd");
+        std::env::remove_var("RTK_TEE");
+        assert!(hint.is_none(), "Should respect RTK_TEE=0");
+    }
+
+    // upstream v0.41: force_tee_tail_hint tests
+    #[test]
+    fn test_force_tee_tail_hint_skip_empty() {
+        let hint = force_tee_tail_hint("", "test_cmd", 22);
+        assert!(hint.is_none(), "Should skip empty content");
+    }
+
+    #[test]
+    fn test_force_tee_tail_hint_format() {
+        let path = std::path::PathBuf::from("/tmp/rtk/tee/123_docker_images.log");
+        let display = display_path(&path);
+        let hint = format!("[see remaining: tail -n +{} {}]", 22, display);
+        assert!(hint.starts_with("[see remaining: tail -n +22 "));
+        assert!(hint.ends_with(']'));
+        assert!(hint.contains("123_docker_images.log"));
     }
 }
